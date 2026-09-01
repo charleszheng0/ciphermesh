@@ -1,26 +1,30 @@
 use ciphermesh::{Alice, Bob, InitialMessage, PreKeyBundle, SimulatedDirectory};
 use futures::StreamExt;
 use libp2p::{
-    identify, identity, kad, mdns,
+    autonat, dcutr, identify, identity, kad, mdns,
     multiaddr::Protocol,
+    relay, request_response,
     swarm::{NetworkBehaviour, SwarmEvent},
-    Multiaddr, PeerId, Swarm, SwarmBuilder,
+    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
 use quinn::{ClientConfig, Endpoint, ServerConfig};
 use rcgen::generate_simple_self_signed;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::time;
 
 type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 const DISCOVERY_LISTEN_ADDR: &str = "/ip4/0.0.0.0/tcp/0";
-const DISCOVERY_PROTOCOL: &str = "/ciphermesh/discovery/3b/1.0.0";
+const DISCOVERY_PROTOCOL: &str = "/ciphermesh/discovery/3c/1.0.0";
+const APP_RELAY_PROTOCOL: &str = "/ciphermesh/app-bytes/3c/1.0.0";
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+const DIRECT_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> AppResult<()> {
@@ -49,7 +53,22 @@ async fn main() -> AppResult<()> {
                 .unwrap_or("hello bob over quic");
             run_alice(bob_addr, message).await
         }
+        Some("alice-relay") => {
+            let bob_peer_id = parse_peer_id(args.get(2))?;
+            let message = args.get(3).map(String::as_str).unwrap_or("hello via relay");
+            let relay_peers = parse_bootstrap_peers(&args[4..])?;
+            run_alice_relayed(bob_peer_id, message, relay_peers).await
+        }
         Some("kad-demo") => run_kademlia_demo().await,
+        Some("relay") => {
+            let listen_addr = args
+                .get(2)
+                .map(String::as_str)
+                .unwrap_or("/ip4/0.0.0.0/tcp/4001")
+                .parse()?;
+            run_relay_server(listen_addr).await
+        }
+        Some("relay-demo") => run_relay_demo().await,
         _ => {
             run_local_demo()?;
             print_usage();
@@ -70,6 +89,13 @@ fn print_usage() {
     println!();
     println!("Optional bootstrap/Kademlia demo:");
     println!("  cargo run -- kad-demo");
+    println!();
+    println!("Optional relay fallback demo:");
+    println!("  Terminal 1: cargo run -- relay /ip4/0.0.0.0/tcp/4001");
+    println!("  Terminal 2: cargo run -- bob 0.0.0.0:5000 <relay-multiaddr>");
+    println!("  Terminal 3: cargo run -- alice <bob-libp2p-peer-id> \"hello via relay\" <relay-multiaddr>");
+    println!("  Force relay path: cargo run -- alice-relay <bob-libp2p-peer-id> \"hello via relay\" <relay-multiaddr>");
+    println!("  Or run: cargo run -- relay-demo");
     println!();
     println!("Phase 3A direct QUIC comparison:");
     println!("  Terminal 1: cargo run -- bob 127.0.0.1:5000");
@@ -131,26 +157,46 @@ fn run_local_demo() -> AppResult<()> {
 }
 
 async fn run_bob(listen_addr: SocketAddr, bootstrap_peers: Vec<Multiaddr>) -> AppResult<()> {
-    let mut bob = Bob::local();
+    let bob = Arc::new(Mutex::new(Bob::local()));
     let endpoint = Endpoint::server(server_config()?, listen_addr)?;
     let app_addr = endpoint.local_addr()?;
     println!("Bob QUIC app listening on {app_addr}");
 
-    let discovery = tokio::spawn(async move {
-        if let Err(error) = run_discovery_advertiser(app_addr, bootstrap_peers).await {
-            eprintln!("Bob discovery stopped: {error}");
-        }
+    let direct_bob = Arc::clone(&bob);
+    let mut direct = tokio::spawn(async move { run_bob_quic_once(endpoint, direct_bob).await });
+
+    let relayed_bob = Arc::clone(&bob);
+    let mut relayed = tokio::spawn(async move {
+        run_discovery_advertiser(app_addr, bootstrap_peers, Some(relayed_bob)).await
     });
 
+    tokio::select! {
+        result = &mut direct => {
+            relayed.abort();
+            result??;
+        }
+        result = &mut relayed => {
+            direct.abort();
+            result??;
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_bob_quic_once(endpoint: Endpoint, bob: Arc<Mutex<Bob>>) -> AppResult<()> {
     let incoming = endpoint.accept().await.ok_or("endpoint closed")?;
     let connection = incoming.await?;
     println!(
-        "Bob accepted QUIC connection from {}",
+        "direct connection established: Bob accepted QUIC connection from {}",
         connection.remote_address()
     );
 
     let mut send = connection.open_uni().await?;
-    let bundle = bob.prekey_bundle()?;
+    let bundle = bob
+        .lock()
+        .map_err(|_| "Bob state lock poisoned")?
+        .prekey_bundle()?;
     let bundle_bytes = bincode::serialize(&bundle)?;
     log_boundary("Bob -> Alice PreKeyBundle", &bundle_bytes);
     send_bytes(&mut send, &bundle_bytes).await?;
@@ -159,13 +205,15 @@ async fn run_bob(listen_addr: SocketAddr, bootstrap_peers: Vec<Multiaddr>) -> Ap
     let encrypted_bytes = receive_bytes(&mut recv).await?;
     log_boundary("Alice -> Bob InitialMessage", &encrypted_bytes);
     let initial_message: InitialMessage = bincode::deserialize(&encrypted_bytes)?;
-    let plaintext = bob.decrypt_initial_message(&initial_message)?;
+    let plaintext = bob
+        .lock()
+        .map_err(|_| "Bob state lock poisoned")?
+        .decrypt_initial_message(&initial_message)?;
     println!("Bob decrypted plaintext: {plaintext}");
 
     let mut ack = connection.open_uni().await?;
     send_bytes(&mut ack, b"ok").await?;
     endpoint.wait_idle().await;
-    discovery.abort();
     Ok(())
 }
 
@@ -175,9 +223,25 @@ async fn run_alice_discovered(
     bootstrap_peers: Vec<Multiaddr>,
 ) -> AppResult<()> {
     println!("Alice looking for Bob PeerId {bob_peer_id}");
-    let bob_addr = discover_app_addr(bob_peer_id, bootstrap_peers).await?;
+    let bob_addr = discover_app_addr(bob_peer_id, bootstrap_peers.clone()).await?;
     println!("Alice discovered Bob's QUIC app address: {bob_addr}");
-    run_alice(bob_addr, message).await
+
+    match time::timeout(DIRECT_DIAL_TIMEOUT, run_alice(bob_addr, message)).await {
+        Ok(Ok(())) => {
+            println!("direct connection established; QUIC path used");
+            Ok(())
+        }
+        Ok(Err(error)) => {
+            println!("direct connection failed: {error}");
+            println!("falling back to relay");
+            run_alice_relayed(bob_peer_id, message, bootstrap_peers).await
+        }
+        Err(_) => {
+            println!("direct connection attempt timed out after {DIRECT_DIAL_TIMEOUT:?}");
+            println!("falling back to relay");
+            run_alice_relayed(bob_peer_id, message, bootstrap_peers).await
+        }
+    }
 }
 
 async fn run_alice(bob_addr: SocketAddr, message: &str) -> AppResult<()> {
@@ -209,12 +273,167 @@ async fn run_alice(bob_addr: SocketAddr, message: &str) -> AppResult<()> {
     Ok(())
 }
 
+async fn run_alice_relayed(
+    bob_peer_id: PeerId,
+    message: &str,
+    relay_peers: Vec<Multiaddr>,
+) -> AppResult<()> {
+    let mut alice = Alice::local();
+    let mut swarm = new_discovery_swarm()?;
+    let local_peer_id = *swarm.local_peer_id();
+    let relay_addresses = relay_dial_addresses(&relay_peers, bob_peer_id);
+
+    if relay_addresses.is_empty() {
+        return Err(
+            "relay fallback requested but no relay bootstrap multiaddr was provided".into(),
+        );
+    }
+
+    listen_and_bootstrap(&mut swarm, relay_peers.clone())?;
+    for address in &relay_addresses {
+        swarm.add_peer_address(bob_peer_id, address.clone());
+    }
+
+    println!("Alice libp2p PeerId for relay fallback: {local_peer_id}");
+    println!("falling back to relay addresses: {relay_addresses:?}");
+    println!("DCUtR hole punch attempt will be coordinated if a relayed connection is established");
+
+    let mut requested_bundle = false;
+    let mut sent_initial = false;
+    let timeout = time::sleep(DISCOVERY_TIMEOUT);
+    tokio::pin!(timeout);
+
+    loop {
+        tokio::select! {
+            _ = &mut timeout => return Err("relay fallback timed out".into()),
+            event = swarm.select_next_some() => {
+                match event {
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        println!(
+                            "Alice libp2p listening on {}",
+                            address.with(Protocol::P2p(local_peer_id))
+                        );
+                    }
+                    SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } if peer_id == bob_peer_id => {
+                        if endpoint.is_relayed() {
+                            println!("connected through relay: Alice connected to Bob");
+                            println!("DCUtR hole punch attempt started");
+                        } else {
+                            println!("hole punch succeeded: Alice has a direct libp2p connection to Bob");
+                        }
+                        if !requested_bundle {
+                            swarm.behaviour_mut().app.send_request(&bob_peer_id, CipherMeshRequest::PreKeyBundle);
+                            requested_bundle = true;
+                        }
+                    }
+                    SwarmEvent::OutgoingConnectionError { peer_id, error, .. } if peer_id == Some(bob_peer_id) => {
+                        println!("direct or relayed libp2p dial failed for Bob: {error}");
+                    }
+                    SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Relay(event)) => log_relay_event("Alice", event),
+                    SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Dcutr(event)) => log_dcutr_event("Alice", event),
+                    SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Autonat(autonat::Event::StatusChanged { old, new })) => {
+                        println!("reachability changed: {old:?} -> {new:?}");
+                        if matches!(new, autonat::NatStatus::Private) {
+                            println!("peer appears private/unreachable; relay fallback may be needed");
+                        }
+                    }
+                    SwarmEvent::Behaviour(DiscoveryBehaviourEvent::App(request_response::Event::Message {
+                        message: request_response::Message::Response { response, .. },
+                        ..
+                    })) => {
+                        match response {
+                            CipherMeshResponse::PreKeyBundle(bundle_bytes) if !sent_initial => {
+                                log_boundary("Bob -> Alice PreKeyBundle over relay", &bundle_bytes);
+                                let bundle: PreKeyBundle = bincode::deserialize(&bundle_bytes)?;
+                                let initial_message = alice.encrypt_initial_message(&bundle, message)?;
+                                let encrypted_bytes = bincode::serialize(&initial_message)?;
+                                log_boundary("Alice -> Bob InitialMessage over relay", &encrypted_bytes);
+                                swarm.behaviour_mut().app.send_request(
+                                    &bob_peer_id,
+                                    CipherMeshRequest::InitialMessage(encrypted_bytes),
+                                );
+                                sent_initial = true;
+                            }
+                            CipherMeshResponse::Ack(ack_bytes) => {
+                                println!(
+                                    "Alice received relay transport ack: {}",
+                                    String::from_utf8_lossy(&ack_bytes)
+                                );
+                                println!("Alice plaintext before network send: {message}");
+                                return Ok(());
+                            }
+                            CipherMeshResponse::Error(error) => return Err(error.into()),
+                            _ => {}
+                        }
+                    }
+                    SwarmEvent::Behaviour(DiscoveryBehaviourEvent::App(request_response::Event::OutboundFailure {
+                        error,
+                        ..
+                    })) => {
+                        return Err(format!("relay app request failed: {error}").into());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 #[derive(NetworkBehaviour)]
 #[behaviour(prelude = "libp2p::swarm::derive_prelude")]
 struct DiscoveryBehaviour {
+    app: request_response::cbor::Behaviour<CipherMeshRequest, CipherMeshResponse>,
+    autonat: autonat::Behaviour,
+    dcutr: dcutr::Behaviour,
     identify: identify::Behaviour,
     kad: kad::Behaviour<kad::store::MemoryStore>,
     mdns: mdns::tokio::Behaviour,
+    relay: relay::client::Behaviour,
+}
+
+#[derive(NetworkBehaviour)]
+#[behaviour(prelude = "libp2p::swarm::derive_prelude")]
+struct RelayServerBehaviour {
+    identify: identify::Behaviour,
+    relay: relay::Behaviour,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum CipherMeshRequest {
+    PreKeyBundle,
+    InitialMessage(Vec<u8>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum CipherMeshResponse {
+    PreKeyBundle(Vec<u8>),
+    Ack(Vec<u8>),
+    Error(String),
+}
+
+fn new_relay_server_swarm() -> AppResult<Swarm<RelayServerBehaviour>> {
+    let local_key = identity::Keypair::generate_ed25519();
+    let local_peer_id = PeerId::from(local_key.public());
+
+    let swarm = SwarmBuilder::with_existing_identity(local_key)
+        .with_tokio()
+        .with_tcp(
+            Default::default(),
+            libp2p::noise::Config::new,
+            libp2p::yamux::Config::default,
+        )?
+        .with_behaviour(move |key| {
+            Ok(RelayServerBehaviour {
+                identify: identify::Behaviour::new(identify::Config::new(
+                    DISCOVERY_PROTOCOL.to_string(),
+                    key.public(),
+                )),
+                relay: relay::Behaviour::new(local_peer_id, relay::Config::default()),
+            })
+        })?
+        .build();
+
+    Ok(swarm)
 }
 
 fn new_discovery_swarm() -> AppResult<Swarm<DiscoveryBehaviour>> {
@@ -231,14 +450,25 @@ fn new_discovery_swarm() -> AppResult<Swarm<DiscoveryBehaviour>> {
             libp2p::noise::Config::new,
             libp2p::yamux::Config::default,
         )?
-        .with_behaviour(move |key| {
+        .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)?
+        .with_behaviour(move |key, relay| {
             Ok(DiscoveryBehaviour {
+                app: request_response::cbor::Behaviour::new(
+                    [(
+                        StreamProtocol::new(APP_RELAY_PROTOCOL),
+                        request_response::ProtocolSupport::Full,
+                    )],
+                    request_response::Config::default().with_request_timeout(DISCOVERY_TIMEOUT),
+                ),
+                autonat: autonat::Behaviour::new(local_peer_id, autonat::Config::default()),
+                dcutr: dcutr::Behaviour::new(local_peer_id),
                 identify: identify::Behaviour::new(identify::Config::new(
                     DISCOVERY_PROTOCOL.to_string(),
                     key.public(),
                 )),
                 kad: kademlia,
                 mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?,
+                relay,
             })
         })?
         .build();
@@ -249,6 +479,7 @@ fn new_discovery_swarm() -> AppResult<Swarm<DiscoveryBehaviour>> {
 async fn run_discovery_advertiser(
     app_addr: SocketAddr,
     bootstrap_peers: Vec<Multiaddr>,
+    bob: Option<Arc<Mutex<Bob>>>,
 ) -> AppResult<()> {
     let mut swarm = new_discovery_swarm()?;
     let local_peer_id = *swarm.local_peer_id();
@@ -262,10 +493,12 @@ async fn run_discovery_advertiser(
         .behaviour_mut()
         .kad
         .put_record(record, kad::Quorum::One)?;
-    listen_and_bootstrap(&mut swarm, bootstrap_peers)?;
+    listen_and_bootstrap(&mut swarm, bootstrap_peers.clone())?;
+    reserve_on_relays(&mut swarm, &bootstrap_peers)?;
 
     println!("Bob libp2p PeerId: {local_peer_id}");
     println!("Bob advertised QUIC app address record: {app_multiaddr}");
+    let mut final_relay_ack_pending = false;
 
     loop {
         match swarm.select_next_some().await {
@@ -301,6 +534,45 @@ async fn run_discovery_advertiser(
                 for address in info.listen_addrs {
                     swarm.behaviour_mut().kad.add_address(&peer_id, address);
                 }
+            }
+            SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Autonat(
+                autonat::Event::StatusChanged { old, new },
+            )) => {
+                println!("reachability changed: {old:?} -> {new:?}");
+                if matches!(new, autonat::NatStatus::Private) {
+                    println!("peer appears private/unreachable; relay fallback may be needed");
+                }
+            }
+            SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Relay(event)) => {
+                log_relay_event("Bob", event);
+            }
+            SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Dcutr(event)) => {
+                log_dcutr_event("Bob", event);
+            }
+            SwarmEvent::Behaviour(DiscoveryBehaviourEvent::App(event)) => {
+                if let Some(bob) = &bob {
+                    if handle_bob_app_event(
+                        &mut swarm,
+                        Arc::clone(bob),
+                        event,
+                        &mut final_relay_ack_pending,
+                    )? {
+                        return Ok(());
+                    }
+                }
+            }
+            SwarmEvent::ConnectionEstablished {
+                peer_id, endpoint, ..
+            } => {
+                if endpoint.is_relayed() {
+                    println!("connected through relay: Bob connected to {peer_id}");
+                    println!("DCUtR hole punch coordination available over relayed connection");
+                } else {
+                    println!("direct libp2p connection established: Bob connected to {peer_id}");
+                }
+            }
+            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                println!("direct/libp2p dial failed for {peer_id:?}: {error}");
             }
             _ => {}
         }
@@ -491,6 +763,91 @@ async fn run_kademlia_demo() -> AppResult<()> {
     }
 }
 
+async fn run_relay_server(listen_addr: Multiaddr) -> AppResult<()> {
+    let mut swarm = new_relay_server_swarm()?;
+    let local_peer_id = *swarm.local_peer_id();
+
+    swarm.listen_on(listen_addr)?;
+    println!("Relay PeerId: {local_peer_id}");
+
+    loop {
+        match swarm.select_next_some().await {
+            SwarmEvent::NewListenAddr { address, .. } => {
+                swarm.add_external_address(address.clone().with(Protocol::P2p(local_peer_id)));
+                println!(
+                    "Relay listening on {}",
+                    address.with(Protocol::P2p(local_peer_id))
+                );
+            }
+            SwarmEvent::ConnectionEstablished {
+                peer_id, endpoint, ..
+            } => {
+                if endpoint.is_relayed() {
+                    println!("Relay observed relayed connection with {peer_id}");
+                } else {
+                    println!("Relay direct control connection established with {peer_id}");
+                }
+            }
+            SwarmEvent::Behaviour(RelayServerBehaviourEvent::Relay(event)) => {
+                println!("Relay server event: {event:?}");
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn run_relay_demo() -> AppResult<()> {
+    let mut relay_swarm = new_relay_server_swarm()?;
+    let relay_peer_id = *relay_swarm.local_peer_id();
+
+    relay_swarm.listen_on("/ip4/127.0.0.1/tcp/0".parse()?)?;
+    let relay_addr = next_relay_listen_addr(&mut relay_swarm)
+        .await?
+        .with(Protocol::P2p(relay_peer_id));
+
+    println!("Relay demo PeerId: {relay_peer_id}");
+    println!("Relay demo address: {relay_addr}");
+    println!("Run Bob with: cargo run -- bob 127.0.0.1:5999 {relay_addr}");
+    println!("Run Alice with: cargo run -- alice <bob-peer-id> \"hello\" {relay_addr}");
+    println!("Keeping demo relay alive for 30 seconds...");
+
+    let timeout = time::sleep(DISCOVERY_TIMEOUT);
+    tokio::pin!(timeout);
+
+    loop {
+        tokio::select! {
+            _ = &mut timeout => return Ok(()),
+            event = relay_swarm.select_next_some() => {
+                match event {
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        relay_swarm.add_external_address(address.clone().with(Protocol::P2p(relay_peer_id)));
+                        println!("Relay listening on {}", address.with(Protocol::P2p(relay_peer_id)));
+                    }
+                    SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                        if endpoint.is_relayed() {
+                            println!("Relay demo observed relayed connection with {peer_id}");
+                        } else {
+                            println!("Relay demo direct control connection established with {peer_id}");
+                        }
+                    }
+                    SwarmEvent::Behaviour(RelayServerBehaviourEvent::Relay(event)) => {
+                        println!("Relay demo event: {event:?}");
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+async fn next_relay_listen_addr(swarm: &mut Swarm<RelayServerBehaviour>) -> AppResult<Multiaddr> {
+    loop {
+        if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
+            return Ok(address);
+        }
+    }
+}
+
 async fn next_listen_addr(swarm: &mut Swarm<DiscoveryBehaviour>) -> AppResult<Multiaddr> {
     loop {
         if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
@@ -532,6 +889,113 @@ fn handle_demo_event(
     }
 }
 
+fn handle_bob_app_event(
+    swarm: &mut Swarm<DiscoveryBehaviour>,
+    bob: Arc<Mutex<Bob>>,
+    event: request_response::Event<CipherMeshRequest, CipherMeshResponse>,
+    final_ack_pending: &mut bool,
+) -> AppResult<bool> {
+    match event {
+        request_response::Event::Message {
+            peer,
+            message:
+                request_response::Message::Request {
+                    request, channel, ..
+                },
+            ..
+        } => match request {
+            CipherMeshRequest::PreKeyBundle => {
+                let bundle = bob
+                    .lock()
+                    .map_err(|_| "Bob state lock poisoned")?
+                    .prekey_bundle()?;
+                let bundle_bytes = bincode::serialize(&bundle)?;
+                log_boundary("Bob -> Alice PreKeyBundle over relay", &bundle_bytes);
+                let _ = swarm
+                    .behaviour_mut()
+                    .app
+                    .send_response(channel, CipherMeshResponse::PreKeyBundle(bundle_bytes));
+                println!("Bob served prekey bundle over libp2p request-response to {peer}");
+                Ok(false)
+            }
+            CipherMeshRequest::InitialMessage(encrypted_bytes) => {
+                log_boundary("Alice -> Bob InitialMessage over relay", &encrypted_bytes);
+                let result: AppResult<String> =
+                    bincode::deserialize::<InitialMessage>(&encrypted_bytes)
+                        .map_err(|error| error.into())
+                        .and_then(|initial_message| {
+                            bob.lock()
+                                .map_err(|_| "Bob state lock poisoned".into())
+                                .and_then(|mut bob| {
+                                    bob.decrypt_initial_message(&initial_message)
+                                        .map_err(|error| error.into())
+                                })
+                        });
+
+                match result {
+                    Ok(plaintext) => {
+                        println!("Bob decrypted plaintext: {plaintext}");
+                        let _ = swarm
+                            .behaviour_mut()
+                            .app
+                            .send_response(channel, CipherMeshResponse::Ack(b"ok".to_vec()));
+                        *final_ack_pending = true;
+                    }
+                    Err(error) => {
+                        let _ = swarm
+                            .behaviour_mut()
+                            .app
+                            .send_response(channel, CipherMeshResponse::Error(error.to_string()));
+                    }
+                }
+
+                Ok(false)
+            }
+        },
+        request_response::Event::InboundFailure { peer, error, .. } => {
+            println!("Bob relay app inbound failure from {peer}: {error}");
+            Ok(false)
+        }
+        request_response::Event::ResponseSent { peer, .. } => {
+            println!("Bob relay app response sent to {peer}");
+            if *final_ack_pending {
+                *final_ack_pending = false;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+        _ => Ok(false),
+    }
+}
+
+fn log_relay_event(name: &str, event: relay::client::Event) {
+    match event {
+        relay::client::Event::ReservationReqAccepted { relay_peer_id, .. } => {
+            println!("{name} relay reservation accepted by {relay_peer_id}");
+        }
+        relay::client::Event::OutboundCircuitEstablished { relay_peer_id, .. } => {
+            println!("{name} connected through relay {relay_peer_id}");
+        }
+        relay::client::Event::InboundCircuitEstablished { src_peer_id, .. } => {
+            println!("{name} accepted inbound relayed circuit from {src_peer_id}");
+        }
+    }
+}
+
+fn log_dcutr_event(name: &str, event: dcutr::Event) {
+    match event.result {
+        Ok(_) => println!(
+            "hole punch succeeded: {name} upgraded relayed connection with {} to direct",
+            event.remote_peer_id
+        ),
+        Err(error) => println!(
+            "hole punch failed: {name} could not upgrade relayed connection with {}: {error}",
+            event.remote_peer_id
+        ),
+    }
+}
+
 fn listen_and_bootstrap(
     swarm: &mut Swarm<DiscoveryBehaviour>,
     bootstrap_peers: Vec<Multiaddr>,
@@ -551,6 +1015,33 @@ fn listen_and_bootstrap(
     }
 
     Ok(())
+}
+
+fn reserve_on_relays(
+    swarm: &mut Swarm<DiscoveryBehaviour>,
+    relay_peers: &[Multiaddr],
+) -> AppResult<()> {
+    for relay_peer in relay_peers {
+        if strip_p2p(relay_peer).1.is_some() {
+            let relay_listener = relay_peer.clone().with(Protocol::P2pCircuit);
+            println!("requesting relay reservation at {relay_listener}");
+            swarm.listen_on(relay_listener)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn relay_dial_addresses(relay_peers: &[Multiaddr], target_peer_id: PeerId) -> Vec<Multiaddr> {
+    relay_peers
+        .iter()
+        .filter(|addr| strip_p2p(addr).1.is_some())
+        .map(|addr| {
+            addr.clone()
+                .with(Protocol::P2pCircuit)
+                .with(Protocol::P2p(target_peer_id))
+        })
+        .collect()
 }
 
 fn parse_peer_id(value: Option<&String>) -> AppResult<PeerId> {
@@ -762,5 +1253,22 @@ mod discovery_tests {
 
         assert!(key_text.contains(&libp2p_peer_id.to_string()));
         assert!(!key_text.contains(&format!("{ciphermesh_identity:?}")));
+    }
+
+    #[test]
+    fn relay_dial_address_targets_peer_through_circuit() {
+        let relay_peer_id = PeerId::from(identity::Keypair::generate_ed25519().public());
+        let target_peer_id = PeerId::from(identity::Keypair::generate_ed25519().public());
+        let relay_addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/4001/p2p/{relay_peer_id}")
+            .parse()
+            .unwrap();
+
+        let addresses = relay_dial_addresses(&[relay_addr], target_peer_id);
+        assert_eq!(addresses.len(), 1);
+        let address = &addresses[0];
+        let rendered = address.to_string();
+
+        assert!(rendered.contains("/p2p-circuit/"));
+        assert!(rendered.ends_with(&format!("/p2p/{target_peer_id}")));
     }
 }

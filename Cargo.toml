@@ -10,7 +10,7 @@ ed25519-dalek = { version = "3", features = ["rand_core"] }
 futures = "0.3"
 getrandom = { version = "0.4", features = ["sys_rng"] }
 hkdf = "0.13"
-libp2p = { version = "0.56", features = ["identify", "kad", "macros", "mdns", "noise", "tcp", "tokio", "yamux"] }
+libp2p = { version = "0.56", features = ["autonat", "cbor", "dcutr", "identify", "kad", "macros", "mdns", "noise", "relay", "request-response", "tcp", "tokio", "yamux"] }
 quinn = "0.11"
 rcgen = "0.14"
 serde = { version = "1", features = ["derive"] }
