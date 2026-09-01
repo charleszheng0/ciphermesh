@@ -5,17 +5,24 @@ use chacha20poly1305::{
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use getrandom::{rand_core::UnwrapErr, SysRng};
 use hkdf::Hkdf;
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+};
 use x25519_dalek::{PublicKey, StaticSecret};
 
-const ONE_MESSAGE_NONCE: [u8; 12] = [
-    0x61, 0x6c, 0x69, 0x63, 0x65, 0x2d, 0x62, 0x6f, 0x62, 0x2d, 0x30, 0x31,
-];
 const LOCAL_AAD: &[u8] = b"ciphermesh.local.alice-to-bob.v1";
 const HKDF_INFO: &[u8] = b"ciphermesh.phase-2a.x25519.chacha20poly1305";
 const PREKEY_HKDF_INFO: &[u8] = b"ciphermesh.phase-2c.prekey-initial-session";
 const SIGNED_KEY_EXCHANGE_CONTEXT: &[u8] = b"ciphermesh.phase-2b.signed-x25519";
 const SIGNED_PREKEY_CONTEXT: &[u8] = b"ciphermesh.phase-2c.signed-prekey";
+const INITIAL_CHAIN_INFO: &[u8] = b"ciphermesh.phase-2d.initial-chains";
+const CHAIN_STEP_INFO: &[u8] = b"ciphermesh.phase-2d.chain-step";
+const DH_RATCHET_INFO: &[u8] = b"ciphermesh.phase-2d.dh-ratchet";
+const MAX_SKIPPED_MESSAGE_KEYS: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CryptoError {
@@ -24,22 +31,32 @@ pub enum CryptoError {
     KeyDerivation,
     MissingSessionKey,
     PreKeyUnavailable,
+    Replay,
     SignatureVerification,
+    TooManySkippedMessages,
     Utf8,
 }
 
+impl fmt::Display for CryptoError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl Error for CryptoError {}
+
 pub type PublicKeyBytes = [u8; 32];
 pub type IdentityPublicKeyBytes = [u8; 32];
-pub type SignatureBytes = [u8; 64];
+pub type SignatureBytes = Vec<u8>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedKeyExchange {
     pub identity_public_key: IdentityPublicKeyBytes,
     pub x25519_public_key: PublicKeyBytes,
     pub signature: SignatureBytes,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreKeyBundle {
     pub identity_public_key: IdentityPublicKeyBytes,
     pub signed_prekey_public_key: PublicKeyBytes,
@@ -48,16 +65,32 @@ pub struct PreKeyBundle {
     pub one_time_prekey_public_key: PublicKeyBytes,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InitialMessage {
     pub alice_initial_public_key: PublicKeyBytes,
     pub one_time_prekey_id: u64,
+    pub message: RatchetMessage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RatchetMessage {
+    pub number: u64,
+    pub ratchet_public_key: PublicKeyBytes,
     pub ciphertext: Vec<u8>,
 }
 
 struct X25519KeyPair {
     private: StaticSecret,
     public: PublicKey,
+}
+
+impl Clone for X25519KeyPair {
+    fn clone(&self) -> Self {
+        let private = StaticSecret::from(self.private.to_bytes());
+        let public = PublicKey::from(&private);
+
+        Self { private, public }
+    }
 }
 
 impl X25519KeyPair {
@@ -90,6 +123,233 @@ impl X25519KeyPair {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RatchetRole {
+    Alice,
+    Bob,
+}
+
+impl RatchetRole {
+    fn chains(self, first: [u8; 32], second: [u8; 32]) -> ([u8; 32], [u8; 32]) {
+        match self {
+            Self::Alice => (first, second),
+            Self::Bob => (second, first),
+        }
+    }
+}
+
+struct RatchetSession {
+    role: RatchetRole,
+    root_key: [u8; 32],
+    send_chain_key: [u8; 32],
+    recv_chain_key: [u8; 32],
+    send_count: u64,
+    recv_count: u64,
+    skipped_message_keys: BTreeMap<u64, [u8; 32]>,
+    consumed_message_numbers: BTreeSet<u64>,
+    dh_keys: X25519KeyPair,
+    peer_ratchet_public_key: PublicKeyBytes,
+}
+
+impl RatchetSession {
+    fn new(
+        root_key: [u8; 32],
+        role: RatchetRole,
+        dh_keys: X25519KeyPair,
+        peer_ratchet_public_key: PublicKeyBytes,
+    ) -> Result<Self, CryptoError> {
+        let (alice_to_bob, bob_to_alice) = derive_directional_chains(root_key)?;
+        let (send_chain_key, recv_chain_key) = role.chains(alice_to_bob, bob_to_alice);
+
+        Ok(Self {
+            role,
+            root_key,
+            send_chain_key,
+            recv_chain_key,
+            send_count: 0,
+            recv_count: 0,
+            skipped_message_keys: BTreeMap::new(),
+            consumed_message_numbers: BTreeSet::new(),
+            dh_keys,
+            peer_ratchet_public_key,
+        })
+    }
+
+    fn encrypt(&mut self, message: &str) -> Result<RatchetMessage, CryptoError> {
+        let number = self.send_count;
+        let message_key = self.next_send_message_key()?;
+        let cipher = ChaCha20Poly1305::new(&message_key.into());
+        let ratchet_public_key = self.dh_keys.public_key();
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce_for(number)),
+                Payload {
+                    msg: message.as_bytes(),
+                    aad: &ratchet_aad(number, ratchet_public_key),
+                },
+            )
+            .map_err(|_| CryptoError::Encrypt)?;
+
+        Ok(RatchetMessage {
+            number,
+            ratchet_public_key,
+            ciphertext,
+        })
+    }
+
+    fn decrypt(&mut self, message: &RatchetMessage) -> Result<String, CryptoError> {
+        if message.ratchet_public_key != self.peer_ratchet_public_key {
+            self.receive_dh_ratchet(message.ratchet_public_key)?;
+        }
+
+        if self.consumed_message_numbers.contains(&message.number) {
+            return Err(CryptoError::Replay);
+        }
+
+        let message_key =
+            if let Some(message_key) = self.skipped_message_keys.remove(&message.number) {
+                message_key
+            } else {
+                if message.number < self.recv_count {
+                    return Err(CryptoError::Replay);
+                }
+
+                while self.recv_count < message.number {
+                    if self.skipped_message_keys.len() >= MAX_SKIPPED_MESSAGE_KEYS {
+                        return Err(CryptoError::TooManySkippedMessages);
+                    }
+
+                    let skipped_key = self.next_recv_message_key()?;
+                    self.skipped_message_keys
+                        .insert(self.recv_count - 1, skipped_key);
+                }
+
+                self.next_recv_message_key()?
+            };
+
+        let cipher = ChaCha20Poly1305::new(&message_key.into());
+        let plaintext = cipher
+            .decrypt(
+                Nonce::from_slice(&nonce_for(message.number)),
+                Payload {
+                    msg: message.ciphertext.as_ref(),
+                    aad: &ratchet_aad(message.number, message.ratchet_public_key),
+                },
+            )
+            .map_err(|_| CryptoError::Decrypt)?;
+
+        self.consumed_message_numbers.insert(message.number);
+        String::from_utf8(plaintext).map_err(|_| CryptoError::Utf8)
+    }
+
+    fn rotate_sending_ratchet(&mut self) -> Result<(), CryptoError> {
+        self.dh_keys = X25519KeyPair::generate();
+        self.apply_dh_ratchet(self.dh_keys.dh_bytes(self.peer_ratchet_public_key))
+    }
+
+    fn receive_dh_ratchet(
+        &mut self,
+        peer_ratchet_public_key: PublicKeyBytes,
+    ) -> Result<(), CryptoError> {
+        let dh_output = self.dh_keys.dh_bytes(peer_ratchet_public_key);
+        self.peer_ratchet_public_key = peer_ratchet_public_key;
+        self.apply_dh_ratchet(dh_output)
+    }
+
+    fn apply_dh_ratchet(&mut self, dh_output: [u8; 32]) -> Result<(), CryptoError> {
+        let (root_key, alice_to_bob, bob_to_alice) =
+            derive_dh_ratchet_state(self.root_key, dh_output)?;
+        let (send_chain_key, recv_chain_key) = self.role.chains(alice_to_bob, bob_to_alice);
+
+        self.root_key = root_key;
+        self.send_chain_key = send_chain_key;
+        self.recv_chain_key = recv_chain_key;
+        self.send_count = 0;
+        self.recv_count = 0;
+        self.skipped_message_keys.clear();
+        self.consumed_message_numbers.clear();
+
+        Ok(())
+    }
+
+    fn next_send_message_key(&mut self) -> Result<[u8; 32], CryptoError> {
+        let (next_chain_key, message_key) = advance_chain(self.send_chain_key)?;
+        self.send_chain_key = next_chain_key;
+        self.send_count += 1;
+
+        Ok(message_key)
+    }
+
+    fn next_recv_message_key(&mut self) -> Result<[u8; 32], CryptoError> {
+        let (next_chain_key, message_key) = advance_chain(self.recv_chain_key)?;
+        self.recv_chain_key = next_chain_key;
+        self.recv_count += 1;
+
+        Ok(message_key)
+    }
+}
+
+fn derive_directional_chains(root_key: [u8; 32]) -> Result<([u8; 32], [u8; 32]), CryptoError> {
+    let hkdf = Hkdf::<Sha256>::new(None, &root_key);
+    let mut output = [0u8; 64];
+    hkdf.expand(INITIAL_CHAIN_INFO, &mut output)
+        .map_err(|_| CryptoError::KeyDerivation)?;
+
+    let mut alice_to_bob = [0u8; 32];
+    let mut bob_to_alice = [0u8; 32];
+    alice_to_bob.copy_from_slice(&output[..32]);
+    bob_to_alice.copy_from_slice(&output[32..]);
+
+    Ok((alice_to_bob, bob_to_alice))
+}
+
+fn advance_chain(chain_key: [u8; 32]) -> Result<([u8; 32], [u8; 32]), CryptoError> {
+    let hkdf = Hkdf::<Sha256>::new(None, &chain_key);
+    let mut output = [0u8; 64];
+    hkdf.expand(CHAIN_STEP_INFO, &mut output)
+        .map_err(|_| CryptoError::KeyDerivation)?;
+
+    let mut next_chain_key = [0u8; 32];
+    let mut message_key = [0u8; 32];
+    next_chain_key.copy_from_slice(&output[..32]);
+    message_key.copy_from_slice(&output[32..]);
+
+    Ok((next_chain_key, message_key))
+}
+
+fn derive_dh_ratchet_state(
+    root_key: [u8; 32],
+    dh_output: [u8; 32],
+) -> Result<([u8; 32], [u8; 32], [u8; 32]), CryptoError> {
+    let hkdf = Hkdf::<Sha256>::new(Some(&root_key), &dh_output);
+    let mut output = [0u8; 96];
+    hkdf.expand(DH_RATCHET_INFO, &mut output)
+        .map_err(|_| CryptoError::KeyDerivation)?;
+
+    let mut next_root_key = [0u8; 32];
+    let mut alice_to_bob = [0u8; 32];
+    let mut bob_to_alice = [0u8; 32];
+    next_root_key.copy_from_slice(&output[..32]);
+    alice_to_bob.copy_from_slice(&output[32..64]);
+    bob_to_alice.copy_from_slice(&output[64..]);
+
+    Ok((next_root_key, alice_to_bob, bob_to_alice))
+}
+
+fn nonce_for(number: u64) -> [u8; 12] {
+    let mut nonce = [0u8; 12];
+    nonce[4..].copy_from_slice(&number.to_be_bytes());
+    nonce
+}
+
+fn ratchet_aad(number: u64, ratchet_public_key: PublicKeyBytes) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(LOCAL_AAD.len() + 8 + ratchet_public_key.len());
+    aad.extend_from_slice(LOCAL_AAD);
+    aad.extend_from_slice(&number.to_be_bytes());
+    aad.extend_from_slice(&ratchet_public_key);
+    aad
+}
+
 struct IdentityKeyPair {
     signing_key: SigningKey,
 }
@@ -114,13 +374,13 @@ impl IdentityKeyPair {
         SignedKeyExchange {
             identity_public_key,
             x25519_public_key,
-            signature: signature.to_bytes(),
+            signature: signature.to_bytes().to_vec(),
         }
     }
 
     fn sign_prekey(&self, signed_prekey_public_key: PublicKeyBytes) -> SignatureBytes {
         let signed_bytes = signed_prekey_bytes(self.public_key(), signed_prekey_public_key);
-        self.signing_key.sign(&signed_bytes).to_bytes()
+        self.signing_key.sign(&signed_bytes).to_bytes().to_vec()
     }
 }
 
@@ -234,7 +494,7 @@ impl Default for SimulatedDirectory {
 pub struct Alice {
     identity: IdentityKeyPair,
     keys: X25519KeyPair,
-    cipher: Option<ChaCha20Poly1305>,
+    session: Option<RatchetSession>,
 }
 
 pub struct Bob {
@@ -242,7 +502,7 @@ pub struct Bob {
     keys: X25519KeyPair,
     signed_prekey: X25519KeyPair,
     one_time_prekey: Option<OneTimePreKey>,
-    cipher: Option<ChaCha20Poly1305>,
+    session: Option<RatchetSession>,
 }
 
 impl Alice {
@@ -250,7 +510,7 @@ impl Alice {
         Self {
             identity: IdentityKeyPair::generate(),
             keys: X25519KeyPair::generate(),
-            cipher: None,
+            session: None,
         }
     }
 
@@ -268,23 +528,21 @@ impl Alice {
     ) -> Result<(), CryptoError> {
         verify_signed_key_exchange(bob_exchange)?;
         let key = self.keys.derive_aead_key(bob_exchange.x25519_public_key)?;
-        self.cipher = Some(ChaCha20Poly1305::new(&key.into()));
+        self.session = Some(RatchetSession::new(
+            key,
+            RatchetRole::Alice,
+            self.keys.clone(),
+            bob_exchange.x25519_public_key,
+        )?);
 
         Ok(())
     }
 
-    pub fn encrypt_for_bob(&self, message: &str) -> Result<Vec<u8>, CryptoError> {
-        self.cipher
-            .as_ref()
+    pub fn encrypt_for_bob(&mut self, message: &str) -> Result<RatchetMessage, CryptoError> {
+        self.session
+            .as_mut()
             .ok_or(CryptoError::MissingSessionKey)?
-            .encrypt(
-                Nonce::from_slice(&ONE_MESSAGE_NONCE),
-                Payload {
-                    msg: message.as_bytes(),
-                    aad: LOCAL_AAD,
-                },
-            )
-            .map_err(|_| CryptoError::Encrypt)
+            .encrypt(message)
     }
 
     pub fn encrypt_initial_message(
@@ -298,15 +556,27 @@ impl Alice {
         let first_dh = initial_keys.dh_bytes(bundle.signed_prekey_public_key);
         let second_dh = initial_keys.dh_bytes(bundle.one_time_prekey_public_key);
         let key = derive_prekey_aead_key(first_dh, second_dh)?;
-        self.cipher = Some(ChaCha20Poly1305::new(&key.into()));
+        self.session = Some(RatchetSession::new(
+            key,
+            RatchetRole::Alice,
+            initial_keys,
+            bundle.signed_prekey_public_key,
+        )?);
 
         let ciphertext = self.encrypt_for_bob(message)?;
 
         Ok(InitialMessage {
-            alice_initial_public_key: initial_keys.public_key(),
+            alice_initial_public_key: ciphertext.ratchet_public_key,
             one_time_prekey_id: bundle.one_time_prekey_id,
-            ciphertext,
+            message: ciphertext,
         })
+    }
+
+    pub fn rotate_sending_ratchet(&mut self) -> Result<(), CryptoError> {
+        self.session
+            .as_mut()
+            .ok_or(CryptoError::MissingSessionKey)?
+            .rotate_sending_ratchet()
     }
 }
 
@@ -317,7 +587,7 @@ impl Bob {
             keys: X25519KeyPair::generate(),
             signed_prekey: X25519KeyPair::generate(),
             one_time_prekey: Some(OneTimePreKey::generate(1)),
-            cipher: None,
+            session: None,
         }
     }
 
@@ -353,26 +623,21 @@ impl Bob {
         let key = self
             .keys
             .derive_aead_key(alice_exchange.x25519_public_key)?;
-        self.cipher = Some(ChaCha20Poly1305::new(&key.into()));
+        self.session = Some(RatchetSession::new(
+            key,
+            RatchetRole::Bob,
+            self.keys.clone(),
+            alice_exchange.x25519_public_key,
+        )?);
 
         Ok(())
     }
 
-    pub fn decrypt_from_alice(&self, ciphertext: &[u8]) -> Result<String, CryptoError> {
-        let plaintext = self
-            .cipher
-            .as_ref()
+    pub fn decrypt_from_alice(&mut self, message: &RatchetMessage) -> Result<String, CryptoError> {
+        self.session
+            .as_mut()
             .ok_or(CryptoError::MissingSessionKey)?
-            .decrypt(
-                Nonce::from_slice(&ONE_MESSAGE_NONCE),
-                Payload {
-                    msg: ciphertext,
-                    aad: LOCAL_AAD,
-                },
-            )
-            .map_err(|_| CryptoError::Decrypt)?;
-
-        String::from_utf8(plaintext).map_err(|_| CryptoError::Utf8)
+            .decrypt(message)
     }
 
     pub fn decrypt_initial_message(
@@ -396,14 +661,19 @@ impl Bob {
             .keys
             .dh_bytes(message.alice_initial_public_key);
         let key = derive_prekey_aead_key(first_dh, second_dh)?;
-        self.cipher = Some(ChaCha20Poly1305::new(&key.into()));
+        self.session = Some(RatchetSession::new(
+            key,
+            RatchetRole::Bob,
+            self.signed_prekey.clone(),
+            message.alice_initial_public_key,
+        )?);
 
-        self.decrypt_from_alice(&message.ciphertext)
+        self.decrypt_from_alice(&message.message)
     }
 }
 
-pub fn send_over_simulated_transport(ciphertext: Vec<u8>) -> Vec<u8> {
-    ciphertext
+pub fn send_over_simulated_transport<T>(payload: T) -> T {
+    payload
 }
 
 #[cfg(test)]
@@ -446,10 +716,10 @@ mod tests {
         bob.derive_session_key(&alice_exchange)
             .expect("bob derives session key");
 
-        let ciphertext = alice.encrypt_for_bob(message).expect("encrypt");
-        assert_ne!(ciphertext, message.as_bytes());
+        let encrypted = alice.encrypt_for_bob(message).expect("encrypt");
+        assert_ne!(encrypted.ciphertext, message.as_bytes());
 
-        let received_ciphertext = send_over_simulated_transport(ciphertext);
+        let received_ciphertext = send_over_simulated_transport(encrypted);
         let plaintext = bob
             .decrypt_from_alice(&received_ciphertext)
             .expect("decrypt");
@@ -470,10 +740,10 @@ mod tests {
         bob.derive_session_key(&alice_exchange)
             .expect("bob derives session key");
 
-        let mut ciphertext = alice.encrypt_for_bob("tamper with me").expect("encrypt");
-        ciphertext[0] ^= 0x01;
+        let mut encrypted = alice.encrypt_for_bob("tamper with me").expect("encrypt");
+        encrypted.ciphertext[0] ^= 0x01;
 
-        let received_ciphertext = send_over_simulated_transport(ciphertext);
+        let received_ciphertext = send_over_simulated_transport(encrypted);
         let result = bob.decrypt_from_alice(&received_ciphertext);
 
         assert_eq!(result, Err(CryptoError::Decrypt));
@@ -584,5 +854,174 @@ mod tests {
             Err(CryptoError::PreKeyUnavailable)
         );
         assert_eq!(bob.prekey_bundle(), Err(CryptoError::PreKeyUnavailable));
+    }
+
+    #[test]
+    fn consecutive_messages_use_different_encryption_keys() {
+        let root_key = [7u8; 32];
+        let (send_chain, _) = derive_directional_chains(root_key).expect("chains derive");
+        let (_, first_message_key) = advance_chain(send_chain).expect("first key");
+        let (second_chain, _) = advance_chain(send_chain).expect("first advance");
+        let (_, second_message_key) = advance_chain(second_chain).expect("second key");
+
+        assert_ne!(first_message_key, second_message_key);
+    }
+
+    #[test]
+    fn alice_and_bob_derive_compatible_ratchet_message_keys() {
+        let root_key = [9u8; 32];
+        let (alice_to_bob, bob_to_alice) =
+            derive_directional_chains(root_key).expect("chains derive");
+        let (_, alice_message_key) = advance_chain(alice_to_bob).expect("alice send key");
+        let (_, bob_message_key) = advance_chain(alice_to_bob).expect("bob receive key");
+
+        assert_eq!(alice_message_key, bob_message_key);
+        assert_ne!(alice_message_key, bob_to_alice);
+    }
+
+    #[test]
+    fn multiple_ratcheted_messages_encrypt_and_decrypt_successfully() {
+        let mut alice = Alice::local();
+        let mut bob = Bob::local();
+        let alice_exchange = alice.signed_key_exchange();
+        let bob_exchange = bob.signed_key_exchange();
+        alice
+            .derive_session_key(&bob_exchange)
+            .expect("alice derives session key");
+        bob.derive_session_key(&alice_exchange)
+            .expect("bob derives session key");
+
+        let first = send_over_simulated_transport(alice.encrypt_for_bob("one").expect("one"));
+        let second = send_over_simulated_transport(alice.encrypt_for_bob("two").expect("two"));
+        let third = send_over_simulated_transport(alice.encrypt_for_bob("three").expect("three"));
+
+        assert_eq!(bob.decrypt_from_alice(&first).expect("decrypt one"), "one");
+        assert_eq!(bob.decrypt_from_alice(&second).expect("decrypt two"), "two");
+        assert_eq!(
+            bob.decrypt_from_alice(&third).expect("decrypt three"),
+            "three"
+        );
+    }
+
+    #[test]
+    fn consumed_message_keys_are_not_reused() {
+        let mut alice = Alice::local();
+        let mut bob = Bob::local();
+        let alice_exchange = alice.signed_key_exchange();
+        let bob_exchange = bob.signed_key_exchange();
+        alice
+            .derive_session_key(&bob_exchange)
+            .expect("alice derives session key");
+        bob.derive_session_key(&alice_exchange)
+            .expect("bob derives session key");
+
+        let encrypted = alice.encrypt_for_bob("use once").expect("encrypt");
+        assert_eq!(
+            bob.decrypt_from_alice(&encrypted).expect("first decrypt"),
+            "use once"
+        );
+
+        assert_eq!(bob.decrypt_from_alice(&encrypted), Err(CryptoError::Replay));
+    }
+
+    #[test]
+    fn replayed_message_is_rejected() {
+        let mut alice = Alice::local();
+        let mut bob = Bob::local();
+        let alice_exchange = alice.signed_key_exchange();
+        let bob_exchange = bob.signed_key_exchange();
+        alice
+            .derive_session_key(&bob_exchange)
+            .expect("alice derives session key");
+        bob.derive_session_key(&alice_exchange)
+            .expect("bob derives session key");
+
+        let encrypted = alice.encrypt_for_bob("no replay").expect("encrypt");
+        bob.decrypt_from_alice(&encrypted).expect("first decrypt");
+        let replay = send_over_simulated_transport(encrypted);
+
+        assert_eq!(bob.decrypt_from_alice(&replay), Err(CryptoError::Replay));
+    }
+
+    #[test]
+    fn limited_out_of_order_delivery_decrypts_correctly() {
+        let mut alice = Alice::local();
+        let mut bob = Bob::local();
+        let alice_exchange = alice.signed_key_exchange();
+        let bob_exchange = bob.signed_key_exchange();
+        alice
+            .derive_session_key(&bob_exchange)
+            .expect("alice derives session key");
+        bob.derive_session_key(&alice_exchange)
+            .expect("bob derives session key");
+
+        let first = alice.encrypt_for_bob("first").expect("first");
+        let second = alice.encrypt_for_bob("second").expect("second");
+        let third = alice.encrypt_for_bob("third").expect("third");
+
+        assert_eq!(bob.decrypt_from_alice(&third).expect("third"), "third");
+        assert_eq!(bob.decrypt_from_alice(&first).expect("first"), "first");
+        assert_eq!(bob.decrypt_from_alice(&second).expect("second"), "second");
+    }
+
+    #[test]
+    fn dh_ratchet_step_changes_state_and_communication_still_succeeds() {
+        let mut alice = Alice::local();
+        let mut bob = Bob::local();
+        let alice_exchange = alice.signed_key_exchange();
+        let bob_exchange = bob.signed_key_exchange();
+        alice
+            .derive_session_key(&bob_exchange)
+            .expect("alice derives session key");
+        bob.derive_session_key(&alice_exchange)
+            .expect("bob derives session key");
+
+        let old_root = alice.session.as_ref().expect("alice session").root_key;
+        alice
+            .rotate_sending_ratchet()
+            .expect("alice rotates sending ratchet");
+        let ratcheted = alice
+            .encrypt_for_bob("after dh ratchet")
+            .expect("encrypt after ratchet");
+
+        assert_ne!(
+            old_root,
+            alice.session.as_ref().expect("alice session").root_key
+        );
+        assert_eq!(
+            bob.decrypt_from_alice(&ratcheted).expect("bob decrypts"),
+            "after dh ratchet"
+        );
+        assert_eq!(
+            alice.session.as_ref().expect("alice session").root_key,
+            bob.session.as_ref().expect("bob session").root_key
+        );
+    }
+
+    #[test]
+    fn prekey_bundle_and_initial_message_serialize_as_network_bytes() {
+        let mut alice = Alice::local();
+        let bob = Bob::local();
+        let bundle = bob.prekey_bundle().expect("bob publishes prekey bundle");
+
+        let bundle_bytes = bincode::serialize(&bundle).expect("serialize bundle");
+        assert!(!bundle_bytes
+            .windows("hello network".len())
+            .any(|window| window == b"hello network"));
+        let decoded_bundle: PreKeyBundle =
+            bincode::deserialize(&bundle_bytes).expect("deserialize bundle");
+        assert_eq!(decoded_bundle, bundle);
+
+        let initial_message = alice
+            .encrypt_initial_message(&decoded_bundle, "hello network")
+            .expect("encrypt initial message");
+        let message_bytes = bincode::serialize(&initial_message).expect("serialize message");
+        assert!(!message_bytes
+            .windows("hello network".len())
+            .any(|window| window == b"hello network"));
+        let decoded_message: InitialMessage =
+            bincode::deserialize(&message_bytes).expect("deserialize message");
+
+        assert_eq!(decoded_message, initial_message);
     }
 }
