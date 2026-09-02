@@ -14,6 +14,7 @@ use std::{
 };
 use x25519_dalek::{PublicKey, StaticSecret};
 
+pub mod crdt;
 pub mod mailbox_storage;
 pub mod storage;
 

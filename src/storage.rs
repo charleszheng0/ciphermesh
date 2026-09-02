@@ -1,5 +1,6 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use std::{
+    collections::BTreeMap,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -100,6 +101,19 @@ pub struct OutboxItem {
     pub last_attempt_unix_secs: Option<u64>,
 }
 
+pub type VersionVector = BTreeMap<String, u64>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventRecord {
+    pub device_id: String,
+    pub counter: u64,
+    pub conversation_id: String,
+    pub event_type: String,
+    pub message_id: Option<String>,
+    pub payload: Vec<u8>,
+    pub created_at_unix_secs: u64,
+}
+
 pub struct Storage {
     conn: Connection,
 }
@@ -165,6 +179,32 @@ impl Storage {
             CREATE TABLE IF NOT EXISTS accepted_messages (
                 message_id TEXT PRIMARY KEY,
                 accepted_at_unix_secs INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS device_counters (
+                device_id TEXT PRIMARY KEY,
+                next_counter INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS event_history (
+                device_id TEXT NOT NULL,
+                counter INTEGER NOT NULL,
+                conversation_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                message_id TEXT,
+                payload BLOB NOT NULL,
+                created_at_unix_secs INTEGER NOT NULL,
+                PRIMARY KEY (device_id, counter)
+            );
+
+            CREATE INDEX IF NOT EXISTS event_history_conversation_idx
+            ON event_history (conversation_id, device_id, counter);
+
+            CREATE TABLE IF NOT EXISTS version_vectors (
+                conversation_id TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                contiguous_counter INTEGER NOT NULL,
+                PRIMARY KEY (conversation_id, device_id)
             );
             ",
         )
@@ -504,6 +544,122 @@ impl Storage {
         Ok(inserted == 1)
     }
 
+    pub fn next_local_event_counter(&mut self, device_id: &str) -> StorageResult<u64> {
+        let tx = self.conn.transaction()?;
+        let current = tx
+            .query_row(
+                "SELECT next_counter FROM device_counters WHERE device_id = ?1",
+                params![device_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(1);
+        let next = current + 1;
+
+        tx.execute(
+            "
+            INSERT INTO device_counters (device_id, next_counter)
+            VALUES (?1, ?2)
+            ON CONFLICT(device_id) DO UPDATE SET
+                next_counter = excluded.next_counter
+            ",
+            params![device_id, next],
+        )?;
+        tx.commit()?;
+        Ok(current as u64)
+    }
+
+    pub fn append_event(&self, event: &EventRecord) -> StorageResult<bool> {
+        let inserted = self.conn.execute(
+            "
+            INSERT OR IGNORE INTO event_history (
+                device_id,
+                counter,
+                conversation_id,
+                event_type,
+                message_id,
+                payload,
+                created_at_unix_secs
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ",
+            params![
+                &event.device_id,
+                event.counter as i64,
+                &event.conversation_id,
+                &event.event_type,
+                &event.message_id,
+                &event.payload,
+                event.created_at_unix_secs as i64,
+            ],
+        )?;
+
+        self.refresh_vector_for_device(&event.conversation_id, &event.device_id)?;
+        Ok(inserted == 1)
+    }
+
+    pub fn append_events(&self, events: &[EventRecord]) -> StorageResult<usize> {
+        let mut inserted = 0;
+        for event in events {
+            if self.append_event(event)? {
+                inserted += 1;
+            }
+        }
+        Ok(inserted)
+    }
+
+    pub fn version_vector(&self, conversation_id: &str) -> StorageResult<VersionVector> {
+        let mut statement = self.conn.prepare(
+            "
+            SELECT device_id, contiguous_counter
+            FROM version_vectors
+            WHERE conversation_id = ?1
+            ORDER BY device_id
+            ",
+        )?;
+        let rows = statement.query_map(params![conversation_id], |row| {
+            let device_id: String = row.get(0)?;
+            let counter: i64 = row.get(1)?;
+            Ok((device_id, counter as u64))
+        })?;
+
+        rows.collect()
+    }
+
+    pub fn missing_events_for(
+        &self,
+        conversation_id: &str,
+        peer_vector: &VersionVector,
+    ) -> StorageResult<Vec<EventRecord>> {
+        let mut statement = self.conn.prepare(
+            "
+            SELECT
+                device_id,
+                counter,
+                conversation_id,
+                event_type,
+                message_id,
+                payload,
+                created_at_unix_secs
+            FROM event_history
+            WHERE conversation_id = ?1
+            ORDER BY device_id, counter
+            ",
+        )?;
+        let rows = statement.query_map(params![conversation_id], event_from_row)?;
+        let mut missing = Vec::new();
+
+        for row in rows {
+            let event = row?;
+            let seen = peer_vector.get(&event.device_id).copied().unwrap_or(0);
+            if event.counter > seen {
+                missing.push(event);
+            }
+        }
+
+        Ok(missing)
+    }
+
     pub fn messages_for_conversation(
         &self,
         conversation_id: &str,
@@ -570,6 +726,46 @@ impl Storage {
         let rows = statement.query_map(params![status.as_str()], outbox_item_from_row)?;
         rows.collect()
     }
+
+    fn refresh_vector_for_device(
+        &self,
+        conversation_id: &str,
+        device_id: &str,
+    ) -> StorageResult<()> {
+        let mut statement = self.conn.prepare(
+            "
+            SELECT counter
+            FROM event_history
+            WHERE conversation_id = ?1
+              AND device_id = ?2
+            ORDER BY counter
+            ",
+        )?;
+        let counters = statement.query_map(params![conversation_id, device_id], |row| {
+            row.get::<_, i64>(0)
+        })?;
+
+        let mut contiguous = 0;
+        for counter in counters {
+            let counter = counter? as u64;
+            if counter == contiguous + 1 {
+                contiguous = counter;
+            } else if counter > contiguous + 1 {
+                break;
+            }
+        }
+
+        self.conn.execute(
+            "
+            INSERT INTO version_vectors (conversation_id, device_id, contiguous_counter)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(conversation_id, device_id) DO UPDATE SET
+                contiguous_counter = excluded.contiguous_counter
+            ",
+            params![conversation_id, device_id, contiguous as i64],
+        )?;
+        Ok(())
+    }
 }
 
 fn outbox_item_from_row(row: &rusqlite::Row<'_>) -> StorageResult<OutboxItem> {
@@ -586,6 +782,21 @@ fn outbox_item_from_row(row: &rusqlite::Row<'_>) -> StorageResult<OutboxItem> {
         retry_count: retry_count as u64,
         created_at_unix_secs: created_at as u64,
         last_attempt_unix_secs: last_attempt.map(|value| value as u64),
+    })
+}
+
+fn event_from_row(row: &rusqlite::Row<'_>) -> StorageResult<EventRecord> {
+    let counter: i64 = row.get(1)?;
+    let created_at: i64 = row.get(6)?;
+
+    Ok(EventRecord {
+        device_id: row.get(0)?,
+        counter: counter as u64,
+        conversation_id: row.get(2)?,
+        event_type: row.get(3)?,
+        message_id: row.get(4)?,
+        payload: row.get(5)?,
+        created_at_unix_secs: created_at as u64,
     })
 }
 
@@ -716,5 +927,173 @@ mod tests {
         assert!(!storage
             .accept_message_once("message-1")
             .expect("duplicate accept"));
+    }
+
+    #[test]
+    fn sync_exchanges_only_missing_events_and_updates_vectors() {
+        let alice = Storage::open_in_memory().expect("alice storage");
+        let bob = Storage::open_in_memory().expect("bob storage");
+        let conversation = "conversation";
+
+        for event in [
+            event("AliceDevice", 1),
+            event("AliceDevice", 2),
+            event("AliceDevice", 3),
+            event("BobDevice", 1),
+        ] {
+            alice.append_event(&event).expect("alice append");
+        }
+        for event in [
+            event("AliceDevice", 1),
+            event("AliceDevice", 2),
+            event("BobDevice", 1),
+            event("BobDevice", 2),
+        ] {
+            bob.append_event(&event).expect("bob append");
+        }
+
+        assert_eq!(alice.version_vector(conversation).expect("alice vector"), {
+            let mut vector = VersionVector::new();
+            vector.insert("AliceDevice".to_string(), 3);
+            vector.insert("BobDevice".to_string(), 1);
+            vector
+        });
+        assert_eq!(bob.version_vector(conversation).expect("bob vector"), {
+            let mut vector = VersionVector::new();
+            vector.insert("AliceDevice".to_string(), 2);
+            vector.insert("BobDevice".to_string(), 2);
+            vector
+        });
+
+        let bob_to_alice = bob
+            .missing_events_for(conversation, &alice.version_vector(conversation).unwrap())
+            .expect("bob missing for alice");
+        let alice_to_bob = alice
+            .missing_events_for(conversation, &bob.version_vector(conversation).unwrap())
+            .expect("alice missing for bob");
+
+        assert_eq!(
+            bob_to_alice
+                .iter()
+                .map(|event| (&event.device_id, event.counter))
+                .collect::<Vec<_>>(),
+            vec![(&"BobDevice".to_string(), 2)]
+        );
+        assert_eq!(
+            alice_to_bob
+                .iter()
+                .map(|event| (&event.device_id, event.counter))
+                .collect::<Vec<_>>(),
+            vec![(&"AliceDevice".to_string(), 3)]
+        );
+
+        alice.append_events(&bob_to_alice).expect("alice receives");
+        bob.append_events(&alice_to_bob).expect("bob receives");
+
+        let mut expected = VersionVector::new();
+        expected.insert("AliceDevice".to_string(), 3);
+        expected.insert("BobDevice".to_string(), 2);
+        assert_eq!(alice.version_vector(conversation).unwrap(), expected);
+        assert_eq!(bob.version_vector(conversation).unwrap(), expected);
+    }
+
+    #[test]
+    fn duplicate_event_delivery_is_idempotent() {
+        let storage = Storage::open_in_memory().expect("storage");
+        let event = event("AliceDevice", 1);
+
+        assert!(storage.append_event(&event).expect("first append"));
+        assert!(!storage.append_event(&event).expect("duplicate append"));
+        assert_eq!(
+            storage.version_vector("conversation").expect("vector")["AliceDevice"],
+            1
+        );
+    }
+
+    #[test]
+    fn out_of_order_event_arrival_advances_when_gap_fills() {
+        let storage = Storage::open_in_memory().expect("storage");
+
+        storage
+            .append_event(&event("AliceDevice", 2))
+            .expect("append two first");
+        assert_eq!(
+            storage
+                .version_vector("conversation")
+                .expect("vector after gap")["AliceDevice"],
+            0
+        );
+
+        storage
+            .append_event(&event("AliceDevice", 1))
+            .expect("append one");
+        assert_eq!(
+            storage
+                .version_vector("conversation")
+                .expect("vector after fill")["AliceDevice"],
+            2
+        );
+    }
+
+    #[test]
+    fn missing_counter_gap_blocks_vector_advancement() {
+        let storage = Storage::open_in_memory().expect("storage");
+
+        storage.append_event(&event("AliceDevice", 1)).unwrap();
+        storage.append_event(&event("AliceDevice", 2)).unwrap();
+        storage.append_event(&event("AliceDevice", 4)).unwrap();
+
+        assert_eq!(
+            storage.version_vector("conversation").unwrap()["AliceDevice"],
+            2
+        );
+    }
+
+    #[test]
+    fn local_counter_survives_storage_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "ciphermesh-sync-counter-{}.sqlite",
+            now_unix_secs()
+        ));
+
+        {
+            let mut storage = Storage::open(&path).expect("open first");
+            assert_eq!(
+                storage
+                    .next_local_event_counter("AliceDevice")
+                    .expect("first counter"),
+                1
+            );
+            assert_eq!(
+                storage
+                    .next_local_event_counter("AliceDevice")
+                    .expect("second counter"),
+                2
+            );
+        }
+
+        {
+            let mut storage = Storage::open(&path).expect("open second");
+            assert_eq!(
+                storage
+                    .next_local_event_counter("AliceDevice")
+                    .expect("third counter"),
+                3
+            );
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn event(device_id: &str, counter: u64) -> EventRecord {
+        EventRecord {
+            device_id: device_id.to_string(),
+            counter,
+            conversation_id: "conversation".to_string(),
+            event_type: "message".to_string(),
+            message_id: Some(format!("{device_id}-{counter}")),
+            payload: format!("{device_id}:{counter}").into_bytes(),
+            created_at_unix_secs: 10 + counter,
+        }
     }
 }

@@ -1,8 +1,9 @@
 use ciphermesh::{
+    crdt::{event_record, materialize_conversation, ConversationEvent},
     mailbox_storage::{mailbox_now_unix_secs, MailboxEnvelopeRecord, MailboxStorage},
     storage::{
-        now_unix_secs, MessageDirection, MessageRecord, MessageStatus, OutboxItem, OutboxStatus,
-        Storage,
+        now_unix_secs, EventRecord, MessageDirection, MessageRecord, MessageStatus, OutboxItem,
+        OutboxStatus, Storage, VersionVector,
     },
     Alice, AliceState, Bob, BobState, InitialMessage, PreKeyBundle, RatchetMessage,
     SimulatedDirectory,
@@ -128,6 +129,8 @@ async fn main() -> AppResult<()> {
                 .unwrap_or_else(|| PathBuf::from("target/ciphermesh-4b-outbox-demo.sqlite"));
             run_outbox_demo(&db_path)
         }
+        Some("sync-demo") => run_sync_demo(),
+        Some("crdt-demo") => run_crdt_demo(),
         _ => {
             run_local_demo()?;
             print_usage();
@@ -178,6 +181,12 @@ fn print_usage() {
     println!();
     println!("Phase 4B durable outbox demo:");
     println!("  cargo run -- outbox-demo [target/ciphermesh-4b-outbox-demo.sqlite]");
+    println!();
+    println!("Phase 4D version-vector sync demo:");
+    println!("  cargo run -- sync-demo");
+    println!();
+    println!("Phase 4E deterministic convergence demo:");
+    println!("  cargo run -- crdt-demo");
 }
 
 fn run_local_demo() -> AppResult<()> {
@@ -595,6 +604,204 @@ fn run_outbox_demo(db_path: &Path) -> AppResult<()> {
     Ok(())
 }
 
+fn run_sync_demo() -> AppResult<()> {
+    let alice = Storage::open_in_memory()?;
+    let bob = Storage::open_in_memory()?;
+    let conversation_id = "demo-conversation";
+
+    for event in [
+        demo_sync_event("AliceDevice", 1),
+        demo_sync_event("AliceDevice", 2),
+        demo_sync_event("AliceDevice", 3),
+        demo_sync_event("BobDevice", 1),
+    ] {
+        alice.append_event(&event)?;
+    }
+    for event in [
+        demo_sync_event("AliceDevice", 1),
+        demo_sync_event("AliceDevice", 2),
+        demo_sync_event("BobDevice", 1),
+        demo_sync_event("BobDevice", 2),
+    ] {
+        bob.append_event(&event)?;
+    }
+
+    let alice_vector = alice.version_vector(conversation_id)?;
+    let bob_vector = bob.version_vector(conversation_id)?;
+    println!("Alice starts with vector: {alice_vector:?}");
+    println!("Bob starts with vector: {bob_vector:?}");
+
+    let alice_request = SyncRequest {
+        version_vector: alice_vector.clone(),
+    };
+    let bob_missing_for_alice =
+        bob.missing_events_for(conversation_id, &alice_request.version_vector)?;
+    let bob_response = SyncResponse {
+        events: bob_missing_for_alice
+            .into_iter()
+            .map(SyncEvent::from)
+            .collect(),
+    };
+    println!(
+        "Bob sends Alice {} missing event(s): {:?}",
+        bob_response.events.len(),
+        sync_event_positions(&bob_response.events)
+    );
+    let bob_response_bytes = bincode::serialize(&bob_response)?;
+    let decoded_bob_response: SyncResponse = bincode::deserialize(&bob_response_bytes)?;
+    let alice_received = decoded_bob_response
+        .events
+        .into_iter()
+        .map(EventRecord::from)
+        .collect::<Vec<_>>();
+    alice.append_events(&alice_received)?;
+
+    let bob_request = SyncRequest {
+        version_vector: bob_vector.clone(),
+    };
+    let alice_missing_for_bob =
+        alice.missing_events_for(conversation_id, &bob_request.version_vector)?;
+    let alice_response = SyncResponse {
+        events: alice_missing_for_bob
+            .into_iter()
+            .map(SyncEvent::from)
+            .collect(),
+    };
+    println!(
+        "Alice sends Bob {} missing event(s): {:?}",
+        alice_response.events.len(),
+        sync_event_positions(&alice_response.events)
+    );
+    let alice_response_bytes = bincode::serialize(&alice_response)?;
+    let decoded_alice_response: SyncResponse = bincode::deserialize(&alice_response_bytes)?;
+    let bob_received = decoded_alice_response
+        .events
+        .into_iter()
+        .map(EventRecord::from)
+        .collect::<Vec<_>>();
+    bob.append_events(&bob_received)?;
+
+    println!(
+        "Alice final vector: {:?}",
+        alice.version_vector(conversation_id)?
+    );
+    println!(
+        "Bob final vector: {:?}",
+        bob.version_vector(conversation_id)?
+    );
+    println!("No CRDT merge semantics are applied here; this demo only syncs missing append-only events.");
+
+    Ok(())
+}
+
+fn run_crdt_demo() -> AppResult<()> {
+    let alice = Storage::open_in_memory()?;
+    let bob = Storage::open_in_memory()?;
+    let conversation_id = "crdt-demo-conversation";
+    let create = crdt_demo_event(
+        conversation_id,
+        "AliceDevice",
+        1,
+        ConversationEvent::MessageCreated {
+            message_id: "message-1".to_string(),
+            author_id: "alice".to_string(),
+            payload: b"hello converged bob".to_vec(),
+        },
+    )?;
+    let alice_reaction = crdt_demo_event(
+        conversation_id,
+        "AliceDevice",
+        2,
+        ConversationEvent::ReactionAdded {
+            message_id: "message-1".to_string(),
+            reaction: "+1".to_string(),
+            actor_id: "alice".to_string(),
+        },
+    )?;
+    let bob_reaction = crdt_demo_event(
+        conversation_id,
+        "BobDevice",
+        1,
+        ConversationEvent::ReactionAdded {
+            message_id: "message-1".to_string(),
+            reaction: "<3".to_string(),
+            actor_id: "bob".to_string(),
+        },
+    )?;
+    let bob_read = crdt_demo_event(
+        conversation_id,
+        "BobDevice",
+        2,
+        ConversationEvent::ReadAdvanced {
+            actor_id: "bob".to_string(),
+            read_device_id: "AliceDevice".to_string(),
+            read_counter: 2,
+        },
+    )?;
+
+    alice.append_event(&alice_reaction)?;
+    alice.append_event(&create)?;
+    bob.append_event(&bob_read)?;
+    bob.append_event(&bob_reaction)?;
+    bob.append_event(&create)?;
+
+    println!(
+        "Alice pre-sync state: {:?}",
+        materialize_conversation(&all_sync_events(&alice, conversation_id)?)
+    );
+    println!(
+        "Bob pre-sync state: {:?}",
+        materialize_conversation(&all_sync_events(&bob, conversation_id)?)
+    );
+
+    let alice_vector = alice.version_vector(conversation_id)?;
+    let bob_vector = bob.version_vector(conversation_id)?;
+    let bob_to_alice = bob.missing_events_for(conversation_id, &alice_vector)?;
+    let alice_to_bob = alice.missing_events_for(conversation_id, &bob_vector)?;
+    alice.append_events(&bob_to_alice)?;
+    bob.append_events(&alice_to_bob)?;
+
+    let alice_state = materialize_conversation(&all_sync_events(&alice, conversation_id)?);
+    let bob_state = materialize_conversation(&all_sync_events(&bob, conversation_id)?);
+    println!("Alice final state: {alice_state:?}");
+    println!("Bob final state: {bob_state:?}");
+    println!("Converged: {}", alice_state == bob_state);
+
+    Ok(())
+}
+
+fn demo_sync_event(device_id: &str, counter: u64) -> EventRecord {
+    EventRecord {
+        device_id: device_id.to_string(),
+        counter,
+        conversation_id: "demo-conversation".to_string(),
+        event_type: "message".to_string(),
+        message_id: Some(format!("{device_id}-{counter}")),
+        payload: format!("{device_id}:{counter}").into_bytes(),
+        created_at_unix_secs: now_unix_secs(),
+    }
+}
+
+fn crdt_demo_event(
+    conversation_id: &str,
+    device_id: &str,
+    counter: u64,
+    event: ConversationEvent,
+) -> AppResult<EventRecord> {
+    Ok(event_record(conversation_id, device_id, counter, event)?)
+}
+
+fn all_sync_events(storage: &Storage, conversation_id: &str) -> AppResult<Vec<EventRecord>> {
+    Ok(storage.missing_events_for(conversation_id, &VersionVector::new())?)
+}
+
+fn sync_event_positions(events: &[SyncEvent]) -> Vec<String> {
+    events
+        .iter()
+        .map(|event| format!("{}:{}", event.device_id, event.counter))
+        .collect()
+}
+
 fn deliver_outbox_item_to_bob(
     storage: &mut Storage,
     bob: &mut Bob,
@@ -925,6 +1132,55 @@ struct DurableAppEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DurableAck {
     message_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SyncEvent {
+    device_id: String,
+    counter: u64,
+    conversation_id: String,
+    event_type: String,
+    message_id: Option<String>,
+    payload: Vec<u8>,
+    created_at_unix_secs: u64,
+}
+
+impl From<EventRecord> for SyncEvent {
+    fn from(event: EventRecord) -> Self {
+        Self {
+            device_id: event.device_id,
+            counter: event.counter,
+            conversation_id: event.conversation_id,
+            event_type: event.event_type,
+            message_id: event.message_id,
+            payload: event.payload,
+            created_at_unix_secs: event.created_at_unix_secs,
+        }
+    }
+}
+
+impl From<SyncEvent> for EventRecord {
+    fn from(event: SyncEvent) -> Self {
+        Self {
+            device_id: event.device_id,
+            counter: event.counter,
+            conversation_id: event.conversation_id,
+            event_type: event.event_type,
+            message_id: event.message_id,
+            payload: event.payload,
+            created_at_unix_secs: event.created_at_unix_secs,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SyncRequest {
+    version_vector: VersionVector,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SyncResponse {
+    events: Vec<SyncEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
