@@ -56,6 +56,7 @@ pub type AccountId = String;
 pub type DeviceId = String;
 
 const DEVICE_CERTIFICATE_CONTEXT: &[u8] = b"ciphermesh.phase-5a.device-certificate";
+const DEVICE_REVOCATION_CONTEXT: &[u8] = b"ciphermesh.phase-5d.device-revocation";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedKeyExchange {
@@ -149,6 +150,14 @@ pub struct DeviceCertificate {
     pub device_id: DeviceId,
     pub device_ed25519_public_key: IdentityPublicKeyBytes,
     pub device_x25519_public_key: PublicKeyBytes,
+    pub signature: SignatureBytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceRevocation {
+    pub account_id: AccountId,
+    pub device_id: DeviceId,
+    pub revocation_counter: u64,
     pub signature: SignatureBytes,
 }
 
@@ -730,6 +739,27 @@ impl AccountIdentity {
             .to_vec();
         certificate
     }
+
+    pub fn revoke_device(
+        &self,
+        device_id: impl Into<DeviceId>,
+        revocation_counter: u64,
+    ) -> DeviceRevocation {
+        let mut revocation = DeviceRevocation {
+            account_id: self.account_id.clone(),
+            device_id: device_id.into(),
+            revocation_counter,
+            signature: Vec::new(),
+        };
+        let signed_bytes = device_revocation_bytes(&revocation);
+        revocation.signature = self
+            .identity
+            .signing_key
+            .sign(&signed_bytes)
+            .to_bytes()
+            .to_vec();
+        revocation
+    }
 }
 
 impl DeviceIdentity {
@@ -911,6 +941,60 @@ pub fn verify_authorized_sibling_devices(
     Ok(())
 }
 
+pub fn verify_device_revocation(
+    account_public_key: IdentityPublicKeyBytes,
+    revocation: &DeviceRevocation,
+) -> Result<(), CryptoError> {
+    if revocation.account_id != account_id_for_public_key(account_public_key) {
+        return Err(CryptoError::SignatureVerification);
+    }
+
+    let verifying_key = VerifyingKey::from_bytes(&account_public_key)
+        .map_err(|_| CryptoError::SignatureVerification)?;
+    let signature = Signature::try_from(&revocation.signature[..])
+        .map_err(|_| CryptoError::SignatureVerification)?;
+
+    verifying_key
+        .verify(&device_revocation_bytes(revocation), &signature)
+        .map_err(|_| CryptoError::SignatureVerification)
+}
+
+pub fn is_device_currently_authorized(
+    account_public_key: IdentityPublicKeyBytes,
+    certificate: &DeviceCertificate,
+    revocations: &[DeviceRevocation],
+) -> Result<bool, CryptoError> {
+    verify_device_certificate(account_public_key, certificate)?;
+
+    for revocation in revocations {
+        if revocation.account_id == certificate.account_id
+            && revocation.device_id == certificate.device_id
+        {
+            verify_device_revocation(account_public_key, revocation)?;
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+pub fn active_device_certificates(
+    account_public_key: IdentityPublicKeyBytes,
+    certificates: &[DeviceCertificate],
+    revocations: &[DeviceRevocation],
+) -> Result<Vec<DeviceCertificate>, CryptoError> {
+    certificates
+        .iter()
+        .filter_map(|certificate| {
+            match is_device_currently_authorized(account_public_key, certificate, revocations) {
+                Ok(true) => Some(Ok(certificate.clone())),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect()
+}
+
 fn account_id_for_public_key(public_key: IdentityPublicKeyBytes) -> AccountId {
     format!("acct-{}", short_hash(&public_key))
 }
@@ -935,6 +1019,17 @@ fn device_certificate_bytes(certificate: &DeviceCertificate) -> Vec<u8> {
     bytes.push(0);
     bytes.extend_from_slice(&certificate.device_ed25519_public_key);
     bytes.extend_from_slice(&certificate.device_x25519_public_key);
+    bytes
+}
+
+fn device_revocation_bytes(revocation: &DeviceRevocation) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(DEVICE_REVOCATION_CONTEXT);
+    bytes.extend_from_slice(revocation.account_id.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(revocation.device_id.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(&revocation.revocation_counter.to_be_bytes());
     bytes
 }
 
@@ -1529,6 +1624,53 @@ mod tests {
             verify_authorized_sibling_devices(account.public_key(), &laptop_cert, &phone_cert),
             Err(CryptoError::SignatureVerification)
         );
+    }
+
+    #[test]
+    fn revoked_device_certificate_is_not_currently_authorized() {
+        let account = AccountIdentity::generate();
+        let phone = DeviceIdentity::generate(account.account_id());
+        let certificate = account.authorize_device(&phone);
+        let revocation = account.revoke_device(phone.device_id().to_string(), 1);
+
+        verify_device_certificate(account.public_key(), &certificate)
+            .expect("old certificate was valid");
+        verify_device_revocation(account.public_key(), &revocation).expect("revocation verifies");
+        assert_eq!(
+            is_device_currently_authorized(account.public_key(), &certificate, &[revocation]),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn modified_device_revocation_fails_verification() {
+        let account = AccountIdentity::generate();
+        let phone = DeviceIdentity::generate(account.account_id());
+        let mut revocation = account.revoke_device(phone.device_id().to_string(), 1);
+
+        revocation.device_id.push_str("-modified");
+
+        assert_eq!(
+            verify_device_revocation(account.public_key(), &revocation),
+            Err(CryptoError::SignatureVerification)
+        );
+    }
+
+    #[test]
+    fn active_device_certificates_excludes_revoked_phone() {
+        let (account, laptop, phone, _, laptop_cert, phone_cert) = fanout_identities();
+        let revocation = account.revoke_device(phone.device_id().to_string(), 1);
+
+        let active = active_device_certificates(
+            account.public_key(),
+            &[laptop_cert, phone_cert],
+            &[revocation],
+        )
+        .expect("active list");
+
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].device_id, laptop.device_id());
+        assert_ne!(active[0].device_id, phone.device_id());
     }
 
     #[test]

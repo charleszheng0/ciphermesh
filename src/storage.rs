@@ -239,6 +239,15 @@ impl Storage {
                 updated_at_unix_secs INTEGER NOT NULL,
                 PRIMARY KEY (account_id, device_id)
             );
+
+            CREATE TABLE IF NOT EXISTS device_revocations (
+                account_id TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                revocation_counter INTEGER NOT NULL,
+                revocation BLOB NOT NULL,
+                updated_at_unix_secs INTEGER NOT NULL,
+                PRIMARY KEY (account_id, device_id)
+            );
             ",
         )
     }
@@ -828,6 +837,56 @@ impl Storage {
         rows.collect()
     }
 
+    pub fn save_device_revocation(
+        &self,
+        account_id: &str,
+        device_id: &str,
+        revocation_counter: u64,
+        revocation: &[u8],
+    ) -> StorageResult<()> {
+        self.conn.execute(
+            "
+            INSERT INTO device_revocations (
+                account_id,
+                device_id,
+                revocation_counter,
+                revocation,
+                updated_at_unix_secs
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(account_id, device_id) DO UPDATE SET
+                revocation_counter = MAX(device_revocations.revocation_counter, excluded.revocation_counter),
+                revocation = CASE
+                    WHEN excluded.revocation_counter >= device_revocations.revocation_counter
+                    THEN excluded.revocation
+                    ELSE device_revocations.revocation
+                END,
+                updated_at_unix_secs = excluded.updated_at_unix_secs
+            ",
+            params![
+                account_id,
+                device_id,
+                revocation_counter as i64,
+                revocation,
+                now_unix_secs() as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn device_revocations_for_account(&self, account_id: &str) -> StorageResult<Vec<Vec<u8>>> {
+        let mut statement = self.conn.prepare(
+            "
+            SELECT revocation
+            FROM device_revocations
+            WHERE account_id = ?1
+            ORDER BY device_id
+            ",
+        )?;
+        let rows = statement.query_map(params![account_id], |row| row.get(0))?;
+        rows.collect()
+    }
+
     pub fn next_local_event_counter(&mut self, device_id: &str) -> StorageResult<u64> {
         let tx = self.conn.transaction()?;
         let current = tx
@@ -1094,6 +1153,7 @@ pub fn now_unix_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crdt::{event_record, materialize_conversation, ConversationEvent};
 
     #[test]
     fn transaction_persists_session_and_message_together() {
@@ -1342,6 +1402,142 @@ mod tests {
     }
 
     #[test]
+    fn own_device_sync_copies_missing_events_without_renumbering() {
+        let laptop = Storage::open_in_memory().expect("laptop");
+        let phone = Storage::open_in_memory().expect("phone");
+        let conversation = "own-device-conversation";
+
+        for counter in 1..=3 {
+            let event = own_device_event(conversation, "AliceLaptop", counter);
+            laptop.append_event(&event).expect("laptop append");
+            if counter == 1 {
+                phone.append_event(&event).expect("phone already has first");
+            }
+        }
+
+        let missing_for_phone = laptop
+            .missing_events_for(conversation, &phone.version_vector(conversation).unwrap())
+            .expect("missing for phone");
+
+        assert_eq!(
+            missing_for_phone
+                .iter()
+                .map(|event| (event.device_id.as_str(), event.counter))
+                .collect::<Vec<_>>(),
+            vec![("AliceLaptop", 2), ("AliceLaptop", 3)]
+        );
+        assert_eq!(
+            missing_for_phone[0].message_id,
+            Some("AliceLaptop-message-2".to_string())
+        );
+
+        phone
+            .append_events(&missing_for_phone)
+            .expect("phone receives");
+        assert_eq!(
+            phone.version_vector(conversation).unwrap()["AliceLaptop"],
+            3
+        );
+    }
+
+    #[test]
+    fn own_devices_bidirectional_sync_converges_materialized_state() {
+        let laptop = Storage::open_in_memory().expect("laptop");
+        let phone = Storage::open_in_memory().expect("phone");
+        let conversation = "own-device-conversation";
+
+        for counter in 1..=2 {
+            laptop
+                .append_event(&own_device_event(conversation, "AliceLaptop", counter))
+                .expect("laptop append");
+        }
+        laptop
+            .append_event(&own_device_event(conversation, "AlicePhone", 1))
+            .expect("laptop already saw phone first");
+        phone
+            .append_event(&own_device_event(conversation, "AliceLaptop", 1))
+            .expect("phone already saw laptop first");
+        phone
+            .append_event(&own_device_event(conversation, "AlicePhone", 1))
+            .expect("phone append");
+        phone
+            .append_event(&own_device_event(conversation, "AlicePhone", 2))
+            .expect("phone append second");
+
+        let phone_missing = laptop
+            .missing_events_for(conversation, &phone.version_vector(conversation).unwrap())
+            .expect("phone missing");
+        let laptop_missing = phone
+            .missing_events_for(conversation, &laptop.version_vector(conversation).unwrap())
+            .expect("laptop missing");
+        phone.append_events(&phone_missing).expect("phone sync");
+        laptop.append_events(&laptop_missing).expect("laptop sync");
+
+        let mut expected = VersionVector::new();
+        expected.insert("AliceLaptop".to_string(), 2);
+        expected.insert("AlicePhone".to_string(), 2);
+        assert_eq!(laptop.version_vector(conversation).unwrap(), expected);
+        assert_eq!(phone.version_vector(conversation).unwrap(), expected);
+        assert_eq!(
+            materialize_conversation(&all_events_for(&laptop, conversation)),
+            materialize_conversation(&all_events_for(&phone, conversation))
+        );
+    }
+
+    #[test]
+    fn duplicate_own_device_sync_delivery_is_idempotent() {
+        let laptop = Storage::open_in_memory().expect("laptop");
+        let phone = Storage::open_in_memory().expect("phone");
+        let conversation = "own-device-conversation";
+        let event = own_device_event(conversation, "AliceLaptop", 1);
+
+        laptop.append_event(&event).expect("laptop append");
+        let missing = laptop
+            .missing_events_for(conversation, &phone.version_vector(conversation).unwrap())
+            .expect("missing");
+
+        assert_eq!(phone.append_events(&missing).expect("first sync"), 1);
+        assert_eq!(phone.append_events(&missing).expect("duplicate sync"), 0);
+        assert_eq!(
+            materialize_conversation(&all_events_for(&phone, conversation))
+                .messages
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn own_device_sync_progress_survives_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "ciphermesh-own-device-sync-{}.sqlite",
+            now_unix_secs()
+        ));
+        let conversation = "own-device-conversation";
+
+        {
+            let storage = Storage::open(&path).expect("open first");
+            storage
+                .append_event(&own_device_event(conversation, "AliceLaptop", 1))
+                .expect("append event");
+        }
+
+        {
+            let storage = Storage::open(&path).expect("open second");
+            assert_eq!(
+                storage.version_vector(conversation).unwrap()["AliceLaptop"],
+                1
+            );
+            assert!(
+                materialize_conversation(&all_events_for(&storage, conversation))
+                    .messages
+                    .contains_key("AliceLaptop-message-1")
+            );
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn duplicate_event_delivery_is_idempotent() {
         let storage = Storage::open_in_memory().expect("storage");
         let event = event("AliceDevice", 1);
@@ -1465,6 +1661,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn device_revocation_records_are_idempotent() {
+        let storage = Storage::open_in_memory().expect("storage");
+
+        storage
+            .save_device_revocation("acct-1", "dev-phone", 1, b"revocation-v1")
+            .expect("save revocation");
+        storage
+            .save_device_revocation("acct-1", "dev-phone", 1, b"revocation-v1")
+            .expect("save duplicate revocation");
+
+        assert_eq!(
+            storage
+                .device_revocations_for_account("acct-1")
+                .expect("revocations"),
+            vec![b"revocation-v1".to_vec()]
+        );
+    }
+
+    #[test]
+    fn device_revocation_survives_storage_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "ciphermesh-device-revocation-{}.sqlite",
+            now_unix_secs()
+        ));
+
+        {
+            let storage = Storage::open(&path).expect("open first");
+            storage
+                .save_device_revocation("acct-1", "dev-phone", 1, b"revocation-v1")
+                .expect("save revocation");
+        }
+
+        {
+            let storage = Storage::open(&path).expect("open second");
+            assert_eq!(
+                storage
+                    .device_revocations_for_account("acct-1")
+                    .expect("revocations"),
+                vec![b"revocation-v1".to_vec()]
+            );
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
     fn event(device_id: &str, counter: u64) -> EventRecord {
         EventRecord {
             device_id: device_id.to_string(),
@@ -1475,5 +1717,25 @@ mod tests {
             payload: format!("{device_id}:{counter}").into_bytes(),
             created_at_unix_secs: 10 + counter,
         }
+    }
+
+    fn own_device_event(conversation: &str, device_id: &str, counter: u64) -> EventRecord {
+        event_record(
+            conversation,
+            device_id,
+            counter,
+            ConversationEvent::MessageCreated {
+                message_id: format!("{device_id}-message-{counter}"),
+                author_id: "alice-account".to_string(),
+                payload: format!("{device_id} event {counter}").into_bytes(),
+            },
+        )
+        .expect("serialize own-device event")
+    }
+
+    fn all_events_for(storage: &Storage, conversation: &str) -> Vec<EventRecord> {
+        storage
+            .missing_events_for(conversation, &VersionVector::new())
+            .expect("all events")
     }
 }

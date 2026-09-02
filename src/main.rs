@@ -1,13 +1,16 @@
 use ciphermesh::{
+    active_device_certificates,
     crdt::{event_record, materialize_conversation, ConversationEvent},
+    is_device_currently_authorized,
     mailbox_storage::{mailbox_now_unix_secs, MailboxEnvelopeRecord, MailboxStorage},
     storage::{
         now_unix_secs, EventRecord, MessageDirection, MessageRecord, MessageStatus, OutboxItem,
         OutboxStatus, Storage, VersionVector,
     },
-    verify_authorized_sibling_devices, verify_device_certificate, AccountIdentity, Alice,
-    AliceState, Bob, BobState, DeviceCertificate, DeviceDeliveryEnvelope, DeviceIdentity,
-    DeviceSession, InitialMessage, PreKeyBundle, RatchetMessage, SimulatedDirectory,
+    verify_authorized_sibling_devices, verify_device_certificate, verify_device_revocation,
+    AccountIdentity, Alice, AliceState, Bob, BobState, DeviceCertificate, DeviceDeliveryEnvelope,
+    DeviceIdentity, DeviceRevocation, DeviceSession, InitialMessage, PreKeyBundle, RatchetMessage,
+    SimulatedDirectory,
 };
 use futures::StreamExt;
 use libp2p::{
@@ -143,6 +146,7 @@ async fn main() -> AppResult<()> {
         Some("device-demo") => run_device_identity_demo(),
         Some("fanout-demo") => run_device_fanout_demo(),
         Some("own-device-sync-demo") => run_own_device_sync_demo(),
+        Some("revocation-demo") => run_device_revocation_demo(),
         _ => {
             run_local_demo()?;
             print_usage();
@@ -225,6 +229,9 @@ fn print_usage() {
     println!();
     println!("Phase 5C own-device sync demo:");
     println!("  cargo run -- own-device-sync-demo");
+    println!();
+    println!("Phase 5D device revocation demo:");
+    println!("  cargo run -- revocation-demo");
 }
 
 fn run_local_demo() -> AppResult<()> {
@@ -964,6 +971,225 @@ fn run_device_fanout_demo() -> AppResult<()> {
     Ok(())
 }
 
+fn run_own_device_sync_demo() -> AppResult<()> {
+    let laptop = Storage::open_in_memory()?;
+    let phone = Storage::open_in_memory()?;
+    let conversation_id = "alice-own-device-sync";
+    let account = AccountIdentity::generate();
+    let laptop_device = DeviceIdentity::generate(account.account_id());
+    let phone_device = DeviceIdentity::generate(account.account_id());
+    let laptop_certificate = account.authorize_device(&laptop_device);
+    let phone_certificate = account.authorize_device(&phone_device);
+
+    verify_authorized_sibling_devices(
+        account.public_key(),
+        &laptop_certificate,
+        &phone_certificate,
+    )?;
+
+    for counter in 1..=3 {
+        let event = crdt_demo_event(
+            conversation_id,
+            laptop_device.device_id(),
+            counter,
+            ConversationEvent::MessageCreated {
+                message_id: format!("laptop-message-{counter}"),
+                author_id: account.account_id().to_string(),
+                payload: format!("laptop event {counter}").into_bytes(),
+            },
+        )?;
+        laptop.append_event(&event)?;
+        if counter == 1 {
+            phone.append_event(&event)?;
+        }
+    }
+
+    let phone_reply = crdt_demo_event(
+        conversation_id,
+        phone_device.device_id(),
+        1,
+        ConversationEvent::MessageCreated {
+            message_id: "phone-message-1".to_string(),
+            author_id: account.account_id().to_string(),
+            payload: b"phone event 1".to_vec(),
+        },
+    )?;
+    phone.append_event(&phone_reply)?;
+
+    println!("Alice AccountId: {}", account.account_id());
+    println!("Laptop DeviceId: {}", laptop_device.device_id());
+    println!("Phone DeviceId: {}", phone_device.device_id());
+    println!(
+        "Sibling certificates verify: {}",
+        verify_authorized_sibling_devices(
+            account.public_key(),
+            &laptop_certificate,
+            &phone_certificate,
+        )
+        .is_ok()
+    );
+    println!(
+        "Laptop vector before sync: {:?}",
+        laptop.version_vector(conversation_id)?
+    );
+    println!(
+        "Phone vector before sync: {:?}",
+        phone.version_vector(conversation_id)?
+    );
+
+    let SyncRoundTrip {
+        left_to_right,
+        right_to_left,
+    } = sync_authorized_sibling_devices(
+        account.public_key(),
+        &laptop_certificate,
+        &phone_certificate,
+        &[],
+        &laptop,
+        &phone,
+        conversation_id,
+    )?;
+
+    let duplicate_inserted = phone.append_events(&left_to_right)?;
+    let laptop_state = materialize_conversation(&all_sync_events(&laptop, conversation_id)?);
+    let phone_state = materialize_conversation(&all_sync_events(&phone, conversation_id)?);
+
+    println!(
+        "Laptop sent Phone missing events: {:?}",
+        event_positions(&left_to_right)
+    );
+    println!(
+        "Phone sent Laptop missing events: {:?}",
+        event_positions(&right_to_left)
+    );
+    println!("Duplicate sync insert count: {duplicate_inserted}");
+    println!(
+        "Laptop vector after sync: {:?}",
+        laptop.version_vector(conversation_id)?
+    );
+    println!(
+        "Phone vector after sync: {:?}",
+        phone.version_vector(conversation_id)?
+    );
+    println!(
+        "CRDT materialized states match: {}",
+        laptop_state == phone_state
+    );
+
+    Ok(())
+}
+
+fn run_device_revocation_demo() -> AppResult<()> {
+    let storage = Storage::open_in_memory()?;
+    let alice_account = AccountIdentity::generate();
+    let alice_laptop = DeviceIdentity::generate(alice_account.account_id());
+    let alice_phone = DeviceIdentity::generate(alice_account.account_id());
+    let bob_device = DeviceIdentity::generate("bob-account");
+    let laptop_certificate = alice_account.authorize_device(&alice_laptop);
+    let phone_certificate = alice_account.authorize_device(&alice_phone);
+
+    persist_phase_5a_identity(&storage, &alice_account, &alice_laptop, &laptop_certificate)?;
+    persist_phase_5a_identity(&storage, &alice_account, &alice_phone, &phone_certificate)?;
+
+    let phone_history = crdt_demo_event(
+        "revocation-demo-conversation",
+        alice_phone.device_id(),
+        1,
+        ConversationEvent::MessageCreated {
+            message_id: "old-phone-message".to_string(),
+            author_id: alice_account.account_id().to_string(),
+            payload: b"old phone history remains".to_vec(),
+        },
+    )?;
+    storage.append_event(&phone_history)?;
+
+    let certificates_before = load_device_certificates(&storage, alice_account.account_id())?;
+    let active_before =
+        active_device_certificates(alice_account.public_key(), &certificates_before, &[])?;
+
+    let revocation = alice_account.revoke_device(alice_phone.device_id().to_string(), 1);
+    verify_device_revocation(alice_account.public_key(), &revocation)?;
+    storage.save_device_revocation(
+        alice_account.account_id(),
+        alice_phone.device_id(),
+        revocation.revocation_counter,
+        &bincode::serialize(&revocation)?,
+    )?;
+    storage.save_device_revocation(
+        alice_account.account_id(),
+        alice_phone.device_id(),
+        revocation.revocation_counter,
+        &bincode::serialize(&revocation)?,
+    )?;
+
+    let certificates_after = load_device_certificates(&storage, alice_account.account_id())?;
+    let revocations_after = load_device_revocations(&storage, alice_account.account_id())?;
+    let active_after = active_device_certificates(
+        alice_account.public_key(),
+        &certificates_after,
+        &revocations_after,
+    )?;
+    let mut bob_sessions = BTreeMap::new();
+    let mut new_envelopes = Vec::new();
+    for certificate in &active_after {
+        let mut session =
+            bob_device.create_outbound_session(alice_account.public_key(), certificate)?;
+        let envelope = session.encrypt("post-revocation-logical-1", "future laptop only")?;
+        bob_sessions.insert(certificate.device_id.clone(), session);
+        new_envelopes.push(envelope);
+    }
+
+    let laptop_envelope = new_envelopes
+        .iter()
+        .find(|envelope| envelope.recipient_device_id == alice_laptop.device_id())
+        .ok_or("laptop did not receive post-revocation envelope")?;
+    let phone_envelope_exists = new_envelopes
+        .iter()
+        .any(|envelope| envelope.recipient_device_id == alice_phone.device_id());
+    let mut laptop_session = alice_laptop.create_inbound_session(
+        bob_device.device_id().to_string(),
+        bob_device.x25519_public_key(),
+    )?;
+    let laptop_plaintext = laptop_session.decrypt(laptop_envelope)?;
+
+    let sync_to_phone_allowed = sync_authorized_sibling_devices(
+        alice_account.public_key(),
+        &laptop_certificate,
+        &phone_certificate,
+        &revocations_after,
+        &storage,
+        &storage,
+        "revocation-demo-conversation",
+    )
+    .is_ok();
+
+    println!("Alice AccountId: {}", alice_account.account_id());
+    println!("Laptop DeviceId: {}", alice_laptop.device_id());
+    println!("Phone DeviceId: {}", alice_phone.device_id());
+    println!("Active devices before revocation: {}", active_before.len());
+    println!("Revoked DeviceId: {}", revocation.device_id);
+    println!("Stored revocation records: {}", revocations_after.len());
+    println!("Active devices after revocation: {}", active_after.len());
+    println!(
+        "Bob created post-revocation envelopes: {}",
+        new_envelopes.len()
+    );
+    println!("Laptop decrypted future message: {laptop_plaintext}");
+    println!("Phone received new envelope: {phone_envelope_exists}");
+    println!("Own-device sync to revoked Phone allowed: {sync_to_phone_allowed}");
+    println!(
+        "Old historical events still stored: {}",
+        all_sync_events(&storage, "revocation-demo-conversation")?.len()
+    );
+    println!(
+        "Bob kept sessions only for active devices: {}",
+        bob_sessions.contains_key(alice_laptop.device_id())
+            && !bob_sessions.contains_key(alice_phone.device_id())
+    );
+
+    Ok(())
+}
+
 fn persist_phase_5a_identity(
     storage: &Storage,
     account: &AccountIdentity,
@@ -995,6 +1221,28 @@ fn persist_phase_5a_identity(
     Ok(())
 }
 
+fn load_device_certificates(
+    storage: &Storage,
+    account_id: &str,
+) -> AppResult<Vec<DeviceCertificate>> {
+    storage
+        .device_certificates_for_account(account_id)?
+        .into_iter()
+        .map(|blob| bincode::deserialize::<DeviceCertificate>(&blob).map_err(Into::into))
+        .collect()
+}
+
+fn load_device_revocations(
+    storage: &Storage,
+    account_id: &str,
+) -> AppResult<Vec<DeviceRevocation>> {
+    storage
+        .device_revocations_for_account(account_id)?
+        .into_iter()
+        .map(|blob| bincode::deserialize::<DeviceRevocation>(&blob).map_err(Into::into))
+        .collect()
+}
+
 fn encrypt_and_queue_device_delivery(
     storage: &mut Storage,
     session: &mut DeviceSession,
@@ -1023,11 +1271,83 @@ fn encrypt_and_queue_device_delivery(
     Ok(envelope)
 }
 
+struct SyncRoundTrip {
+    left_to_right: Vec<EventRecord>,
+    right_to_left: Vec<EventRecord>,
+}
+
+fn sync_authorized_sibling_devices(
+    account_public_key: ciphermesh::IdentityPublicKeyBytes,
+    left_certificate: &DeviceCertificate,
+    right_certificate: &DeviceCertificate,
+    revocations: &[DeviceRevocation],
+    left: &Storage,
+    right: &Storage,
+    conversation_id: &str,
+) -> AppResult<SyncRoundTrip> {
+    verify_authorized_sibling_devices(account_public_key, left_certificate, right_certificate)?;
+    if !is_device_currently_authorized(account_public_key, left_certificate, revocations)?
+        || !is_device_currently_authorized(account_public_key, right_certificate, revocations)?
+    {
+        return Err("sibling device is revoked".into());
+    }
+
+    let right_request = SyncRequest {
+        version_vector: right.version_vector(conversation_id)?,
+    };
+    let left_response = SyncResponse {
+        events: left
+            .missing_events_for(conversation_id, &right_request.version_vector)?
+            .into_iter()
+            .map(SyncEvent::from)
+            .collect(),
+    };
+    let left_response_bytes = bincode::serialize(&left_response)?;
+    let decoded_left_response: SyncResponse = bincode::deserialize(&left_response_bytes)?;
+    let left_to_right = decoded_left_response
+        .events
+        .into_iter()
+        .map(EventRecord::from)
+        .collect::<Vec<_>>();
+    right.append_events(&left_to_right)?;
+
+    let left_request = SyncRequest {
+        version_vector: left.version_vector(conversation_id)?,
+    };
+    let right_response = SyncResponse {
+        events: right
+            .missing_events_for(conversation_id, &left_request.version_vector)?
+            .into_iter()
+            .map(SyncEvent::from)
+            .collect(),
+    };
+    let right_response_bytes = bincode::serialize(&right_response)?;
+    let decoded_right_response: SyncResponse = bincode::deserialize(&right_response_bytes)?;
+    let right_to_left = decoded_right_response
+        .events
+        .into_iter()
+        .map(EventRecord::from)
+        .collect::<Vec<_>>();
+    left.append_events(&right_to_left)?;
+
+    Ok(SyncRoundTrip {
+        left_to_right,
+        right_to_left,
+    })
+}
+
 fn delivery_outbox_id(envelope: &DeviceDeliveryEnvelope) -> String {
     format!(
         "{}:{}",
         envelope.logical_message_id, envelope.recipient_device_id
     )
+}
+
+fn event_positions(events: &[EventRecord]) -> Vec<String> {
+    events
+        .iter()
+        .map(|event| format!("{}:{}", event.device_id, event.counter))
+        .collect()
 }
 
 fn demo_sync_event(device_id: &str, counter: u64) -> EventRecord {
