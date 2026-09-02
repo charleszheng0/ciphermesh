@@ -1,4 +1,5 @@
 use ciphermesh::{
+    mailbox_storage::{mailbox_now_unix_secs, MailboxEnvelopeRecord, MailboxStorage},
     storage::{
         now_unix_secs, MessageDirection, MessageRecord, MessageStatus, OutboxItem, OutboxStatus,
         Storage,
@@ -19,7 +20,7 @@ use rcgen::generate_simple_self_signed;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -87,7 +88,11 @@ async fn main() -> AppResult<()> {
                 .map(String::as_str)
                 .unwrap_or("/ip4/0.0.0.0/tcp/7000")
                 .parse()?;
-            run_mailbox_node(listen_addr).await
+            let db_path = args
+                .get(3)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("target/ciphermesh-mailbox.sqlite"));
+            run_mailbox_node(listen_addr, &db_path).await
         }
         Some("alice-mailbox") => {
             let mailbox_addr = parse_required_multiaddr(args.get(2), "mailbox multiaddr")?;
@@ -95,11 +100,19 @@ async fn main() -> AppResult<()> {
                 .get(3)
                 .map(String::as_str)
                 .unwrap_or("hello offline bob");
-            run_alice_mailbox_deposit(mailbox_addr, message).await
+            let db_path = args
+                .get(4)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("target/ciphermesh-alice-mailbox.sqlite"));
+            run_alice_mailbox_deposit(mailbox_addr, message, &db_path).await
         }
         Some("bob-mailbox") => {
             let mailbox_addr = parse_required_multiaddr(args.get(2), "mailbox multiaddr")?;
-            run_bob_mailbox_fetch(mailbox_addr).await
+            let db_path = args
+                .get(3)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("target/ciphermesh-bob-mailbox.sqlite"));
+            run_bob_mailbox_fetch(mailbox_addr, &db_path).await
         }
         Some("restart-demo") => {
             let db_path = args
@@ -154,9 +167,11 @@ fn print_usage() {
     println!("  Terminal 2: cargo run -- alice-direct 127.0.0.1:5000 \"hello from alice\"");
     println!();
     println!("Phase 3D mailbox demo:");
-    println!("  Terminal 1: cargo run -- mailbox /ip4/0.0.0.0/tcp/7000");
-    println!("  Terminal 2: cargo run -- alice-mailbox <mailbox-multiaddr> \"hello offline bob\"");
-    println!("  Terminal 3: cargo run -- bob-mailbox <mailbox-multiaddr>");
+    println!("  Terminal 1: cargo run -- mailbox /ip4/0.0.0.0/tcp/7000 target/mailbox.db");
+    println!(
+        "  Terminal 2: cargo run -- alice-mailbox <mailbox-multiaddr> \"hello offline bob\" target/alice-mailbox.db"
+    );
+    println!("  Terminal 3: cargo run -- bob-mailbox <mailbox-multiaddr> target/bob-mailbox.db");
     println!();
     println!("Phase 4A SQLite restart demo:");
     println!("  cargo run -- restart-demo [target/ciphermesh-4a-demo.sqlite]");
@@ -924,74 +939,15 @@ struct OfflineEnvelope {
 enum MailboxRequest {
     Deposit(OfflineEnvelope),
     Fetch { recipient_token: String },
+    Acknowledge { message_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum MailboxResponse {
     Deposited { message_id: String },
     Pending { envelopes: Vec<OfflineEnvelope> },
+    Acknowledged { message_id: String },
     Error(String),
-}
-
-#[derive(Debug, Default)]
-struct MailboxStore {
-    envelopes_by_recipient: HashMap<String, Vec<OfflineEnvelope>>,
-    seen_message_ids: HashSet<String>,
-    max_envelopes: usize,
-}
-
-impl MailboxStore {
-    fn new(max_envelopes: usize) -> Self {
-        Self {
-            envelopes_by_recipient: HashMap::new(),
-            seen_message_ids: HashSet::new(),
-            max_envelopes,
-        }
-    }
-
-    fn deposit(&mut self, envelope: OfflineEnvelope, now: u64) -> Result<(), String> {
-        self.expire(now);
-
-        if self.seen_message_ids.contains(&envelope.message_id) {
-            return Ok(());
-        }
-
-        if self.total_envelopes() >= self.max_envelopes {
-            return Err("mailbox storage is full".to_string());
-        }
-
-        self.seen_message_ids.insert(envelope.message_id.clone());
-        self.envelopes_by_recipient
-            .entry(envelope.recipient_token.clone())
-            .or_default()
-            .push(envelope);
-        Ok(())
-    }
-
-    fn fetch(&mut self, recipient_token: &str, now: u64) -> Vec<OfflineEnvelope> {
-        self.expire(now);
-        self.envelopes_by_recipient
-            .remove(recipient_token)
-            .unwrap_or_default()
-    }
-
-    fn total_envelopes(&self) -> usize {
-        self.envelopes_by_recipient
-            .values()
-            .map(Vec::len)
-            .sum::<usize>()
-    }
-
-    fn expire(&mut self, now: u64) {
-        self.envelopes_by_recipient.retain(|_, envelopes| {
-            envelopes.retain(|envelope| {
-                envelope
-                    .expires_at_unix_secs
-                    .is_none_or(|expires_at| expires_at > now)
-            });
-            !envelopes.is_empty()
-        });
-    }
 }
 
 fn new_relay_server_swarm() -> AppResult<Swarm<RelayServerBehaviour>> {
@@ -1453,13 +1409,20 @@ async fn run_relay_demo() -> AppResult<()> {
     }
 }
 
-async fn run_mailbox_node(listen_addr: Multiaddr) -> AppResult<()> {
+async fn run_mailbox_node(listen_addr: Multiaddr, db_path: &Path) -> AppResult<()> {
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
     let mut swarm = new_mailbox_swarm()?;
     let local_peer_id = *swarm.local_peer_id();
-    let mut store = MailboxStore::new(MAILBOX_MAX_ENVELOPES);
+    let store = MailboxStorage::open(db_path, MAILBOX_MAX_ENVELOPES)?;
+    let pending_count = store.pending_count()?;
 
     swarm.listen_on(listen_addr)?;
     println!("Mailbox PeerId: {local_peer_id}");
+    println!("Mailbox SQLite database: {}", db_path.display());
+    println!("Mailbox loaded {pending_count} pending opaque envelope(s) from SQLite");
     println!("Mailbox is untrusted: it stores routing tokens and encrypted bytes only");
 
     loop {
@@ -1485,16 +1448,37 @@ async fn run_mailbox_node(listen_addr: Multiaddr) -> AppResult<()> {
             )) => match request {
                 MailboxRequest::Deposit(envelope) => {
                     println!(
-                        "Mailbox storing opaque envelope id={} recipient_token={} encrypted_bytes={} expires_at={:?}",
+                        "[MAILBOX] storing opaque envelope id={} recipient_token={} encrypted_bytes={} expires_at={:?}",
                         envelope.message_id,
                         envelope.recipient_token,
                         envelope.encrypted_payload.len(),
                         envelope.expires_at_unix_secs
                     );
                     let message_id = envelope.message_id.clone();
-                    let response = match store.deposit(envelope, current_unix_secs()) {
-                        Ok(()) => MailboxResponse::Deposited { message_id },
-                        Err(error) => MailboxResponse::Error(error),
+                    let record = MailboxEnvelopeRecord {
+                        message_id: envelope.message_id,
+                        recipient_token: envelope.recipient_token,
+                        encrypted_payload: envelope.encrypted_payload,
+                        created_at_unix_secs: mailbox_now_unix_secs(),
+                        expires_at_unix_secs: envelope.expires_at_unix_secs,
+                    };
+                    let response = match store.deposit(&record, mailbox_now_unix_secs()) {
+                        Ok(inserted) => {
+                            if inserted {
+                                println!(
+                                    "[MAILBOX] stored envelope {}, {} bytes",
+                                    record.message_id,
+                                    record.encrypted_payload.len()
+                                );
+                            } else {
+                                println!(
+                                    "[MAILBOX] duplicate deposit {}, keeping one row",
+                                    record.message_id
+                                );
+                            }
+                            MailboxResponse::Deposited { message_id }
+                        }
+                        Err(error) => MailboxResponse::Error(error.to_string()),
                     };
                     let _ = swarm
                         .behaviour_mut()
@@ -1503,9 +1487,27 @@ async fn run_mailbox_node(listen_addr: Multiaddr) -> AppResult<()> {
                     println!("Mailbox accepted deposit request from {peer}");
                 }
                 MailboxRequest::Fetch { recipient_token } => {
-                    let envelopes = store.fetch(&recipient_token, current_unix_secs());
+                    let envelopes =
+                        match store.fetch_pending(&recipient_token, mailbox_now_unix_secs()) {
+                            Ok(records) => records
+                                .into_iter()
+                                .map(|record| OfflineEnvelope {
+                                    recipient_token: record.recipient_token,
+                                    message_id: record.message_id,
+                                    encrypted_payload: record.encrypted_payload,
+                                    expires_at_unix_secs: record.expires_at_unix_secs,
+                                })
+                                .collect::<Vec<_>>(),
+                            Err(error) => {
+                                let _ = swarm.behaviour_mut().mailbox.send_response(
+                                    channel,
+                                    MailboxResponse::Error(error.to_string()),
+                                );
+                                continue;
+                            }
+                        };
                     println!(
-                        "Mailbox returning {} opaque envelope(s) for recipient_token={recipient_token}",
+                        "[MAILBOX] returning {} pending opaque envelope(s) for recipient_token={recipient_token}",
                         envelopes.len()
                     );
                     let _ = swarm
@@ -1513,6 +1515,21 @@ async fn run_mailbox_node(listen_addr: Multiaddr) -> AppResult<()> {
                         .mailbox
                         .send_response(channel, MailboxResponse::Pending { envelopes });
                     println!("Mailbox accepted fetch request from {peer}");
+                }
+                MailboxRequest::Acknowledge { message_id } => {
+                    let response =
+                        match store.acknowledge_retrieval(&message_id, mailbox_now_unix_secs()) {
+                            Ok(()) => {
+                                println!("[MAILBOX] marked envelope {message_id} delivered");
+                                MailboxResponse::Acknowledged { message_id }
+                            }
+                            Err(error) => MailboxResponse::Error(error.to_string()),
+                        };
+                    let _ = swarm
+                        .behaviour_mut()
+                        .mailbox
+                        .send_response(channel, response);
+                    println!("Mailbox accepted retrieval ACK from {peer}");
                 }
             },
             SwarmEvent::Behaviour(MailboxBehaviourEvent::Mailbox(
@@ -1530,21 +1547,67 @@ async fn run_mailbox_node(listen_addr: Multiaddr) -> AppResult<()> {
     }
 }
 
-async fn run_alice_mailbox_deposit(mailbox_addr: Multiaddr, message: &str) -> AppResult<()> {
+async fn run_alice_mailbox_deposit(
+    mailbox_addr: Multiaddr,
+    message: &str,
+    db_path: &Path,
+) -> AppResult<()> {
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
     let mailbox_peer_id = peer_id_from_multiaddr(&mailbox_addr)?;
+    let mut storage = Storage::open(db_path)?;
     let mut alice = Alice::local();
     let bob_bundle = Bob::mailbox_demo_prekey_bundle()?;
     let recipient_token = recipient_token_for_bundle(&bob_bundle);
     let initial_message = alice.encrypt_initial_message(&bob_bundle, message)?;
     let encrypted_payload = bincode::serialize(&initial_message)?;
     let message_id = message_id_for(&encrypted_payload);
+    let conversation_id = format!("mailbox-{recipient_token}");
     let envelope = OfflineEnvelope {
-        recipient_token,
-        message_id,
-        encrypted_payload,
+        recipient_token: recipient_token.clone(),
+        message_id: message_id.clone(),
+        encrypted_payload: encrypted_payload.clone(),
         expires_at_unix_secs: Some(current_unix_secs() + MAILBOX_ENVELOPE_TTL_SECS),
     };
+    let outbox = OutboxItem {
+        message_id: message_id.clone(),
+        recipient_id: recipient_token.clone(),
+        payload: encrypted_payload.clone(),
+        status: OutboxStatus::Pending,
+        retry_count: 0,
+        created_at_unix_secs: now_unix_secs(),
+        last_attempt_unix_secs: None,
+    };
 
+    storage.save_state_session_message_and_outbox(
+        "alice-mailbox",
+        "alice",
+        &bincode::serialize(&alice.export_state())?,
+        &conversation_id,
+        &recipient_token,
+        "alice",
+        &bincode::serialize(
+            &alice
+                .session_state()
+                .ok_or("Alice session missing after mailbox encrypt")?,
+        )?,
+        &MessageRecord {
+            message_id: message_id.clone(),
+            conversation_id: conversation_id.clone(),
+            sender_id: "alice".to_string(),
+            recipient_id: recipient_token.clone(),
+            direction: MessageDirection::Sent,
+            status: MessageStatus::Stored,
+            protocol_counter: Some(initial_message.message.number),
+            ciphertext: encrypted_payload.clone(),
+            plaintext: Some(message.to_string()),
+            created_at_unix_secs: now_unix_secs(),
+        },
+        &outbox,
+    )?;
+    println!("[OUTBOX] queued {message_id} for mailbox deposit");
     println!(
         "Alice depositing encrypted offline envelope id={} encrypted_bytes={}",
         envelope.message_id,
@@ -1553,7 +1616,7 @@ async fn run_alice_mailbox_deposit(mailbox_addr: Multiaddr, message: &str) -> Ap
     println!("Alice plaintext before mailbox deposit: {message}");
 
     let response = mailbox_request(
-        mailbox_addr,
+        mailbox_addr.clone(),
         mailbox_peer_id,
         MailboxRequest::Deposit(envelope),
     )
@@ -1561,25 +1624,34 @@ async fn run_alice_mailbox_deposit(mailbox_addr: Multiaddr, message: &str) -> Ap
 
     match response {
         MailboxResponse::Deposited { message_id } => {
-            println!("Mailbox confirmed encrypted envelope deposit id={message_id}");
+            println!("[MAILBOX-ACK] mailbox stored encrypted envelope id={message_id}");
+            println!("Alice outbox remains pending until Bob ACKs actual receipt");
             Ok(())
         }
         MailboxResponse::Error(error) => Err(error.into()),
         MailboxResponse::Pending { .. } => Err("unexpected pending-envelope response".into()),
+        MailboxResponse::Acknowledged { .. } => Err("unexpected mailbox ACK response".into()),
     }
 }
 
-async fn run_bob_mailbox_fetch(mailbox_addr: Multiaddr) -> AppResult<()> {
+async fn run_bob_mailbox_fetch(mailbox_addr: Multiaddr, db_path: &Path) -> AppResult<()> {
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
     let mailbox_peer_id = peer_id_from_multiaddr(&mailbox_addr)?;
+    let storage = Storage::open(db_path)?;
     let mut bob = Bob::mailbox_demo();
     let bob_bundle = bob.prekey_bundle()?;
     let recipient_token = recipient_token_for_bundle(&bob_bundle);
 
     println!("Bob fetching offline envelopes for recipient_token={recipient_token}");
     let response = mailbox_request(
-        mailbox_addr,
+        mailbox_addr.clone(),
         mailbox_peer_id,
-        MailboxRequest::Fetch { recipient_token },
+        MailboxRequest::Fetch {
+            recipient_token: recipient_token.clone(),
+        },
     )
     .await?;
 
@@ -1595,15 +1667,55 @@ async fn run_bob_mailbox_fetch(mailbox_addr: Multiaddr) -> AppResult<()> {
                     envelope.message_id,
                     envelope.encrypted_payload.len()
                 );
-                let initial_message: InitialMessage =
-                    bincode::deserialize(&envelope.encrypted_payload)?;
-                let plaintext = bob.decrypt_initial_message(&initial_message)?;
-                println!("Bob decrypted offline plaintext: {plaintext}");
+                if !storage.accept_message_once(&envelope.message_id)? {
+                    println!(
+                        "[DEDUP] duplicate {}, not processing twice",
+                        envelope.message_id
+                    );
+                } else {
+                    let initial_message: InitialMessage =
+                        bincode::deserialize(&envelope.encrypted_payload)?;
+                    let plaintext = bob.decrypt_initial_message(&initial_message)?;
+                    println!("Bob decrypted offline plaintext: {plaintext}");
+                    storage.insert_message(&MessageRecord {
+                        message_id: envelope.message_id.clone(),
+                        conversation_id: format!("mailbox-{recipient_token}"),
+                        sender_id: "alice".to_string(),
+                        recipient_id: "bob".to_string(),
+                        direction: MessageDirection::Received,
+                        status: MessageStatus::Received,
+                        protocol_counter: Some(initial_message.message.number),
+                        ciphertext: envelope.encrypted_payload.clone(),
+                        plaintext: Some(plaintext),
+                        created_at_unix_secs: now_unix_secs(),
+                    })?;
+                    storage.save_local_identity(
+                        "bob-mailbox",
+                        "bob",
+                        &bincode::serialize(&bob.export_state())?,
+                    )?;
+                }
+                let ack_response = mailbox_request(
+                    mailbox_addr.clone(),
+                    mailbox_peer_id,
+                    MailboxRequest::Acknowledge {
+                        message_id: envelope.message_id.clone(),
+                    },
+                )
+                .await?;
+                match ack_response {
+                    MailboxResponse::Acknowledged { message_id } => {
+                        println!("[ACK] Bob confirmed mailbox retrieval for {message_id}");
+                    }
+                    MailboxResponse::Error(error) => return Err(error.into()),
+                    _ => return Err("unexpected mailbox retrieval ACK response".into()),
+                }
             }
             Ok(())
         }
         MailboxResponse::Error(error) => Err(error.into()),
         MailboxResponse::Deposited { .. } => Err("unexpected deposit response".into()),
+        MailboxResponse::Acknowledged { .. } => Err("unexpected mailbox ACK response".into()),
     }
 }
 
@@ -2111,42 +2223,5 @@ mod discovery_tests {
 
         assert!(rendered.contains("/p2p-circuit/"));
         assert!(rendered.ends_with(&format!("/p2p/{target_peer_id}")));
-    }
-
-    #[test]
-    fn mailbox_deduplicates_message_ids_and_removes_after_fetch() {
-        let mut store = MailboxStore::new(4);
-        let envelope = OfflineEnvelope {
-            recipient_token: "recipient".to_string(),
-            message_id: "message-1".to_string(),
-            encrypted_payload: vec![1, 2, 3],
-            expires_at_unix_secs: Some(200),
-        };
-
-        store.deposit(envelope.clone(), 100).unwrap();
-        store.deposit(envelope, 100).unwrap();
-
-        let fetched = store.fetch("recipient", 100);
-        assert_eq!(fetched.len(), 1);
-        assert_eq!(fetched[0].encrypted_payload, vec![1, 2, 3]);
-        assert!(store.fetch("recipient", 100).is_empty());
-    }
-
-    #[test]
-    fn mailbox_drops_expired_envelopes() {
-        let mut store = MailboxStore::new(4);
-        store
-            .deposit(
-                OfflineEnvelope {
-                    recipient_token: "recipient".to_string(),
-                    message_id: "expired".to_string(),
-                    encrypted_payload: vec![9],
-                    expires_at_unix_secs: Some(100),
-                },
-                50,
-            )
-            .unwrap();
-
-        assert!(store.fetch("recipient", 101).is_empty());
     }
 }

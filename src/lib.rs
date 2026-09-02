@@ -14,6 +14,7 @@ use std::{
 };
 use x25519_dalek::{PublicKey, StaticSecret};
 
+pub mod mailbox_storage;
 pub mod storage;
 
 const LOCAL_AAD: &[u8] = b"ciphermesh.local.alice-to-bob.v1";
