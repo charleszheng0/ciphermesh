@@ -48,6 +48,7 @@ SQLite local state / outbox / events / vectors
 ## Storage And Distributed State
 
 - SQLite via `rusqlite`.
+- Local chat history for the endpoint's own conversation UI.
 - Durable outbox with pending/delivered status.
 - ACK/retry/deduplication.
 - Append-only event history.
@@ -114,6 +115,20 @@ cargo run -- revocation-demo
 ```
 
 Verbose logging is enabled with `--verbose`, `-v`, or `CIPHERMESH_VERBOSE=1`.
+
+## Local History Security
+
+CipherMesh encrypts messages before they leave the device. QUIC peers, relays,
+mailboxes, bootstrap nodes, and discovery infrastructure handle ciphertext or
+routing metadata, not decrypted chat history.
+
+The conversation history shown in the terminal is local endpoint state stored in
+SQLite so the user can reopen chats after restart. That local plaintext history
+is not uploaded by the invite, relay, mailbox, discovery, outbox, sync, or CRDT
+paths, but a compromised endpoint or unprotected local database can expose it.
+Database encryption at rest is a future hardening item; CipherMesh should use a
+well-reviewed local key wrapping/database encryption design rather than a custom
+scheme.
 
 ## Same-Machine Interactive Chat
 

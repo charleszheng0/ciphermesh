@@ -132,6 +132,12 @@ pub struct InviteRecord {
     pub created_at_unix_secs: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatSummary {
+    pub contact: ContactRecord,
+    pub last_message: Option<MessageRecord>,
+}
+
 pub struct Storage {
     conn: Connection,
 }
@@ -386,6 +392,36 @@ impl Storage {
                 contact_from_row,
             )
             .optional()
+    }
+
+    pub fn contacts(&self) -> StorageResult<Vec<ContactRecord>> {
+        let mut statement = self.conn.prepare(
+            "
+            SELECT
+                contact_id,
+                display_name,
+                identity_public_key,
+                discovery_hint,
+                saved_at_unix_secs
+            FROM contacts
+            ORDER BY saved_at_unix_secs DESC, display_name COLLATE NOCASE
+            ",
+        )?;
+        let rows = statement.query_map([], contact_from_row)?;
+        rows.collect()
+    }
+
+    pub fn chat_summaries(&self) -> StorageResult<Vec<ChatSummary>> {
+        self.contacts()?
+            .into_iter()
+            .map(|contact| {
+                let last_message = self.last_message_for_conversation(&contact.contact_id)?;
+                Ok(ChatSummary {
+                    contact,
+                    last_message,
+                })
+            })
+            .collect()
     }
 
     pub fn save_invite_record(&self, invite: &InviteRecord) -> StorageResult<()> {
@@ -1206,27 +1242,45 @@ impl Storage {
             ",
         )?;
 
-        let rows = statement.query_map(params![conversation_id], |row| {
-            let direction: String = row.get(4)?;
-            let status: String = row.get(5)?;
-            let protocol_counter: Option<i64> = row.get(6)?;
-            let created_at: i64 = row.get(9)?;
-
-            Ok(MessageRecord {
-                message_id: row.get(0)?,
-                conversation_id: row.get(1)?,
-                sender_id: row.get(2)?,
-                recipient_id: row.get(3)?,
-                direction: MessageDirection::from_str(&direction),
-                status: MessageStatus::from_str(&status),
-                protocol_counter: protocol_counter.map(|value| value as u64),
-                ciphertext: row.get(7)?,
-                plaintext: row.get(8)?,
-                created_at_unix_secs: created_at as u64,
-            })
-        })?;
+        let rows = statement.query_map(params![conversation_id], message_from_row)?;
 
         rows.collect()
+    }
+
+    pub fn last_message_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> StorageResult<Option<MessageRecord>> {
+        self.conn
+            .query_row(
+                "
+                SELECT
+                    message_id,
+                    conversation_id,
+                    sender_id,
+                    recipient_id,
+                    direction,
+                    status,
+                    protocol_counter,
+                    ciphertext,
+                    plaintext,
+                    created_at_unix_secs
+                FROM messages
+                WHERE conversation_id = ?1
+                ORDER BY created_at_unix_secs DESC, protocol_counter DESC, message_id DESC
+                LIMIT 1
+                ",
+                params![conversation_id],
+                message_from_row,
+            )
+            .optional()
+    }
+
+    pub fn clear_conversation_history(&self, conversation_id: &str) -> StorageResult<usize> {
+        self.conn.execute(
+            "DELETE FROM messages WHERE conversation_id = ?1",
+            params![conversation_id],
+        )
     }
 
     fn outbox_items_with_status(&self, status: OutboxStatus) -> StorageResult<Vec<OutboxItem>> {
@@ -1317,6 +1371,26 @@ fn contact_from_row(row: &rusqlite::Row<'_>) -> StorageResult<ContactRecord> {
         identity_public_key: row.get(2)?,
         discovery_hint: row.get(3)?,
         saved_at_unix_secs: saved_at as u64,
+    })
+}
+
+fn message_from_row(row: &rusqlite::Row<'_>) -> StorageResult<MessageRecord> {
+    let direction: String = row.get(4)?;
+    let status: String = row.get(5)?;
+    let protocol_counter: Option<i64> = row.get(6)?;
+    let created_at: i64 = row.get(9)?;
+
+    Ok(MessageRecord {
+        message_id: row.get(0)?,
+        conversation_id: row.get(1)?,
+        sender_id: row.get(2)?,
+        recipient_id: row.get(3)?,
+        direction: MessageDirection::from_str(&direction),
+        status: MessageStatus::from_str(&status),
+        protocol_counter: protocol_counter.map(|value| value as u64),
+        ciphertext: row.get(7)?,
+        plaintext: row.get(8)?,
+        created_at_unix_secs: created_at as u64,
     })
 }
 
@@ -2020,6 +2094,98 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[test]
+    fn saved_contact_appears_in_chat_summaries_with_last_message() {
+        let storage = Storage::open_in_memory().expect("storage");
+        storage
+            .save_contact(&ContactRecord {
+                contact_id: "contact-james".to_string(),
+                display_name: "James".to_string(),
+                identity_public_key: b"james-identity".to_vec(),
+                discovery_hint: "direct QUIC".to_string(),
+                saved_at_unix_secs: 100,
+            })
+            .expect("save contact");
+        storage
+            .insert_message(&message("msg-1", "contact-james", "hey are you free later"))
+            .expect("insert message");
+
+        let summaries = storage.chat_summaries().expect("summaries");
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].contact.display_name, "James");
+        assert_eq!(
+            summaries[0]
+                .last_message
+                .as_ref()
+                .and_then(|message| message.plaintext.as_deref()),
+            Some("hey are you free later")
+        );
+    }
+
+    #[test]
+    fn chat_history_survives_reopen_and_clear_is_local() {
+        let path =
+            std::env::temp_dir().join(format!("ciphermesh-history-{}.sqlite", now_unix_secs()));
+
+        {
+            let storage = Storage::open(&path).expect("open first");
+            storage
+                .save_contact(&ContactRecord {
+                    contact_id: "contact-james".to_string(),
+                    display_name: "James".to_string(),
+                    identity_public_key: b"james-identity".to_vec(),
+                    discovery_hint: "direct QUIC".to_string(),
+                    saved_at_unix_secs: 100,
+                })
+                .expect("save contact");
+            storage
+                .insert_message(&message("msg-1", "contact-james", "hello"))
+                .expect("insert message");
+        }
+
+        {
+            let storage = Storage::open(&path).expect("open second");
+            assert_eq!(
+                storage
+                    .messages_for_conversation("contact-james")
+                    .expect("messages")
+                    .len(),
+                1
+            );
+            assert_eq!(
+                storage
+                    .clear_conversation_history("contact-james")
+                    .expect("clear"),
+                1
+            );
+            assert!(storage
+                .messages_for_conversation("contact-james")
+                .expect("messages after clear")
+                .is_empty());
+            assert_eq!(storage.contacts().expect("contacts").len(), 1);
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn duplicate_history_message_id_renders_once() {
+        let storage = Storage::open_in_memory().expect("storage");
+        let record = message("duplicate-msg", "contact-james", "hello once");
+
+        storage.insert_message(&record).expect("first insert");
+        storage.insert_message(&record).expect("duplicate insert");
+
+        assert_eq!(
+            storage
+                .messages_for_conversation("contact-james")
+                .expect("messages")
+                .len(),
+            1
+        );
+    }
+
     fn event(device_id: &str, counter: u64) -> EventRecord {
         EventRecord {
             device_id: device_id.to_string(),
@@ -2050,5 +2216,20 @@ mod tests {
         storage
             .missing_events_for(conversation, &VersionVector::new())
             .expect("all events")
+    }
+
+    fn message(message_id: &str, conversation_id: &str, plaintext: &str) -> MessageRecord {
+        MessageRecord {
+            message_id: message_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            sender_id: "you".to_string(),
+            recipient_id: "James".to_string(),
+            direction: MessageDirection::Sent,
+            status: MessageStatus::Sent,
+            protocol_counter: Some(1),
+            ciphertext: b"ciphertext".to_vec(),
+            plaintext: Some(plaintext.to_string()),
+            created_at_unix_secs: 120,
+        }
     }
 }
