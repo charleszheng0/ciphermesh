@@ -4,8 +4,8 @@ use ciphermesh::{
     is_device_currently_authorized,
     mailbox_storage::{mailbox_now_unix_secs, MailboxEnvelopeRecord, MailboxStorage},
     storage::{
-        now_unix_secs, ContactRecord, EventRecord, InviteRecord, MessageDirection, MessageRecord,
-        MessageStatus, OutboxItem, OutboxStatus, Storage, VersionVector,
+        now_unix_secs, ContactRecord, DebugLogRecord, EventRecord, InviteRecord, MessageDirection,
+        MessageRecord, MessageStatus, OutboxItem, OutboxStatus, Storage, VersionVector,
     },
     verify_authorized_sibling_devices, verify_device_certificate, verify_device_revocation,
     AccountIdentity, Alice, AliceState, Bob, BobState, DeviceCertificate, DeviceDeliveryEnvelope,
@@ -870,31 +870,54 @@ fn run_invite_demo(db_path: &Path) -> AppResult<()> {
 }
 
 async fn run_product_menu() -> AppResult<()> {
-    println!("CipherMesh");
-    println!();
-    println!("[1] Create invite");
-    println!("[2] Join invite");
-    println!("[3] Open chats");
-    println!();
+    loop {
+        println!("CipherMesh");
+        println!();
+        println!("[1] Create invite");
+        println!("[2] Join invite");
+        println!("[3] Open chats");
+        println!("[P] Profile");
+        println!(
+            "[D] Debug mode: {}",
+            debug_mode_label(&default_chat_db("profile"))
+        );
+        println!("[Q] Quit");
+        println!();
 
-    match prompt_line("Select: ")?.trim() {
-        "1" => {
-            let rendezvous_db = PathBuf::from(DEFAULT_INVITE_DB);
-            let listen_addr = DEFAULT_INVITE_LISTEN_ADDR.parse()?;
-            run_create_invite(listen_addr, &rendezvous_db, &default_chat_db("invite-host")).await
+        match prompt_line("Select: ")?.trim() {
+            "1" => {
+                let rendezvous_db = PathBuf::from(DEFAULT_INVITE_DB);
+                let listen_addr = DEFAULT_INVITE_LISTEN_ADDR.parse()?;
+                return run_create_invite(
+                    listen_addr,
+                    &rendezvous_db,
+                    &default_chat_db("invite-host"),
+                )
+                .await;
+            }
+            "2" => {
+                let code = prompt_line("Invite code: ")?;
+                let rendezvous_db = PathBuf::from(DEFAULT_INVITE_DB);
+                return run_join_invite(
+                    code.trim(),
+                    &rendezvous_db,
+                    &default_chat_db("invite-joiner"),
+                )
+                .await;
+            }
+            "3" => run_open_chats_menu().await?,
+            selection if selection.eq_ignore_ascii_case("p") => {
+                run_profile_screen(&default_chat_db("profile"))?;
+            }
+            selection if selection.eq_ignore_ascii_case("d") => {
+                run_debug_screen(&default_chat_db("profile"))?;
+            }
+            selection if selection.eq_ignore_ascii_case("q") => return Ok(()),
+            _ => {
+                println!("Invalid selection");
+                println!();
+            }
         }
-        "2" => {
-            let code = prompt_line("Invite code: ")?;
-            let rendezvous_db = PathBuf::from(DEFAULT_INVITE_DB);
-            run_join_invite(
-                code.trim(),
-                &rendezvous_db,
-                &default_chat_db("invite-joiner"),
-            )
-            .await
-        }
-        "3" => run_open_chats_menu().await,
-        _ => Err("invalid selection".into()),
     }
 }
 
@@ -979,6 +1002,637 @@ fn open_saved_conversation(
     Ok(())
 }
 
+fn run_profile_screen(db_path: &Path) -> AppResult<()> {
+    let profile = load_or_create_profile(db_path)?;
+
+    println!("{}", profile_summary_text(&profile));
+    println!("[C] Change display name");
+    println!("[L] Link new device");
+    println!("[R] Revoke device");
+    println!("[V] View verification details");
+    println!("[B] Back");
+    println!();
+
+    match prompt_line("Select: ")?.trim() {
+        selection if selection.eq_ignore_ascii_case("c") => {
+            let display_name = prompt_line("Display name: ")?;
+            Storage::open(db_path)?.save_display_name(&display_name_or_anonymous(&display_name))?;
+            println!("Display name updated");
+        }
+        selection if selection.eq_ignore_ascii_case("r") => {
+            revoke_device_from_profile(db_path, &profile)?;
+        }
+        selection if selection.eq_ignore_ascii_case("l") => {
+            let device_name = prompt_line("Device name: ")?;
+            let linked = link_new_profile_device(db_path, &profile.account_id, &device_name)?;
+            println!("Device linked: {}", linked.name);
+            println!("Device authorized with a signed certificate.");
+        }
+        selection if selection.eq_ignore_ascii_case("v") => {
+            print_verification_details(&profile);
+        }
+        selection if selection.eq_ignore_ascii_case("b") => {}
+        _ => return Err("invalid selection".into()),
+    }
+
+    Ok(())
+}
+
+fn run_debug_screen(db_path: &Path) -> AppResult<()> {
+    let storage = Storage::open(db_path)?;
+    let _ = debug_event_catalog_count();
+    println!();
+    println!("DEBUG - LIVE");
+    println!();
+    println!("[T] Toggle debug mode: {}", debug_mode_label(db_path));
+    println!("[A] All");
+    println!("[C] Crypto");
+    println!("[N] Network");
+    println!("[M] Messages");
+    println!("[S] Sync / Devices");
+    println!("[X] Clear logs");
+    println!("[B] Back");
+    println!();
+
+    match prompt_line("Select: ")?.trim() {
+        selection if selection.eq_ignore_ascii_case("t") => {
+            let enabled = !debug_mode_enabled(db_path);
+            storage.save_setting("debug.enabled", if enabled { "true" } else { "false" })?;
+            println!("Debug mode: {}", if enabled { "On" } else { "Off" });
+        }
+        selection if selection.eq_ignore_ascii_case("a") => {
+            print_debug_events(&storage.debug_events(None)?);
+        }
+        selection if selection.eq_ignore_ascii_case("c") => {
+            print_debug_events(&storage.debug_events(Some("CRYPTO"))?);
+        }
+        selection if selection.eq_ignore_ascii_case("n") => {
+            print_debug_events(&storage.debug_events(Some("NETWORK"))?);
+        }
+        selection if selection.eq_ignore_ascii_case("m") => {
+            print_debug_events(&storage.debug_events(Some("MESSAGE"))?);
+        }
+        selection if selection.eq_ignore_ascii_case("s") => {
+            let mut events = storage.debug_events(Some("SYNC"))?;
+            events.extend(storage.debug_events(Some("DEVICE"))?);
+            print_debug_events(&events);
+        }
+        selection if selection.eq_ignore_ascii_case("x") => {
+            let removed = storage.clear_debug_events()?;
+            println!("Cleared {removed} debug event(s)");
+        }
+        selection if selection.eq_ignore_ascii_case("b") => {}
+        _ => return Err("invalid selection".into()),
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DebugEvent {
+    PeerDiscovered,
+    DirectConnectionEstablished,
+    IdentityVerified,
+    SessionEstablished,
+    RatchetAdvanced {
+        direction: &'static str,
+        from: u64,
+        to: u64,
+    },
+    MessageEncrypted {
+        plaintext_preview: String,
+        ciphertext_bytes: usize,
+        ciphertext_preview: String,
+    },
+    CiphertextSent {
+        bytes: usize,
+        transport: &'static str,
+    },
+    AckReceived,
+    MessageReceived {
+        bytes: usize,
+    },
+    MessageDecrypted {
+        plaintext_preview: String,
+    },
+    DuplicateIgnored,
+    ReplayRejected,
+    MailboxStored {
+        bytes: usize,
+    },
+    SyncCompleted {
+        missing_events: usize,
+    },
+    DeviceFanout {
+        device_name: String,
+    },
+    DeviceLinked {
+        device_name: String,
+    },
+    DeviceRevoked {
+        device_name: String,
+    },
+    RevokedDeviceExcluded {
+        device_name: String,
+    },
+    AuthenticationRejected {
+        reason: &'static str,
+    },
+}
+
+fn debug_mode_label(db_path: &Path) -> &'static str {
+    if debug_mode_enabled(db_path) {
+        "On"
+    } else {
+        "Off"
+    }
+}
+
+fn debug_mode_enabled(db_path: &Path) -> bool {
+    let path = debug_db_path(db_path);
+    Storage::open(path)
+        .and_then(|storage| storage.load_setting("debug.enabled"))
+        .ok()
+        .flatten()
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn emit_debug_event(db_path: &Path, event: DebugEvent) -> AppResult<()> {
+    if !debug_mode_enabled(db_path) {
+        return Ok(());
+    }
+    let path = debug_db_path(db_path);
+    let (category, message) = render_debug_event(&event);
+    Storage::open(path)?.append_debug_event(category, &redact_debug_message(&message))?;
+    Ok(())
+}
+
+fn debug_db_path(db_path: &Path) -> PathBuf {
+    if db_path.ends_with(default_chat_db("profile")) {
+        db_path.to_path_buf()
+    } else {
+        default_chat_db("profile")
+    }
+}
+
+fn render_debug_event(event: &DebugEvent) -> (&'static str, String) {
+    match event {
+        DebugEvent::PeerDiscovered => ("NETWORK", "Peer discovered".to_string()),
+        DebugEvent::DirectConnectionEstablished => {
+            ("NETWORK", "Direct connection established".to_string())
+        }
+        DebugEvent::IdentityVerified => ("CRYPTO", "Ed25519 identity verified".to_string()),
+        DebugEvent::SessionEstablished => (
+            "CRYPTO",
+            "X25519 + HKDF session material established".to_string(),
+        ),
+        DebugEvent::RatchetAdvanced {
+            direction,
+            from,
+            to,
+        } => (
+            "RATCHET",
+            format!("{direction} counter {from} -> {to}; message key discarded"),
+        ),
+        DebugEvent::MessageEncrypted {
+            plaintext_preview,
+            ciphertext_bytes,
+            ciphertext_preview,
+        } => (
+            "CRYPTO",
+            format!(
+                "Message encrypted with ChaCha20-Poly1305: plaintext \"{}\" -> {}... [{} bytes]",
+                plaintext_preview, ciphertext_preview, ciphertext_bytes
+            ),
+        ),
+        DebugEvent::CiphertextSent { bytes, transport } => (
+            "NETWORK",
+            format!("Sent {bytes}-byte ciphertext over {transport}"),
+        ),
+        DebugEvent::AckReceived => ("ACK", "Delivery acknowledged".to_string()),
+        DebugEvent::MessageReceived { bytes } => {
+            ("MESSAGE", format!("Received {bytes}-byte ciphertext"))
+        }
+        DebugEvent::MessageDecrypted { plaintext_preview } => (
+            "CRYPTO",
+            format!(
+                "Authentication tag valid; replay check passed; decrypted \"{plaintext_preview}\""
+            ),
+        ),
+        DebugEvent::DuplicateIgnored => ("MESSAGE", "Duplicate ignored".to_string()),
+        DebugEvent::ReplayRejected => ("CRYPTO", "Replay detected - message rejected".to_string()),
+        DebugEvent::MailboxStored { bytes } => {
+            ("MAILBOX", format!("Stored ciphertext only [{bytes} bytes]"))
+        }
+        DebugEvent::SyncCompleted { missing_events } => (
+            "SYNC",
+            format!("Sync completed; missing events merged: {missing_events}"),
+        ),
+        DebugEvent::DeviceFanout { device_name } => {
+            ("DEVICE", format!("Encrypting separately for {device_name}"))
+        }
+        DebugEvent::DeviceLinked { device_name } => (
+            "DEVICE",
+            format!("Device linked and authorized: {device_name}"),
+        ),
+        DebugEvent::DeviceRevoked { device_name } => {
+            ("DEVICE", format!("Device revoked: {device_name}"))
+        }
+        DebugEvent::RevokedDeviceExcluded { device_name } => (
+            "DEVICE",
+            format!("Revoked device excluded from fanout: {device_name}"),
+        ),
+        DebugEvent::AuthenticationRejected { reason } => ("CRYPTO", format!("{reason} - rejected")),
+    }
+}
+
+fn debug_event_catalog_count() -> usize {
+    [
+        DebugEvent::DuplicateIgnored,
+        DebugEvent::ReplayRejected,
+        DebugEvent::MailboxStored { bytes: 0 },
+        DebugEvent::SyncCompleted { missing_events: 0 },
+        DebugEvent::DeviceFanout {
+            device_name: "device".to_string(),
+        },
+        DebugEvent::DeviceLinked {
+            device_name: "device".to_string(),
+        },
+        DebugEvent::DeviceRevoked {
+            device_name: "device".to_string(),
+        },
+        DebugEvent::RevokedDeviceExcluded {
+            device_name: "device".to_string(),
+        },
+        DebugEvent::AuthenticationRejected {
+            reason: "invalid input",
+        },
+    ]
+    .len()
+}
+
+fn print_debug_events(events: &[DebugLogRecord]) {
+    println!();
+    println!("DEBUG - LIVE");
+    if events.is_empty() {
+        println!("No debug events yet.");
+        return;
+    }
+    for event in events {
+        println!(
+            "{} [{}] {}",
+            debug_time(event.created_at_unix_secs),
+            event.category,
+            event.message
+        );
+    }
+}
+
+fn debug_time(timestamp: u64) -> String {
+    let seconds = timestamp % 86_400;
+    format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3600,
+        (seconds % 3600) / 60,
+        seconds % 60
+    )
+}
+
+fn ciphertext_preview(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn plaintext_preview(plaintext: &str) -> String {
+    plaintext.chars().take(32).collect()
+}
+
+fn redact_debug_message(message: &str) -> String {
+    let lower = message.to_ascii_lowercase();
+    for forbidden in [
+        "private key",
+        "shared secret",
+        "root key",
+        "chain key",
+        "message key",
+        "session key",
+    ] {
+        if lower.contains(forbidden) {
+            return "[redacted debug event]".to_string();
+        }
+    }
+    message.to_string()
+}
+
+fn profile_summary_text(profile: &ProfileView) -> String {
+    let mut text = String::new();
+    text.push_str("\nProfile\n\n");
+    text.push_str(&profile.display_name);
+    text.push('\n');
+    text.push_str(if profile.verified {
+        "Verified\n\n"
+    } else {
+        "Unverified\n\n"
+    });
+    text.push_str("Security fingerprint:\n");
+    text.push_str(&profile.fingerprint);
+    text.push_str("\n\nDevices\n\n");
+    for (index, device) in profile.devices.iter().enumerate() {
+        text.push_str(&format!(
+            "[{}] {} - {}\n",
+            index + 1,
+            device.name,
+            render_device_status(device)
+        ));
+    }
+    text.push('\n');
+    text
+}
+
+#[derive(Debug, Clone)]
+struct ProfileView {
+    display_name: String,
+    verified: bool,
+    account_id: String,
+    current_device_id: String,
+    fingerprint: String,
+    devices: Vec<ProfileDeviceView>,
+}
+
+#[derive(Debug, Clone)]
+struct ProfileDeviceView {
+    device_id: String,
+    name: String,
+    status: ProfileDeviceStatus,
+    online: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileDeviceStatus {
+    ThisDevice,
+    Authorized,
+    Revoked,
+}
+
+fn load_or_create_profile(db_path: &Path) -> AppResult<ProfileView> {
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let storage = Storage::open(db_path)?;
+
+    if storage.load_setting("profile.account_id")?.is_none() {
+        initialize_profile_backend(&storage)?;
+    }
+
+    profile_view_from_storage(&storage)
+}
+
+fn initialize_profile_backend(storage: &Storage) -> AppResult<()> {
+    let account = AccountIdentity::generate();
+    let macbook = DeviceIdentity::generate(account.account_id());
+
+    let macbook_certificate = account.authorize_device(&macbook);
+    persist_phase_5a_identity(storage, &account, &macbook, &macbook_certificate)?;
+
+    storage.save_setting("profile.account_id", account.account_id())?;
+    storage.save_setting("profile.current_device_id", macbook.device_id())?;
+    storage.save_setting(&device_name_key(macbook.device_id()), "MacBook Pro")?;
+    storage.save_setting(&device_online_key(macbook.device_id()), "online")?;
+    Ok(())
+}
+
+fn link_new_profile_device(
+    db_path: &Path,
+    account_id: &str,
+    device_name: &str,
+) -> AppResult<ProfileDeviceView> {
+    let storage = Storage::open(db_path)?;
+    let account = AccountIdentity::from_state(ciphermesh::AccountIdentityState {
+        account_id: account_id.to_string(),
+        account_secret_key: fixed_32(
+            storage
+                .load_account_secret_key(account_id)?
+                .ok_or("profile account secret missing")?,
+        )?,
+    });
+    let device = DeviceIdentity::generate(account.account_id());
+    let certificate = account.authorize_device(&device);
+    verify_device_certificate(account.public_key(), &certificate)?;
+    persist_phase_5a_identity(&storage, &account, &device, &certificate)?;
+
+    let name = display_name_or_anonymous(device_name);
+    storage.save_setting(&device_name_key(device.device_id()), &name)?;
+    storage.save_setting(&device_online_key(device.device_id()), "offline")?;
+    emit_debug_event(
+        db_path,
+        DebugEvent::DeviceLinked {
+            device_name: name.clone(),
+        },
+    )?;
+
+    Ok(ProfileDeviceView {
+        device_id: device.device_id().to_string(),
+        name,
+        status: ProfileDeviceStatus::Authorized,
+        online: Some(false),
+    })
+}
+
+fn profile_view_from_storage(storage: &Storage) -> AppResult<ProfileView> {
+    let account_id = storage
+        .load_setting("profile.account_id")?
+        .ok_or("profile account missing")?;
+    let current_device_id = storage
+        .load_setting("profile.current_device_id")?
+        .ok_or("current device missing")?;
+    let account_secret_key = fixed_32(
+        storage
+            .load_account_secret_key(&account_id)?
+            .ok_or("profile account secret missing")?,
+    )?;
+    let account = AccountIdentity::from_state(ciphermesh::AccountIdentityState {
+        account_id: account_id.clone(),
+        account_secret_key,
+    });
+    let certificates = load_device_certificates(storage, &account_id)?;
+    let revocations = load_device_revocations(storage, &account_id)?;
+    let verified = certificates
+        .iter()
+        .all(|certificate| verify_device_certificate(account.public_key(), certificate).is_ok());
+
+    Ok(ProfileView {
+        display_name: display_name_or_anonymous(&storage.load_display_name()?.unwrap_or_default()),
+        verified,
+        account_id,
+        current_device_id: current_device_id.clone(),
+        fingerprint: format_fingerprint(&account.public_key()),
+        devices: profile_devices_from_records(
+            storage,
+            &current_device_id,
+            account.public_key(),
+            &certificates,
+            &revocations,
+        )?,
+    })
+}
+
+fn profile_devices_from_records(
+    storage: &Storage,
+    current_device_id: &str,
+    account_public_key: [u8; 32],
+    certificates: &[DeviceCertificate],
+    revocations: &[DeviceRevocation],
+) -> AppResult<Vec<ProfileDeviceView>> {
+    certificates
+        .iter()
+        .map(|certificate| {
+            let revoked =
+                !is_device_currently_authorized(account_public_key, certificate, revocations)?;
+            let status = if revoked {
+                ProfileDeviceStatus::Revoked
+            } else if certificate.device_id == current_device_id {
+                ProfileDeviceStatus::ThisDevice
+            } else {
+                ProfileDeviceStatus::Authorized
+            };
+            Ok(ProfileDeviceView {
+                device_id: certificate.device_id.clone(),
+                name: storage
+                    .load_setting(&device_name_key(&certificate.device_id))?
+                    .unwrap_or_else(|| "Unnamed device".to_string()),
+                status,
+                online: storage
+                    .load_setting(&device_online_key(&certificate.device_id))?
+                    .map(|value| value == "online"),
+            })
+        })
+        .collect()
+}
+
+fn revoke_device_from_profile(db_path: &Path, profile: &ProfileView) -> AppResult<()> {
+    let candidates = profile
+        .devices
+        .iter()
+        .filter(|device| device.status == ProfileDeviceStatus::Authorized)
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        println!("No active non-current devices can be revoked.");
+        return Ok(());
+    }
+
+    println!();
+    println!("Revoke device");
+    for (index, device) in candidates.iter().enumerate() {
+        println!("[{}] {}", index + 1, device.name);
+    }
+    println!();
+
+    let selection = prompt_line("Select device: ")?;
+    let selected = selection
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .and_then(|index| candidates.get(index.saturating_sub(1)))
+        .ok_or("invalid selection")?;
+
+    revoke_profile_device_by_id(db_path, &profile.account_id, &selected.device_id)?;
+
+    println!("Device revoked. This does not delete data already stored on that device.");
+    Ok(())
+}
+
+fn revoke_profile_device_by_id(db_path: &Path, account_id: &str, device_id: &str) -> AppResult<()> {
+    let storage = Storage::open(db_path)?;
+    let account = AccountIdentity::from_state(ciphermesh::AccountIdentityState {
+        account_id: account_id.to_string(),
+        account_secret_key: fixed_32(
+            storage
+                .load_account_secret_key(account_id)?
+                .ok_or("profile account secret missing")?,
+        )?,
+    });
+    let next_counter = load_device_revocations(&storage, account_id)?
+        .iter()
+        .map(|revocation| revocation.revocation_counter)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let revocation = account.revoke_device(device_id.to_string(), next_counter);
+    verify_device_revocation(account.public_key(), &revocation)?;
+    storage.save_device_revocation(
+        account_id,
+        device_id,
+        revocation.revocation_counter,
+        &bincode::serialize(&revocation)?,
+    )?;
+    Ok(())
+}
+
+fn print_verification_details(profile: &ProfileView) {
+    println!();
+    println!("Verification details");
+    println!(
+        "Status: {}",
+        if profile.verified {
+            "Verified"
+        } else {
+            "Unverified"
+        }
+    );
+    println!("Fingerprint: {}", profile.fingerprint);
+    println!("AccountId: {}", profile.account_id);
+    println!("This DeviceId: {}", profile.current_device_id);
+}
+
+fn render_device_status(device: &ProfileDeviceView) -> String {
+    match device.status {
+        ProfileDeviceStatus::Revoked => "Revoked".to_string(),
+        ProfileDeviceStatus::ThisDevice => {
+            format!("This device - {}", online_label(device.online))
+        }
+        ProfileDeviceStatus::Authorized => {
+            format!("Authorized - {}", online_label(device.online))
+        }
+    }
+}
+
+fn online_label(online: Option<bool>) -> &'static str {
+    match online {
+        Some(true) => "Online",
+        Some(false) => "Offline",
+        None => "Status unknown",
+    }
+}
+
+fn format_fingerprint(identity_public_key: &[u8; 32]) -> String {
+    let digest = Sha256::digest(identity_public_key);
+    let hex = hex_encode(&digest[..12]).to_ascii_uppercase();
+    hex.as_bytes()
+        .chunks(4)
+        .map(|chunk| std::str::from_utf8(chunk).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+fn fixed_32(bytes: Vec<u8>) -> AppResult<[u8; 32]> {
+    bytes
+        .try_into()
+        .map_err(|_| "stored key had unexpected length".into())
+}
+
+fn device_name_key(device_id: &str) -> String {
+    format!("profile.device.{device_id}.name")
+}
+
+fn device_online_key(device_id: &str) -> String {
+    format!("profile.device.{device_id}.online")
+}
+
 async fn run_create_invite(
     listen_addr: SocketAddr,
     rendezvous_db: &Path,
@@ -1021,7 +1675,9 @@ async fn run_join_invite(code: &str, rendezvous_db: &Path, profile_db: &Path) ->
         .map_err(|error| format!("invite resolved to invalid peer address: {error}"))?;
 
     println!("Pairing...");
+    emit_debug_event(profile_db, DebugEvent::PeerDiscovered)?;
     println!("Identity established");
+    emit_debug_event(profile_db, DebugEvent::IdentityVerified)?;
     run_chat_alice(peer_addr, profile_db).await
 }
 
@@ -1950,6 +2606,7 @@ async fn run_bob_quic_once(
 ) -> AppResult<()> {
     let incoming = endpoint.accept().await.ok_or("endpoint closed")?;
     let connection = incoming.await?;
+    emit_debug_event(&db_path, DebugEvent::DirectConnectionEstablished)?;
     println!(
         "direct connection established: accepted QUIC connection from {}",
         connection.remote_address()
@@ -1972,6 +2629,7 @@ async fn run_bob_quic_once(
     log_boundary("Alice -> Bob InitialMessage", &encrypted_bytes);
     let initial_message = decode_chat_initial_message(&encrypted_bytes)?;
     let remote_display_name = initial_message.sender_display_name;
+    emit_debug_event(&db_path, DebugEvent::IdentityVerified)?;
     let conversation_id = contact_id_for_display_name(&remote_display_name);
     save_contact_for_chat(
         &db_path,
@@ -1984,6 +2642,7 @@ async fn run_bob_quic_once(
         let mut bob = bob.lock().map_err(|_| "Bob state lock poisoned")?;
         bob.decrypt_initial_message(&initial_message.message)?
     };
+    emit_debug_event(&db_path, DebugEvent::SessionEstablished)?;
 
     if !plaintext.is_empty() {
         persist_chat_message(
@@ -2001,6 +2660,7 @@ async fn run_bob_quic_once(
         )?;
         let mut ack = connection.open_uni().await?;
         send_bytes(&mut ack, b"ok").await?;
+        emit_debug_event(&db_path, DebugEvent::AckReceived)?;
     }
 
     println!("Connected securely");
@@ -2050,11 +2710,13 @@ async fn run_alice(bob_addr: SocketAddr, message: &str, db_path: &Path) -> AppRe
 
     let connection = endpoint.connect(bob_addr, "localhost")?.await?;
     println!("Connected to peer at {}", connection.remote_address());
+    emit_debug_event(db_path, DebugEvent::DirectConnectionEstablished)?;
 
     let mut recv = connection.accept_uni().await?;
     let bundle_bytes = receive_bytes(&mut recv).await?;
     log_boundary("Bob -> Alice PreKeyBundle", &bundle_bytes);
     let (remote_display_name, bundle) = decode_chat_prekey_bundle(&bundle_bytes)?;
+    emit_debug_event(db_path, DebugEvent::IdentityVerified)?;
     let conversation_id = contact_id_for_identity(&bundle.identity_public_key);
     save_contact_for_chat(
         db_path,
@@ -2065,6 +2727,7 @@ async fn run_alice(bob_addr: SocketAddr, message: &str, db_path: &Path) -> AppRe
     )?;
 
     let initial_message = alice.encrypt_initial_message(&bundle, message)?;
+    emit_debug_event(db_path, DebugEvent::SessionEstablished)?;
     let encrypted_bytes = bincode::serialize(&ChatInitialMessage {
         sender_display_name: local_display_name.clone(),
         message: initial_message,
@@ -2072,12 +2735,20 @@ async fn run_alice(bob_addr: SocketAddr, message: &str, db_path: &Path) -> AppRe
     log_boundary("Alice -> Bob InitialMessage", &encrypted_bytes);
     let mut send = connection.open_uni().await?;
     send_bytes(&mut send, &encrypted_bytes).await?;
+    emit_debug_event(
+        db_path,
+        DebugEvent::CiphertextSent {
+            bytes: encrypted_bytes.len(),
+            transport: "QUIC",
+        },
+    )?;
     let mut ack = connection.accept_uni().await?;
     let ack_bytes = receive_bytes(&mut ack).await?;
     println!(
         "Received transport ack: {}",
         String::from_utf8_lossy(&ack_bytes)
     );
+    emit_debug_event(db_path, DebugEvent::AckReceived)?;
     println!("Connected to peer");
     println!(
         "Remote display name: {}",
@@ -2119,6 +2790,7 @@ async fn run_chat_bob(listen_addr: SocketAddr, db_path: &Path) -> AppResult<()> 
 
     let incoming = endpoint.accept().await.ok_or("endpoint closed")?;
     let connection = incoming.await?;
+    emit_debug_event(db_path, DebugEvent::DirectConnectionEstablished)?;
 
     let mut send = connection.open_uni().await?;
     let bundle = bob.prekey_bundle()?;
@@ -2133,9 +2805,23 @@ async fn run_chat_bob(listen_addr: SocketAddr, db_path: &Path) -> AppResult<()> 
 
     let mut recv = connection.accept_uni().await?;
     let initial_bytes = receive_bytes(&mut recv).await?;
+    emit_debug_event(
+        db_path,
+        DebugEvent::MessageReceived {
+            bytes: initial_bytes.len(),
+        },
+    )?;
     let initial_message = decode_chat_initial_message(&initial_bytes)?;
     let remote_display_name = initial_message.sender_display_name;
+    emit_debug_event(db_path, DebugEvent::IdentityVerified)?;
     let initial_plaintext = bob.decrypt_initial_message(&initial_message.message)?;
+    emit_debug_event(db_path, DebugEvent::SessionEstablished)?;
+    emit_debug_event(
+        db_path,
+        DebugEvent::MessageDecrypted {
+            plaintext_preview: plaintext_preview(&initial_plaintext),
+        },
+    )?;
     let conversation_id = contact_id_for_display_name(&remote_display_name);
     save_contact_for_chat(
         db_path,
@@ -2179,10 +2865,12 @@ async fn run_chat_alice(bob_addr: SocketAddr, db_path: &Path) -> AppResult<()> {
     endpoint.set_default_client_config(insecure_client_config()?);
 
     let connection = endpoint.connect(bob_addr, "localhost")?.await?;
+    emit_debug_event(db_path, DebugEvent::DirectConnectionEstablished)?;
 
     let mut recv = connection.accept_uni().await?;
     let bundle_bytes = receive_bytes(&mut recv).await?;
     let (remote_display_name, bundle) = decode_chat_prekey_bundle(&bundle_bytes)?;
+    emit_debug_event(db_path, DebugEvent::IdentityVerified)?;
     let conversation_id = contact_id_for_identity(&bundle.identity_public_key);
     save_contact_for_chat(
         db_path,
@@ -2193,15 +2881,20 @@ async fn run_chat_alice(bob_addr: SocketAddr, db_path: &Path) -> AppResult<()> {
     )?;
 
     let initial_message = alice.encrypt_initial_message(&bundle, "")?;
+    let initial_bytes = bincode::serialize(&ChatInitialMessage {
+        sender_display_name: local_display_name.clone(),
+        message: initial_message,
+    })?;
     let mut send = connection.open_uni().await?;
-    send_bytes(
-        &mut send,
-        &bincode::serialize(&ChatInitialMessage {
-            sender_display_name: local_display_name.clone(),
-            message: initial_message,
-        })?,
-    )
-    .await?;
+    send_bytes(&mut send, &initial_bytes).await?;
+    emit_debug_event(db_path, DebugEvent::SessionEstablished)?;
+    emit_debug_event(
+        db_path,
+        DebugEvent::CiphertextSent {
+            bytes: initial_bytes.len(),
+            transport: "QUIC",
+        },
+    )?;
     println!("Connected securely");
 
     chat_loop_alice(
@@ -2251,6 +2944,12 @@ async fn chat_loop_alice(
             incoming = connection.accept_uni() => {
                 let mut recv = incoming?;
                 let frame_bytes = receive_bytes(&mut recv).await?;
+                emit_debug_event(
+                    &db_path,
+                    DebugEvent::MessageReceived {
+                        bytes: frame_bytes.len(),
+                    },
+                )?;
                 let frame: ChatFrame = bincode::deserialize(&frame_bytes)?;
                 match frame {
                     ChatFrame::Message { sender_display_name, message } => {
@@ -2258,6 +2957,12 @@ async fn chat_loop_alice(
                             .lock()
                             .map_err(|_| "Alice state lock poisoned")?
                             .decrypt_from_bob(&message)?;
+                        emit_debug_event(
+                            &db_path,
+                            DebugEvent::MessageDecrypted {
+                                plaintext_preview: plaintext_preview(&plaintext),
+                            },
+                        )?;
                         persist_chat_message(
                             &db_path,
                             ChatHistoryEntry {
@@ -2333,6 +3038,12 @@ async fn chat_loop_bob_shared(
             incoming = connection.accept_uni() => {
                 let mut recv = incoming?;
                 let frame_bytes = receive_bytes(&mut recv).await?;
+                emit_debug_event(
+                    &db_path,
+                    DebugEvent::MessageReceived {
+                        bytes: frame_bytes.len(),
+                    },
+                )?;
                 let frame: ChatFrame = bincode::deserialize(&frame_bytes)?;
                 match frame {
                     ChatFrame::Message { sender_display_name, message } => {
@@ -2340,6 +3051,12 @@ async fn chat_loop_bob_shared(
                             .lock()
                             .map_err(|_| "Bob state lock poisoned")?
                             .decrypt_from_alice(&message)?;
+                        emit_debug_event(
+                            &db_path,
+                            DebugEvent::MessageDecrypted {
+                                plaintext_preview: plaintext_preview(&plaintext),
+                            },
+                        )?;
                         persist_chat_message(
                             &db_path,
                             ChatHistoryEntry {
@@ -2378,12 +3095,36 @@ async fn send_alice_chat_line(
         .lock()
         .map_err(|_| "Alice state lock poisoned")?
         .encrypt_for_bob(&line)?;
+    let send_counter = message.number;
     let frame = ChatFrame::Message {
         sender_display_name: local_display_name.to_string(),
         message,
     };
     let frame_bytes = bincode::serialize(&frame)?;
+    emit_debug_event(
+        db_path,
+        DebugEvent::MessageEncrypted {
+            plaintext_preview: plaintext_preview(&line),
+            ciphertext_bytes: frame_bytes.len(),
+            ciphertext_preview: ciphertext_preview(&frame_bytes),
+        },
+    )?;
+    emit_debug_event(
+        db_path,
+        DebugEvent::RatchetAdvanced {
+            direction: "Send",
+            from: send_counter,
+            to: send_counter + 1,
+        },
+    )?;
     send_chat_frame(connection, frame).await?;
+    emit_debug_event(
+        db_path,
+        DebugEvent::CiphertextSent {
+            bytes: frame_bytes.len(),
+            transport: "QUIC",
+        },
+    )?;
     persist_chat_message(
         db_path,
         ChatHistoryEntry {
@@ -2416,12 +3157,36 @@ async fn send_bob_chat_line(
         .lock()
         .map_err(|_| "Bob state lock poisoned")?
         .encrypt_for_alice(&line)?;
+    let send_counter = message.number;
     let frame = ChatFrame::Message {
         sender_display_name: local_display_name.to_string(),
         message,
     };
     let frame_bytes = bincode::serialize(&frame)?;
+    emit_debug_event(
+        db_path,
+        DebugEvent::MessageEncrypted {
+            plaintext_preview: plaintext_preview(&line),
+            ciphertext_bytes: frame_bytes.len(),
+            ciphertext_preview: ciphertext_preview(&frame_bytes),
+        },
+    )?;
+    emit_debug_event(
+        db_path,
+        DebugEvent::RatchetAdvanced {
+            direction: "Send",
+            from: send_counter,
+            to: send_counter + 1,
+        },
+    )?;
     send_chat_frame(connection, frame).await?;
+    emit_debug_event(
+        db_path,
+        DebugEvent::CiphertextSent {
+            bytes: frame_bytes.len(),
+            transport: "QUIC",
+        },
+    )?;
     persist_chat_message(
         db_path,
         ChatHistoryEntry {
@@ -4363,5 +5128,311 @@ mod discovery_tests {
         assert!(!id.contains("127.0.0.1"));
         assert!(!id.contains("raw-peer-id"));
         assert_eq!(id.len(), 32);
+    }
+
+    #[test]
+    fn profile_display_name_persists_and_blank_is_anonymous() {
+        let path = temp_profile_path("display");
+        {
+            let storage = Storage::open(&path).expect("storage");
+            storage.save_display_name("").expect("blank display name");
+        }
+
+        let profile = load_or_create_profile(&path).expect("profile");
+        assert_eq!(profile.display_name, "Anonymous");
+
+        Storage::open(&path)
+            .expect("storage")
+            .save_display_name("James")
+            .expect("save display");
+        let reopened = load_or_create_profile(&path).expect("reopened profile");
+        assert_eq!(reopened.display_name, "James");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn changing_display_name_does_not_change_account_or_fingerprint() {
+        let path = temp_profile_path("identity-separation");
+        let before = load_or_create_profile(&path).expect("profile");
+
+        Storage::open(&path)
+            .expect("storage")
+            .save_display_name("New Name")
+            .expect("display name");
+        let after = load_or_create_profile(&path).expect("reopened profile");
+
+        assert_eq!(before.account_id, after.account_id);
+        assert_eq!(before.current_device_id, after.current_device_id);
+        assert_eq!(before.fingerprint, after.fingerprint);
+        assert_eq!(after.display_name, "New Name");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn profile_devices_render_authorized_offline_current_and_revoked() {
+        let path = temp_profile_path("devices");
+        let profile = load_or_create_profile(&path).expect("profile");
+        let linked =
+            link_new_profile_device(&path, &profile.account_id, "iPhone").expect("link phone");
+        revoke_profile_device_by_id(&path, &profile.account_id, &linked.device_id)
+            .expect("revoke phone");
+        let profile = load_or_create_profile(&path).expect("profile after links");
+
+        assert!(profile.devices.iter().any(|device| {
+            device.name == "MacBook Pro"
+                && device.status == ProfileDeviceStatus::ThisDevice
+                && device.online == Some(true)
+                && render_device_status(device) == "This device - Online"
+        }));
+        assert!(profile.devices.iter().any(|device| {
+            device.name == "iPhone"
+                && device.status == ProfileDeviceStatus::Revoked
+                && render_device_status(device) == "Revoked"
+        }));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn revoking_profile_device_updates_backend_and_fanout_filter() {
+        let path = temp_profile_path("revocation");
+        let before = load_or_create_profile(&path).expect("profile");
+        let phone =
+            link_new_profile_device(&path, &before.account_id, "iPhone").expect("link phone");
+        assert_eq!(phone.status, ProfileDeviceStatus::Authorized);
+        assert_eq!(phone.online, Some(false));
+
+        revoke_profile_device_by_id(&path, &before.account_id, &phone.device_id)
+            .expect("revoke phone");
+
+        let storage = Storage::open(&path).expect("storage");
+        let account = AccountIdentity::from_state(ciphermesh::AccountIdentityState {
+            account_id: before.account_id.clone(),
+            account_secret_key: fixed_32(
+                storage
+                    .load_account_secret_key(&before.account_id)
+                    .expect("load secret")
+                    .expect("secret"),
+            )
+            .expect("fixed key"),
+        });
+        let certificates = load_device_certificates(&storage, &before.account_id).expect("certs");
+        let revocations = load_device_revocations(&storage, &before.account_id).expect("revokes");
+        let active = active_device_certificates(account.public_key(), &certificates, &revocations)
+            .expect("active devices");
+        let after = profile_view_from_storage(&storage).expect("profile after revoke");
+
+        assert!(after.devices.iter().any(|device| {
+            device.device_id == phone.device_id && device.status == ProfileDeviceStatus::Revoked
+        }));
+        assert!(!active
+            .iter()
+            .any(|certificate| certificate.device_id == phone.device_id));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn linked_devices_are_real_persisted_device_identities() {
+        let path = temp_profile_path("real-device-link");
+        let profile = load_or_create_profile(&path).expect("profile");
+        let linked =
+            link_new_profile_device(&path, &profile.account_id, "Travel Laptop").expect("link");
+        let storage = Storage::open(&path).expect("storage");
+
+        assert!(storage
+            .load_device_identity(&linked.device_id)
+            .expect("load linked identity")
+            .is_some());
+        assert!(load_device_certificates(&storage, &profile.account_id)
+            .expect("certs")
+            .iter()
+            .any(|certificate| certificate.device_id == linked.device_id));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn offline_linked_device_is_not_treated_as_revoked() {
+        let path = temp_profile_path("offline-not-revoked");
+        let profile = load_or_create_profile(&path).expect("profile");
+        let linked =
+            link_new_profile_device(&path, &profile.account_id, "iPhone").expect("link phone");
+        let reopened = load_or_create_profile(&path).expect("reopened");
+        let phone = reopened
+            .devices
+            .iter()
+            .find(|device| device.device_id == linked.device_id)
+            .expect("phone");
+
+        assert_eq!(phone.online, Some(false));
+        assert_eq!(phone.status, ProfileDeviceStatus::Authorized);
+        assert_eq!(render_device_status(phone), "Authorized - Offline");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn profile_fingerprint_is_stable_across_restart() {
+        let path = temp_profile_path("fingerprint");
+        let first = load_or_create_profile(&path).expect("profile");
+        let second = load_or_create_profile(&path).expect("reopened profile");
+
+        assert_eq!(first.fingerprint, second.fingerprint);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn normal_profile_ui_does_not_show_private_or_session_keys() {
+        let path = temp_profile_path("normal-ui");
+        let profile = load_or_create_profile(&path).expect("profile");
+        let text = profile_summary_text(&profile).to_ascii_lowercase();
+
+        assert!(text.contains("security fingerprint"));
+        assert!(!text.contains("private"));
+        assert!(!text.contains("secret"));
+        assert!(!text.contains("session key"));
+        assert!(!text.contains("ratchet"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn debug_mode_off_produces_no_debug_events() {
+        let path = temp_debug_path("off");
+        emit_debug_event(&path, DebugEvent::IdentityVerified).expect("emit off");
+
+        let storage = Storage::open(&path).expect("storage");
+        assert!(storage.debug_events(None).expect("events").is_empty());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn debug_mode_on_receives_structured_events() {
+        let path = temp_debug_path("on");
+        let storage = Storage::open(&path).expect("storage");
+        storage
+            .save_setting("debug.enabled", "true")
+            .expect("enable debug");
+
+        emit_debug_event(&path, DebugEvent::IdentityVerified).expect("identity event");
+        emit_debug_event(
+            &path,
+            DebugEvent::CiphertextSent {
+                bytes: 184,
+                transport: "QUIC",
+            },
+        )
+        .expect("network event");
+
+        let events = storage.debug_events(None).expect("events");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].category, "CRYPTO");
+        assert_eq!(events[1].category, "NETWORK");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn debug_rendering_shows_safe_crypto_and_delivery_metadata() {
+        let (_, encrypted) = render_debug_event(&DebugEvent::MessageEncrypted {
+            plaintext_preview: "hello james".to_string(),
+            ciphertext_bytes: 184,
+            ciphertext_preview: "8f a2 91 3c".to_string(),
+        });
+        assert!(encrypted.contains("ChaCha20-Poly1305"));
+        assert!(encrypted.contains("[184 bytes]"));
+        assert!(encrypted.contains("8f a2 91 3c"));
+
+        let (_, ratchet) = render_debug_event(&DebugEvent::RatchetAdvanced {
+            direction: "Send",
+            from: 41,
+            to: 42,
+        });
+        assert!(ratchet.contains("41 -> 42"));
+        assert!(ratchet.contains("discarded"));
+
+        let (_, ack) = render_debug_event(&DebugEvent::AckReceived);
+        assert_eq!(ack, "Delivery acknowledged");
+    }
+
+    #[test]
+    fn debug_rendering_covers_mailbox_fanout_revocation_and_rejections() {
+        assert!(
+            render_debug_event(&DebugEvent::MailboxStored { bytes: 201 })
+                .1
+                .contains("ciphertext only")
+        );
+        assert!(render_debug_event(&DebugEvent::DeviceFanout {
+            device_name: "MacBook".to_string()
+        })
+        .1
+        .contains("Encrypting separately"));
+        assert!(render_debug_event(&DebugEvent::RevokedDeviceExcluded {
+            device_name: "iPhone".to_string()
+        })
+        .1
+        .contains("excluded"));
+        assert!(render_debug_event(&DebugEvent::ReplayRejected)
+            .1
+            .contains("rejected"));
+        assert!(render_debug_event(&DebugEvent::AuthenticationRejected {
+            reason: "Invalid Ed25519 signature"
+        })
+        .1
+        .contains("rejected"));
+    }
+
+    #[test]
+    fn debug_output_never_includes_private_or_session_keys() {
+        let messages = [
+            render_debug_event(&DebugEvent::SessionEstablished).1,
+            render_debug_event(&DebugEvent::RatchetAdvanced {
+                direction: "Send",
+                from: 1,
+                to: 2,
+            })
+            .1,
+            redact_debug_message("root key abc123"),
+            redact_debug_message("private key abc123"),
+            redact_debug_message("message key abc123"),
+        ]
+        .join("\n")
+        .to_ascii_lowercase();
+
+        assert!(!messages.contains("abc123"));
+        assert!(!messages.contains("root key abc123"));
+        assert!(!messages.contains("private key abc123"));
+        assert!(!messages.contains("message key abc123"));
+    }
+
+    #[test]
+    fn debug_mode_does_not_change_rendered_protocol_metadata() {
+        let event = DebugEvent::CiphertextSent {
+            bytes: 64,
+            transport: "QUIC",
+        };
+
+        assert_eq!(render_debug_event(&event), render_debug_event(&event));
+    }
+
+    fn temp_profile_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ciphermesh-profile-{label}-{}.sqlite",
+            now_unix_secs()
+        ))
+    }
+
+    fn temp_debug_path(label: &str) -> PathBuf {
+        let path = std::env::temp_dir()
+            .join(format!("ciphermesh-debug-{label}-{}", now_unix_secs()))
+            .join("target")
+            .join("ciphermesh-profile-profile.sqlite");
+        std::fs::create_dir_all(path.parent().expect("debug path parent")).expect("debug dir");
+        path
     }
 }

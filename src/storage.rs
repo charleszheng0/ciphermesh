@@ -138,6 +138,14 @@ pub struct ChatSummary {
     pub last_message: Option<MessageRecord>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebugLogRecord {
+    pub id: i64,
+    pub category: String,
+    pub message: String,
+    pub created_at_unix_secs: u64,
+}
+
 pub struct Storage {
     conn: Connection,
 }
@@ -294,6 +302,13 @@ impl Storage {
                 consumed_at_unix_secs INTEGER,
                 created_at_unix_secs INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS debug_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL,
+                message TEXT NOT NULL,
+                created_at_unix_secs INTEGER NOT NULL
+            );
             ",
         )
     }
@@ -338,13 +353,72 @@ impl Storage {
     }
 
     pub fn load_display_name(&self) -> StorageResult<Option<String>> {
+        self.load_setting("display_name")
+    }
+
+    pub fn save_setting(&self, key: &str, value: &str) -> StorageResult<()> {
+        self.conn.execute(
+            "
+            INSERT INTO local_settings (key, value, updated_at_unix_secs)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at_unix_secs = excluded.updated_at_unix_secs
+            ",
+            params![key, value, now_unix_secs() as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_setting(&self, key: &str) -> StorageResult<Option<String>> {
         self.conn
             .query_row(
-                "SELECT value FROM local_settings WHERE key = 'display_name'",
-                [],
+                "SELECT value FROM local_settings WHERE key = ?1",
+                params![key],
                 |row| row.get(0),
             )
             .optional()
+    }
+
+    pub fn append_debug_event(&self, category: &str, message: &str) -> StorageResult<()> {
+        self.conn.execute(
+            "
+            INSERT INTO debug_events (category, message, created_at_unix_secs)
+            VALUES (?1, ?2, ?3)
+            ",
+            params![category, message, now_unix_secs() as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn debug_events(&self, category: Option<&str>) -> StorageResult<Vec<DebugLogRecord>> {
+        let sql = match category {
+            Some(_) => {
+                "
+                SELECT id, category, message, created_at_unix_secs
+                FROM debug_events
+                WHERE category = ?1
+                ORDER BY id
+                "
+            }
+            None => {
+                "
+                SELECT id, category, message, created_at_unix_secs
+                FROM debug_events
+                ORDER BY id
+                "
+            }
+        };
+        let mut statement = self.conn.prepare(sql)?;
+        let rows = match category {
+            Some(category) => statement.query_map(params![category], debug_log_from_row)?,
+            None => statement.query_map([], debug_log_from_row)?,
+        };
+        rows.collect()
+    }
+
+    pub fn clear_debug_events(&self) -> StorageResult<usize> {
+        self.conn.execute("DELETE FROM debug_events", [])
     }
 
     pub fn save_contact(&self, contact: &ContactRecord) -> StorageResult<()> {
@@ -1374,6 +1448,17 @@ fn contact_from_row(row: &rusqlite::Row<'_>) -> StorageResult<ContactRecord> {
     })
 }
 
+fn debug_log_from_row(row: &rusqlite::Row<'_>) -> StorageResult<DebugLogRecord> {
+    let created_at: i64 = row.get(3)?;
+
+    Ok(DebugLogRecord {
+        id: row.get(0)?,
+        category: row.get(1)?,
+        message: row.get(2)?,
+        created_at_unix_secs: created_at as u64,
+    })
+}
+
 fn message_from_row(row: &rusqlite::Row<'_>) -> StorageResult<MessageRecord> {
     let direction: String = row.get(4)?;
     let status: String = row.get(5)?;
@@ -2184,6 +2269,28 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn debug_events_append_filter_and_clear() {
+        let storage = Storage::open_in_memory().expect("storage");
+        storage
+            .append_debug_event("CRYPTO", "Message encrypted")
+            .expect("crypto event");
+        storage
+            .append_debug_event("NETWORK", "Sent ciphertext")
+            .expect("network event");
+
+        assert_eq!(storage.debug_events(None).expect("all").len(), 2);
+        assert_eq!(
+            storage
+                .debug_events(Some("CRYPTO"))
+                .expect("crypto only")
+                .len(),
+            1
+        );
+        assert_eq!(storage.clear_debug_events().expect("clear"), 2);
+        assert!(storage.debug_events(None).expect("empty").is_empty());
     }
 
     fn event(device_id: &str, counter: u64) -> EventRecord {
