@@ -6,7 +6,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use getrandom::{rand_core::UnwrapErr, SysRng};
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
@@ -52,6 +52,10 @@ impl Error for CryptoError {}
 pub type PublicKeyBytes = [u8; 32];
 pub type IdentityPublicKeyBytes = [u8; 32];
 pub type SignatureBytes = Vec<u8>;
+pub type AccountId = String;
+pub type DeviceId = String;
+
+const DEVICE_CERTIFICATE_CONTEXT: &[u8] = b"ciphermesh.phase-5a.device-certificate";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedKeyExchange {
@@ -123,6 +127,41 @@ pub struct BobState {
     pub signed_prekey_private_key: [u8; 32],
     pub one_time_prekey: Option<OneTimePreKeyState>,
     pub session: Option<RatchetSessionState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountIdentityState {
+    pub account_id: AccountId,
+    pub account_secret_key: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceIdentityState {
+    pub account_id: AccountId,
+    pub device_id: DeviceId,
+    pub device_secret_key: [u8; 32],
+    pub device_x25519_private_key: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceCertificate {
+    pub account_id: AccountId,
+    pub device_id: DeviceId,
+    pub device_ed25519_public_key: IdentityPublicKeyBytes,
+    pub device_x25519_public_key: PublicKeyBytes,
+    pub signature: SignatureBytes,
+}
+
+pub struct AccountIdentity {
+    account_id: AccountId,
+    identity: IdentityKeyPair,
+}
+
+pub struct DeviceIdentity {
+    account_id: AccountId,
+    device_id: DeviceId,
+    signing: IdentityKeyPair,
+    x25519: X25519KeyPair,
 }
 
 struct X25519KeyPair {
@@ -618,6 +657,153 @@ impl Default for SimulatedDirectory {
     fn default() -> Self {
         Self::new()
     }
+}
+
+impl AccountIdentity {
+    pub fn generate() -> Self {
+        let identity = IdentityKeyPair::generate();
+        let account_id = account_id_for_public_key(identity.public_key());
+
+        Self {
+            account_id,
+            identity,
+        }
+    }
+
+    pub fn from_state(state: AccountIdentityState) -> Self {
+        Self {
+            account_id: state.account_id,
+            identity: IdentityKeyPair::from_secret_bytes(state.account_secret_key),
+        }
+    }
+
+    pub fn export_state(&self) -> AccountIdentityState {
+        AccountIdentityState {
+            account_id: self.account_id.clone(),
+            account_secret_key: self.identity.secret_key_bytes(),
+        }
+    }
+
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    pub fn public_key(&self) -> IdentityPublicKeyBytes {
+        self.identity.public_key()
+    }
+
+    pub fn authorize_device(&self, device: &DeviceIdentity) -> DeviceCertificate {
+        let mut certificate = DeviceCertificate {
+            account_id: self.account_id.clone(),
+            device_id: device.device_id.clone(),
+            device_ed25519_public_key: device.signing.public_key(),
+            device_x25519_public_key: device.x25519.public_key(),
+            signature: Vec::new(),
+        };
+        let signed_bytes = device_certificate_bytes(&certificate);
+        certificate.signature = self
+            .identity
+            .signing_key
+            .sign(&signed_bytes)
+            .to_bytes()
+            .to_vec();
+        certificate
+    }
+}
+
+impl DeviceIdentity {
+    pub fn generate(account_id: impl Into<AccountId>) -> Self {
+        let account_id = account_id.into();
+        let signing = IdentityKeyPair::generate();
+        let x25519 = X25519KeyPair::generate();
+        let device_id = device_id_for_public_key(signing.public_key());
+
+        Self {
+            account_id,
+            device_id,
+            signing,
+            x25519,
+        }
+    }
+
+    pub fn from_state(state: DeviceIdentityState) -> Self {
+        Self {
+            account_id: state.account_id,
+            device_id: state.device_id,
+            signing: IdentityKeyPair::from_secret_bytes(state.device_secret_key),
+            x25519: X25519KeyPair::from_private_bytes(state.device_x25519_private_key),
+        }
+    }
+
+    pub fn export_state(&self) -> DeviceIdentityState {
+        DeviceIdentityState {
+            account_id: self.account_id.clone(),
+            device_id: self.device_id.clone(),
+            device_secret_key: self.signing.secret_key_bytes(),
+            device_x25519_private_key: self.x25519.private_key_bytes(),
+        }
+    }
+
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+
+    pub fn ed25519_public_key(&self) -> IdentityPublicKeyBytes {
+        self.signing.public_key()
+    }
+
+    pub fn x25519_public_key(&self) -> PublicKeyBytes {
+        self.x25519.public_key()
+    }
+}
+
+pub fn verify_device_certificate(
+    account_public_key: IdentityPublicKeyBytes,
+    certificate: &DeviceCertificate,
+) -> Result<(), CryptoError> {
+    if certificate.account_id != account_id_for_public_key(account_public_key) {
+        return Err(CryptoError::SignatureVerification);
+    }
+
+    let verifying_key = VerifyingKey::from_bytes(&account_public_key)
+        .map_err(|_| CryptoError::SignatureVerification)?;
+    let signature = Signature::try_from(&certificate.signature[..])
+        .map_err(|_| CryptoError::SignatureVerification)?;
+
+    verifying_key
+        .verify(&device_certificate_bytes(certificate), &signature)
+        .map_err(|_| CryptoError::SignatureVerification)
+}
+
+fn account_id_for_public_key(public_key: IdentityPublicKeyBytes) -> AccountId {
+    format!("acct-{}", short_hash(&public_key))
+}
+
+fn device_id_for_public_key(public_key: IdentityPublicKeyBytes) -> DeviceId {
+    format!("dev-{}", short_hash(&public_key))
+}
+
+fn short_hash(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn device_certificate_bytes(certificate: &DeviceCertificate) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(DEVICE_CERTIFICATE_CONTEXT);
+    bytes.extend_from_slice(certificate.account_id.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(certificate.device_id.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(&certificate.device_ed25519_public_key);
+    bytes.extend_from_slice(&certificate.device_x25519_public_key);
+    bytes
 }
 
 pub struct Alice {
@@ -1127,6 +1313,63 @@ mod tests {
             alice.decrypt_from_bob(&encrypted).expect("alice decrypts"),
             "hello alice"
         );
+    }
+
+    #[test]
+    fn account_authorizes_two_distinct_devices() {
+        let account = AccountIdentity::generate();
+        let laptop = DeviceIdentity::generate(account.account_id());
+        let phone = DeviceIdentity::generate(account.account_id());
+        let laptop_certificate = account.authorize_device(&laptop);
+        let phone_certificate = account.authorize_device(&phone);
+
+        verify_device_certificate(account.public_key(), &laptop_certificate)
+            .expect("laptop verifies");
+        verify_device_certificate(account.public_key(), &phone_certificate)
+            .expect("phone verifies");
+
+        assert_eq!(laptop.account_id(), account.account_id());
+        assert_eq!(phone.account_id(), account.account_id());
+        assert_ne!(laptop.device_id(), phone.device_id());
+        assert_ne!(laptop.ed25519_public_key(), phone.ed25519_public_key());
+        assert_ne!(laptop.x25519_public_key(), phone.x25519_public_key());
+    }
+
+    #[test]
+    fn modified_device_certificate_fails_verification() {
+        let account = AccountIdentity::generate();
+        let laptop = DeviceIdentity::generate(account.account_id());
+        let mut certificate = account.authorize_device(&laptop);
+
+        certificate.device_x25519_public_key[0] ^= 0x01;
+
+        assert_eq!(
+            verify_device_certificate(account.public_key(), &certificate),
+            Err(CryptoError::SignatureVerification)
+        );
+    }
+
+    #[test]
+    fn certificate_signed_by_other_account_does_not_authorize_alice_device() {
+        let alice_account = AccountIdentity::generate();
+        let other_account = AccountIdentity::generate();
+        let laptop = DeviceIdentity::generate(alice_account.account_id());
+        let certificate = other_account.authorize_device(&laptop);
+
+        assert_eq!(
+            verify_device_certificate(alice_account.public_key(), &certificate),
+            Err(CryptoError::SignatureVerification)
+        );
+    }
+
+    #[test]
+    fn account_identity_survives_export_and_restore() {
+        let account = AccountIdentity::generate();
+        let state = account.export_state();
+        let restored = AccountIdentity::from_state(state);
+
+        assert_eq!(account.account_id(), restored.account_id());
+        assert_eq!(account.public_key(), restored.public_key());
     }
 
     #[test]

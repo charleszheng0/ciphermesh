@@ -206,6 +206,31 @@ impl Storage {
                 contiguous_counter INTEGER NOT NULL,
                 PRIMARY KEY (conversation_id, device_id)
             );
+
+            CREATE TABLE IF NOT EXISTS account_identities (
+                account_id TEXT PRIMARY KEY,
+                account_public_key BLOB NOT NULL,
+                account_secret_key BLOB,
+                updated_at_unix_secs INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS device_identities (
+                device_id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                device_ed25519_public_key BLOB NOT NULL,
+                device_ed25519_secret_key BLOB NOT NULL,
+                device_x25519_public_key BLOB NOT NULL,
+                device_x25519_private_key BLOB NOT NULL,
+                updated_at_unix_secs INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS device_certificates (
+                account_id TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                certificate BLOB NOT NULL,
+                updated_at_unix_secs INTEGER NOT NULL,
+                PRIMARY KEY (account_id, device_id)
+            );
             ",
         )
     }
@@ -542,6 +567,154 @@ impl Storage {
             params![message_id, now_unix_secs() as i64],
         )?;
         Ok(inserted == 1)
+    }
+
+    pub fn save_account_identity(
+        &self,
+        account_id: &str,
+        account_public_key: &[u8],
+        account_secret_key: Option<&[u8]>,
+    ) -> StorageResult<()> {
+        self.conn.execute(
+            "
+            INSERT INTO account_identities (
+                account_id,
+                account_public_key,
+                account_secret_key,
+                updated_at_unix_secs
+            )
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(account_id) DO UPDATE SET
+                account_public_key = excluded.account_public_key,
+                account_secret_key = excluded.account_secret_key,
+                updated_at_unix_secs = excluded.updated_at_unix_secs
+            ",
+            params![
+                account_id,
+                account_public_key,
+                account_secret_key,
+                now_unix_secs() as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_account_secret_key(&self, account_id: &str) -> StorageResult<Option<Vec<u8>>> {
+        self.conn
+            .query_row(
+                "SELECT account_secret_key FROM account_identities WHERE account_id = ?1",
+                params![account_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(Option::flatten)
+    }
+
+    pub fn save_device_identity(
+        &self,
+        device_id: &str,
+        account_id: &str,
+        device_ed25519_public_key: &[u8],
+        device_ed25519_secret_key: &[u8],
+        device_x25519_public_key: &[u8],
+        device_x25519_private_key: &[u8],
+    ) -> StorageResult<()> {
+        self.conn.execute(
+            "
+            INSERT INTO device_identities (
+                device_id,
+                account_id,
+                device_ed25519_public_key,
+                device_ed25519_secret_key,
+                device_x25519_public_key,
+                device_x25519_private_key,
+                updated_at_unix_secs
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(device_id) DO UPDATE SET
+                account_id = excluded.account_id,
+                device_ed25519_public_key = excluded.device_ed25519_public_key,
+                device_ed25519_secret_key = excluded.device_ed25519_secret_key,
+                device_x25519_public_key = excluded.device_x25519_public_key,
+                device_x25519_private_key = excluded.device_x25519_private_key,
+                updated_at_unix_secs = excluded.updated_at_unix_secs
+            ",
+            params![
+                device_id,
+                account_id,
+                device_ed25519_public_key,
+                device_ed25519_secret_key,
+                device_x25519_public_key,
+                device_x25519_private_key,
+                now_unix_secs() as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_device_identity(&self, device_id: &str) -> StorageResult<Option<Vec<u8>>> {
+        self.conn
+            .query_row(
+                "
+                SELECT
+                    account_id,
+                    device_ed25519_secret_key,
+                    device_x25519_private_key
+                FROM device_identities
+                WHERE device_id = ?1
+                ",
+                params![device_id],
+                |row| {
+                    let account_id: String = row.get(0)?;
+                    let device_ed25519_secret_key: Vec<u8> = row.get(1)?;
+                    let device_x25519_private_key: Vec<u8> = row.get(2)?;
+                    Ok(bincode::serialize(&(
+                        account_id,
+                        device_id.to_string(),
+                        device_ed25519_secret_key,
+                        device_x25519_private_key,
+                    ))
+                    .expect("serializing loaded device identity cannot fail"))
+                },
+            )
+            .optional()
+    }
+
+    pub fn save_device_certificate(
+        &self,
+        account_id: &str,
+        device_id: &str,
+        certificate: &[u8],
+    ) -> StorageResult<()> {
+        self.conn.execute(
+            "
+            INSERT INTO device_certificates (
+                account_id,
+                device_id,
+                certificate,
+                updated_at_unix_secs
+            )
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(account_id, device_id) DO UPDATE SET
+                certificate = excluded.certificate,
+                updated_at_unix_secs = excluded.updated_at_unix_secs
+            ",
+            params![account_id, device_id, certificate, now_unix_secs() as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn device_certificates_for_account(&self, account_id: &str) -> StorageResult<Vec<Vec<u8>>> {
+        let mut statement = self.conn.prepare(
+            "
+            SELECT certificate
+            FROM device_certificates
+            WHERE account_id = ?1
+            ORDER BY device_id
+            ",
+        )?;
+        let rows = statement.query_map(params![account_id], |row| row.get(0))?;
+        rows.collect()
     }
 
     pub fn next_local_event_counter(&mut self, device_id: &str) -> StorageResult<u64> {
@@ -1083,6 +1256,42 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn account_device_identity_records_persist() {
+        let storage = Storage::open_in_memory().expect("storage");
+
+        storage
+            .save_account_identity("acct-1", b"account-public", Some(b"account-secret"))
+            .expect("save account");
+        storage
+            .save_device_identity(
+                "dev-laptop",
+                "acct-1",
+                b"device-ed-public",
+                b"device-ed-secret",
+                b"device-x-public",
+                b"device-x-private",
+            )
+            .expect("save laptop");
+        storage
+            .save_device_certificate("acct-1", "dev-laptop", b"cert-laptop")
+            .expect("save laptop cert");
+        storage
+            .save_device_certificate("acct-1", "dev-phone", b"cert-phone")
+            .expect("save phone cert");
+
+        assert_eq!(
+            storage.load_account_secret_key("acct-1").expect("secret"),
+            Some(b"account-secret".to_vec())
+        );
+        assert_eq!(
+            storage
+                .device_certificates_for_account("acct-1")
+                .expect("certs"),
+            vec![b"cert-laptop".to_vec(), b"cert-phone".to_vec()]
+        );
     }
 
     fn event(device_id: &str, counter: u64) -> EventRecord {

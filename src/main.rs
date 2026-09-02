@@ -5,8 +5,8 @@ use ciphermesh::{
         now_unix_secs, EventRecord, MessageDirection, MessageRecord, MessageStatus, OutboxItem,
         OutboxStatus, Storage, VersionVector,
     },
-    Alice, AliceState, Bob, BobState, InitialMessage, PreKeyBundle, RatchetMessage,
-    SimulatedDirectory,
+    verify_device_certificate, AccountIdentity, Alice, AliceState, Bob, BobState, DeviceIdentity,
+    InitialMessage, PreKeyBundle, RatchetMessage, SimulatedDirectory,
 };
 use futures::StreamExt;
 use libp2p::{
@@ -16,7 +16,7 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent},
     Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
-use quinn::{ClientConfig, Endpoint, ServerConfig};
+use quinn::{ClientConfig, Endpoint, IdleTimeout, ServerConfig, TransportConfig};
 use rcgen::generate_simple_self_signed;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -49,16 +49,14 @@ async fn main() -> AppResult<()> {
     match args.get(1).map(String::as_str) {
         Some("bob") => {
             let listen_addr = parse_addr(args.get(2), "127.0.0.1:5000")?;
-            let bootstrap_peers = parse_bootstrap_peers(&args[3..])?;
+            let bootstrap_peers = parse_bootstrap_peers(tail_args(&args, 3))?;
             run_bob(listen_addr, bootstrap_peers).await
         }
         Some("alice") => {
             let bob_peer_id = parse_peer_id(args.get(2))?;
-            let message = args
-                .get(3)
-                .map(String::as_str)
-                .unwrap_or("hello bob over quic");
-            let bootstrap_peers = parse_bootstrap_peers(&args[4..])?;
+            let (message, bootstrap_args) =
+                split_optional_message_and_bootstrap(tail_args(&args, 3));
+            let bootstrap_peers = parse_bootstrap_peers(bootstrap_args)?;
             run_alice_discovered(bob_peer_id, message, bootstrap_peers).await
         }
         Some("alice-direct") => {
@@ -80,7 +78,7 @@ async fn main() -> AppResult<()> {
         Some("alice-relay") => {
             let bob_peer_id = parse_peer_id(args.get(2))?;
             let message = args.get(3).map(String::as_str).unwrap_or("hello via relay");
-            let relay_peers = parse_bootstrap_peers(&args[4..])?;
+            let relay_peers = parse_bootstrap_peers(tail_args(&args, 4))?;
             run_alice_relayed(bob_peer_id, message, relay_peers).await
         }
         Some("kad-demo") => run_kademlia_demo().await,
@@ -141,6 +139,7 @@ async fn main() -> AppResult<()> {
         }
         Some("sync-demo") => run_sync_demo(),
         Some("crdt-demo") => run_crdt_demo(),
+        Some("device-demo") => run_device_identity_demo(),
         _ => {
             run_local_demo()?;
             print_usage();
@@ -159,11 +158,24 @@ fn parse_required_multiaddr(addr: Option<&String>, label: &str) -> AppResult<Mul
         .map_err(|error| format!("invalid {label}: {error}").into())
 }
 
+fn tail_args(args: &[String], start: usize) -> &[String] {
+    args.get(start..).unwrap_or(&[])
+}
+
+fn split_optional_message_and_bootstrap(values: &[String]) -> (Option<&str>, &[String]) {
+    match values.split_first() {
+        None => (None, values),
+        Some((first, _)) if first.parse::<Multiaddr>().is_ok() => (None, values),
+        Some((first, rest)) => (Some(first.as_str()), rest),
+    }
+}
+
 fn print_usage() {
     println!();
     println!("Phase 3B mDNS discovery test:");
     println!("  Terminal 1: cargo run -- bob 0.0.0.0:5000");
-    println!("  Terminal 2: cargo run -- alice <bob-libp2p-peer-id> \"hello from alice\"");
+    println!("  Terminal 2: cargo run -- alice <bob-libp2p-peer-id>");
+    println!("  One-shot send: cargo run -- alice <bob-libp2p-peer-id> \"hello from alice\"");
     println!();
     println!("Optional bootstrap/Kademlia demo:");
     println!("  cargo run -- kad-demo");
@@ -201,6 +213,9 @@ fn print_usage() {
     println!();
     println!("Phase 4E deterministic convergence demo:");
     println!("  cargo run -- crdt-demo");
+    println!();
+    println!("Phase 5A account/device identity demo:");
+    println!("  cargo run -- device-demo");
 }
 
 fn run_local_demo() -> AppResult<()> {
@@ -784,6 +799,76 @@ fn run_crdt_demo() -> AppResult<()> {
     Ok(())
 }
 
+fn run_device_identity_demo() -> AppResult<()> {
+    let storage = Storage::open_in_memory()?;
+    let account = AccountIdentity::generate();
+    let laptop = DeviceIdentity::generate(account.account_id());
+    let phone = DeviceIdentity::generate(account.account_id());
+    let laptop_certificate = account.authorize_device(&laptop);
+    let phone_certificate = account.authorize_device(&phone);
+
+    verify_device_certificate(account.public_key(), &laptop_certificate)?;
+    verify_device_certificate(account.public_key(), &phone_certificate)?;
+    persist_phase_5a_identity(&storage, &account, &laptop, &laptop_certificate)?;
+    persist_phase_5a_identity(&storage, &account, &phone, &phone_certificate)?;
+
+    let known_certs = storage.device_certificates_for_account(account.account_id())?;
+
+    println!("Alice AccountId: {}", account.account_id());
+    println!("Alice Laptop DeviceId: {}", laptop.device_id());
+    println!("Alice Phone DeviceId: {}", phone.device_id());
+    println!(
+        "Both devices belong to same account: {}",
+        laptop.account_id() == account.account_id() && phone.account_id() == account.account_id()
+    );
+    println!(
+        "Laptop and Phone have different Ed25519 keys: {}",
+        laptop.ed25519_public_key() != phone.ed25519_public_key()
+    );
+    println!(
+        "Laptop and Phone have different X25519 keys: {}",
+        laptop.x25519_public_key() != phone.x25519_public_key()
+    );
+    println!(
+        "Stored {} authorized device certificate(s) in SQLite",
+        known_certs.len()
+    );
+    println!("libp2p PeerId remains separate from AccountId and DeviceId");
+
+    Ok(())
+}
+
+fn persist_phase_5a_identity(
+    storage: &Storage,
+    account: &AccountIdentity,
+    device: &DeviceIdentity,
+    certificate: &ciphermesh::DeviceCertificate,
+) -> AppResult<()> {
+    let account_state = account.export_state();
+    let device_state = device.export_state();
+
+    storage.save_account_identity(
+        account.account_id(),
+        &account.public_key(),
+        Some(&account_state.account_secret_key),
+    )?;
+    storage.save_device_identity(
+        device.device_id(),
+        device.account_id(),
+        &device.ed25519_public_key(),
+        &device_state.device_secret_key,
+        &device.x25519_public_key(),
+        &device_state.device_x25519_private_key,
+    )?;
+    storage.save_device_certificate(
+        account.account_id(),
+        device.device_id(),
+        &bincode::serialize(certificate)?,
+    )?;
+
+    Ok(())
+}
+
 fn demo_sync_event(device_id: &str, counter: u64) -> EventRecord {
     EventRecord {
         device_id: device_id.to_string(),
@@ -924,12 +1009,18 @@ async fn run_bob_quic_once(endpoint: Endpoint, bob: Arc<Mutex<Bob>>) -> AppResul
     let encrypted_bytes = receive_bytes(&mut recv).await?;
     log_boundary("Alice -> Bob InitialMessage", &encrypted_bytes);
     let initial_message: InitialMessage = bincode::deserialize(&encrypted_bytes)?;
-    let plaintext = bob
-        .lock()
-        .map_err(|_| "Bob state lock poisoned")?
-        .decrypt_initial_message(&initial_message)?;
-    println!("Bob decrypted plaintext: {plaintext}");
+    let plaintext = {
+        let mut bob = bob.lock().map_err(|_| "Bob state lock poisoned")?;
+        bob.decrypt_initial_message(&initial_message)?
+    };
 
+    if plaintext.is_empty() {
+        println!("Connected to Alice");
+        println!("Type messages and press Enter:");
+        return chat_loop_bob_shared(connection, bob).await;
+    }
+
+    println!("Bob decrypted plaintext: {plaintext}");
     let mut ack = connection.open_uni().await?;
     send_bytes(&mut ack, b"ok").await?;
     endpoint.wait_idle().await;
@@ -938,12 +1029,16 @@ async fn run_bob_quic_once(endpoint: Endpoint, bob: Arc<Mutex<Bob>>) -> AppResul
 
 async fn run_alice_discovered(
     bob_peer_id: PeerId,
-    message: &str,
+    message: Option<&str>,
     bootstrap_peers: Vec<Multiaddr>,
 ) -> AppResult<()> {
     println!("Alice looking for Bob PeerId {bob_peer_id}");
     let bob_addr = discover_app_addr(bob_peer_id, bootstrap_peers.clone()).await?;
     println!("Alice discovered Bob's QUIC app address: {bob_addr}");
+
+    let Some(message) = message else {
+        return run_chat_alice(bob_addr).await;
+    };
 
     match time::timeout(DIRECT_DIAL_TIMEOUT, run_alice(bob_addr, message)).await {
         Ok(Ok(())) => {
@@ -1070,7 +1165,13 @@ async fn chat_loop_alice(connection: quinn::Connection, alice: Alice) -> AppResu
 }
 
 async fn chat_loop_bob(connection: quinn::Connection, bob: Bob) -> AppResult<()> {
-    let bob = Arc::new(Mutex::new(bob));
+    chat_loop_bob_shared(connection, Arc::new(Mutex::new(bob))).await
+}
+
+async fn chat_loop_bob_shared(
+    connection: quinn::Connection,
+    bob: Arc<Mutex<Bob>>,
+) -> AppResult<()> {
     let mut stdin_rx = spawn_stdin_reader();
 
     loop {
@@ -2530,10 +2631,10 @@ fn server_config() -> AppResult<ServerConfig> {
     let priv_key =
         quinn::rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
 
-    Ok(ServerConfig::with_single_cert(
-        vec![cert_der],
-        priv_key.into(),
-    )?)
+    let mut config = ServerConfig::with_single_cert(vec![cert_der], priv_key.into())?;
+    config.transport_config(long_lived_transport_config()?);
+
+    Ok(config)
 }
 
 fn insecure_client_config() -> AppResult<ClientConfig> {
@@ -2542,9 +2643,20 @@ fn insecure_client_config() -> AppResult<ClientConfig> {
         .with_custom_certificate_verifier(SkipServerVerification::new())
         .with_no_client_auth();
 
-    Ok(ClientConfig::new(Arc::new(
+    let mut config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)?,
-    )))
+    ));
+    config.transport_config(long_lived_transport_config()?);
+
+    Ok(config)
+}
+
+fn long_lived_transport_config() -> AppResult<Arc<TransportConfig>> {
+    let mut transport = TransportConfig::default();
+    transport.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(10 * 60))?));
+    transport.keep_alive_interval(Some(Duration::from_secs(10)));
+
+    Ok(Arc::new(transport))
 }
 
 #[derive(Debug)]
@@ -2662,5 +2774,42 @@ mod discovery_tests {
 
         assert!(rendered.contains("/p2p-circuit/"));
         assert!(rendered.ends_with(&format!("/p2p/{target_peer_id}")));
+    }
+
+    #[test]
+    fn alice_args_allow_no_initial_message() {
+        let args = Vec::<String>::new();
+        let (message, bootstrap) = split_optional_message_and_bootstrap(tail_args(&args, 3));
+
+        assert_eq!(message, None);
+        assert!(bootstrap.is_empty());
+    }
+
+    #[test]
+    fn alice_args_treat_first_multiaddr_as_bootstrap_without_message() {
+        let args = vec![
+            "ciphermesh".to_string(),
+            "alice".to_string(),
+            "peer-id-placeholder".to_string(),
+            "/ip4/127.0.0.1/tcp/4001".to_string(),
+        ];
+        let (message, bootstrap) = split_optional_message_and_bootstrap(tail_args(&args, 3));
+
+        assert_eq!(message, None);
+        assert_eq!(bootstrap.len(), 1);
+    }
+
+    #[test]
+    fn alice_args_still_allow_one_shot_message() {
+        let args = vec![
+            "ciphermesh".to_string(),
+            "alice".to_string(),
+            "peer-id-placeholder".to_string(),
+            "hello bob".to_string(),
+        ];
+        let (message, bootstrap) = split_optional_message_and_bootstrap(tail_args(&args, 3));
+
+        assert_eq!(message, Some("hello bob"));
+        assert!(bootstrap.is_empty());
     }
 }
