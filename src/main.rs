@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
-    io::{self, BufRead},
+    io::{self, BufRead, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -1560,6 +1560,7 @@ async fn run_bob_quic_once(endpoint: Endpoint, bob: Arc<Mutex<Bob>>) -> AppResul
     if plaintext.is_empty() {
         println!("Connected to Alice");
         println!("Type messages and press Enter:");
+        print_prompt()?;
         return chat_loop_bob_shared(connection, bob).await;
     }
 
@@ -1652,6 +1653,7 @@ async fn run_chat_bob(listen_addr: SocketAddr) -> AppResult<()> {
     }
     println!("Connected to Alice");
     println!("Type messages and press Enter:");
+    print_prompt()?;
 
     chat_loop_bob(connection, bob).await
 }
@@ -1672,6 +1674,7 @@ async fn run_chat_alice(bob_addr: SocketAddr) -> AppResult<()> {
     send_bytes(&mut send, &bincode::serialize(&initial_message)?).await?;
     println!("Connected to Bob");
     println!("Type messages and press Enter:");
+    print_prompt()?;
 
     chat_loop_alice(connection, alice).await
 }
@@ -1692,6 +1695,7 @@ async fn chat_loop_alice(connection: quinn::Connection, alice: Alice) -> AppResu
                     return Ok(());
                 };
                 send_alice_chat_line(&connection, Arc::clone(&alice), line).await?;
+                print_prompt()?;
             }
             incoming = connection.accept_uni() => {
                 let mut recv = incoming?;
@@ -1703,7 +1707,8 @@ async fn chat_loop_alice(connection: quinn::Connection, alice: Alice) -> AppResu
                             .lock()
                             .map_err(|_| "Alice state lock poisoned")?
                             .decrypt_from_bob(&message)?;
-                        println!("Bob: {plaintext}");
+                        println!("\nBob: {plaintext}");
+                        print_prompt()?;
                     }
                 }
             }
@@ -1733,6 +1738,7 @@ async fn chat_loop_bob_shared(
                     return Ok(());
                 };
                 send_bob_chat_line(&connection, Arc::clone(&bob), line).await?;
+                print_prompt()?;
             }
             incoming = connection.accept_uni() => {
                 let mut recv = incoming?;
@@ -1744,7 +1750,8 @@ async fn chat_loop_bob_shared(
                             .lock()
                             .map_err(|_| "Bob state lock poisoned")?
                             .decrypt_from_alice(&message)?;
-                        println!("Alice: {plaintext}");
+                        println!("\nAlice: {plaintext}");
+                        print_prompt()?;
                     }
                 }
             }
@@ -1788,6 +1795,12 @@ async fn send_chat_frame(connection: &quinn::Connection, frame: ChatFrame) -> Ap
     let bytes = bincode::serialize(&frame)?;
     let mut send = connection.open_uni().await?;
     send_bytes(&mut send, &bytes).await
+}
+
+fn print_prompt() -> AppResult<()> {
+    print!("> ");
+    io::stdout().flush()?;
+    Ok(())
 }
 
 fn spawn_stdin_reader() -> mpsc::UnboundedReceiver<String> {
