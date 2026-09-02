@@ -1557,18 +1557,16 @@ async fn run_bob_quic_once(endpoint: Endpoint, bob: Arc<Mutex<Bob>>) -> AppResul
         bob.decrypt_initial_message(&initial_message)?
     };
 
-    if plaintext.is_empty() {
-        println!("Connected to Alice");
-        println!("Type messages and press Enter:");
-        print_prompt()?;
-        return chat_loop_bob_shared(connection, bob).await;
+    if !plaintext.is_empty() {
+        println!("Alice: {plaintext}");
+        let mut ack = connection.open_uni().await?;
+        send_bytes(&mut ack, b"ok").await?;
     }
 
-    println!("Bob decrypted plaintext: {plaintext}");
-    let mut ack = connection.open_uni().await?;
-    send_bytes(&mut ack, b"ok").await?;
-    endpoint.wait_idle().await;
-    Ok(())
+    println!("Connected to Alice");
+    println!("Type messages and press Enter:");
+    print_prompt()?;
+    chat_loop_bob_shared(connection, bob).await
 }
 
 async fn run_alice_discovered(
@@ -1627,8 +1625,11 @@ async fn run_alice(bob_addr: SocketAddr, message: &str) -> AppResult<()> {
         String::from_utf8_lossy(&ack_bytes)
     );
     println!("Alice sent encrypted message and received transport ack");
+    println!("Connected to Bob");
+    println!("Type messages and press Enter:");
+    print_prompt()?;
 
-    Ok(())
+    chat_loop_alice(connection, alice).await
 }
 
 async fn run_chat_bob(listen_addr: SocketAddr) -> AppResult<()> {
