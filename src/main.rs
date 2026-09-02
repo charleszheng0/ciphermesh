@@ -1,6 +1,10 @@
 use ciphermesh::{
-    storage::{now_unix_secs, MessageDirection, MessageRecord, MessageStatus, Storage},
-    Alice, AliceState, Bob, BobState, InitialMessage, PreKeyBundle, SimulatedDirectory,
+    storage::{
+        now_unix_secs, MessageDirection, MessageRecord, MessageStatus, OutboxItem, OutboxStatus,
+        Storage,
+    },
+    Alice, AliceState, Bob, BobState, InitialMessage, PreKeyBundle, RatchetMessage,
+    SimulatedDirectory,
 };
 use futures::StreamExt;
 use libp2p::{
@@ -104,6 +108,13 @@ async fn main() -> AppResult<()> {
                 .unwrap_or_else(|| PathBuf::from("target/ciphermesh-4a-demo.sqlite"));
             run_restart_demo(&db_path)
         }
+        Some("outbox-demo") => {
+            let db_path = args
+                .get(2)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("target/ciphermesh-4b-outbox-demo.sqlite"));
+            run_outbox_demo(&db_path)
+        }
         _ => {
             run_local_demo()?;
             print_usage();
@@ -149,6 +160,9 @@ fn print_usage() {
     println!();
     println!("Phase 4A SQLite restart demo:");
     println!("  cargo run -- restart-demo [target/ciphermesh-4a-demo.sqlite]");
+    println!();
+    println!("Phase 4B durable outbox demo:");
+    println!("  cargo run -- outbox-demo [target/ciphermesh-4b-outbox-demo.sqlite]");
 }
 
 fn run_local_demo() -> AppResult<()> {
@@ -423,6 +437,208 @@ fn persist_actor_message(
     Ok(())
 }
 
+fn run_outbox_demo(db_path: &Path) -> AppResult<()> {
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if db_path.exists() {
+        std::fs::remove_file(db_path)?;
+    }
+
+    let conversation_id = format!("alice-bob-outbox-{}", now_unix_secs());
+    let mut storage = Storage::open(db_path)?;
+    let mut alice = Alice::local();
+    let mut bob = Bob::local();
+    let alice_exchange = alice.signed_key_exchange();
+    let bob_exchange = bob.signed_key_exchange();
+
+    alice.derive_session_key(&bob_exchange)?;
+    bob.derive_session_key(&alice_exchange)?;
+    storage.save_local_identity(
+        "alice",
+        "alice",
+        &bincode::serialize(&alice.export_state())?,
+    )?;
+    storage.save_local_identity("bob", "bob", &bincode::serialize(&bob.export_state())?)?;
+    println!("SQLite database: {}", db_path.display());
+    println!("Bob is unavailable, so Alice will queue encrypted ciphertext durably");
+
+    let plaintext = "durable hello while bob is offline";
+    let ciphertext = alice.encrypt_for_bob(plaintext)?;
+    let wire_envelope = DurableAppEnvelope {
+        message_id: format!("msg-{}", message_id_for(&bincode::serialize(&ciphertext)?)),
+        message: ciphertext,
+    };
+    let payload = bincode::serialize(&wire_envelope)?;
+    let message_record = MessageRecord {
+        message_id: wire_envelope.message_id.clone(),
+        conversation_id: conversation_id.clone(),
+        sender_id: "alice".to_string(),
+        recipient_id: "bob".to_string(),
+        direction: MessageDirection::Sent,
+        status: MessageStatus::Stored,
+        protocol_counter: Some(wire_envelope.message.number),
+        ciphertext: payload.clone(),
+        plaintext: Some(plaintext.to_string()),
+        created_at_unix_secs: now_unix_secs(),
+    };
+    let outbox_item = OutboxItem {
+        message_id: wire_envelope.message_id.clone(),
+        recipient_id: "bob".to_string(),
+        payload: payload.clone(),
+        status: OutboxStatus::Pending,
+        retry_count: 0,
+        created_at_unix_secs: now_unix_secs(),
+        last_attempt_unix_secs: None,
+    };
+
+    storage.save_state_session_message_and_outbox(
+        "alice",
+        "alice",
+        &bincode::serialize(&alice.export_state())?,
+        &conversation_id,
+        "bob",
+        "alice",
+        &bincode::serialize(
+            &alice
+                .session_state()
+                .ok_or("Alice session missing after outbox encrypt")?,
+        )?,
+        &message_record,
+        &outbox_item,
+    )?;
+    println!("[OUTBOX] queued {}", wire_envelope.message_id);
+
+    println!("Network delivery attempt fails because Bob is offline");
+    println!(
+        "Pending outbox items before shutdown: {}",
+        storage.pending_outbox_items()?.len()
+    );
+    drop(alice);
+    drop(storage);
+    println!("Stopped Alice; only SQLite state remains");
+
+    let mut storage = Storage::open(db_path)?;
+    let alice_state: AliceState = bincode::deserialize(
+        &storage
+            .load_local_identity("alice")?
+            .ok_or("Alice state missing after outbox restart")?,
+    )?;
+    let _alice = Alice::from_state(alice_state);
+    let mut bob = Bob::from_state(bincode::deserialize(
+        &storage
+            .load_local_identity("bob")?
+            .ok_or("Bob state missing after outbox restart")?,
+    )?);
+    let pending = storage.pending_outbox_items()?;
+    println!(
+        "Restarted Alice with same DB; pending outbox items: {}",
+        pending.len()
+    );
+
+    for item in pending {
+        println!("[OUTBOX] retrying {}", item.message_id);
+        storage.record_outbox_attempt(&item.message_id)?;
+        let ack = deliver_outbox_item_to_bob(&mut storage, &mut bob, &conversation_id, &item)?;
+        handle_ack(&storage, ack)?;
+    }
+
+    let delivered = storage
+        .outbox_item(&wire_envelope.message_id)?
+        .ok_or("outbox row missing after delivery")?;
+    println!(
+        "Outbox status after ACK: {:?}, retry_count={}",
+        delivered.status, delivered.retry_count
+    );
+
+    println!("Retrying the same encrypted payload once to show receiver deduplication");
+    let duplicate = OutboxItem {
+        message_id: delivered.message_id.clone(),
+        recipient_id: delivered.recipient_id.clone(),
+        payload: delivered.payload.clone(),
+        status: OutboxStatus::Pending,
+        retry_count: delivered.retry_count,
+        created_at_unix_secs: delivered.created_at_unix_secs,
+        last_attempt_unix_secs: delivered.last_attempt_unix_secs,
+    };
+    let ack = deliver_outbox_item_to_bob(&mut storage, &mut bob, &conversation_id, &duplicate)?;
+    handle_ack(&storage, ack)?;
+
+    let messages = storage.messages_for_conversation(&conversation_id)?;
+    println!("Stored conversation events after retry demo:");
+    for message in messages {
+        println!(
+            "  id={} direction={:?} counter={:?} ciphertext_bytes={} local_plaintext={:?}",
+            message.message_id,
+            message.direction,
+            message.protocol_counter,
+            message.ciphertext.len(),
+            message.plaintext
+        );
+    }
+
+    Ok(())
+}
+
+fn deliver_outbox_item_to_bob(
+    storage: &mut Storage,
+    bob: &mut Bob,
+    conversation_id: &str,
+    item: &OutboxItem,
+) -> AppResult<DurableAck> {
+    println!("[OUTBOX] sending {}", item.message_id);
+    let envelope: DurableAppEnvelope = bincode::deserialize(&item.payload)?;
+
+    if !storage.accept_message_once(&envelope.message_id)? {
+        println!(
+            "[DEDUP] duplicate {}, not processing twice",
+            envelope.message_id
+        );
+        return Ok(DurableAck {
+            message_id: envelope.message_id,
+        });
+    }
+
+    let plaintext = bob.decrypt_from_alice(&envelope.message)?;
+    println!("Bob decrypted accepted message: {plaintext}");
+    persist_actor_message(
+        storage,
+        "bob",
+        "bob",
+        &bincode::serialize(&bob.export_state())?,
+        conversation_id,
+        "alice",
+        "bob",
+        &bincode::serialize(
+            &bob.session_state()
+                .ok_or("Bob session missing after outbox receive")?,
+        )?,
+        &MessageRecord {
+            message_id: format!("bob-{}", envelope.message_id),
+            conversation_id: conversation_id.to_string(),
+            sender_id: "alice".to_string(),
+            recipient_id: "bob".to_string(),
+            direction: MessageDirection::Received,
+            status: MessageStatus::Received,
+            protocol_counter: Some(envelope.message.number),
+            ciphertext: item.payload.clone(),
+            plaintext: Some(plaintext),
+            created_at_unix_secs: now_unix_secs(),
+        },
+    )?;
+
+    Ok(DurableAck {
+        message_id: envelope.message_id,
+    })
+}
+
+fn handle_ack(storage: &Storage, ack: DurableAck) -> AppResult<()> {
+    println!("[ACK] received {}", ack.message_id);
+    storage.mark_outbox_delivered(&ack.message_id)?;
+    println!("[OUTBOX] marked delivered {}", ack.message_id);
+    Ok(())
+}
+
 async fn run_bob(listen_addr: SocketAddr, bootstrap_peers: Vec<Multiaddr>) -> AppResult<()> {
     let bob = Arc::new(Mutex::new(Bob::local()));
     let endpoint = Endpoint::server(server_config()?, listen_addr)?;
@@ -683,6 +899,17 @@ enum CipherMeshResponse {
     PreKeyBundle(Vec<u8>),
     Ack(Vec<u8>),
     Error(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DurableAppEnvelope {
+    message_id: String,
+    message: RatchetMessage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DurableAck {
+    message_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
