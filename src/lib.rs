@@ -674,6 +674,13 @@ impl Alice {
             .encrypt(message)
     }
 
+    pub fn decrypt_from_bob(&mut self, message: &RatchetMessage) -> Result<String, CryptoError> {
+        self.session
+            .as_mut()
+            .ok_or(CryptoError::MissingSessionKey)?
+            .decrypt(message)
+    }
+
     pub fn encrypt_initial_message(
         &mut self,
         bundle: &PreKeyBundle,
@@ -804,6 +811,13 @@ impl Bob {
             .as_mut()
             .ok_or(CryptoError::MissingSessionKey)?
             .decrypt(message)
+    }
+
+    pub fn encrypt_for_alice(&mut self, message: &str) -> Result<RatchetMessage, CryptoError> {
+        self.session
+            .as_mut()
+            .ok_or(CryptoError::MissingSessionKey)?
+            .encrypt(message)
     }
 
     pub fn decrypt_initial_message(
@@ -1090,6 +1104,28 @@ mod tests {
         assert_eq!(
             bob.decrypt_from_alice(&third).expect("decrypt three"),
             "three"
+        );
+    }
+
+    #[test]
+    fn bob_can_send_ratcheted_messages_back_to_alice() {
+        let mut alice = Alice::local();
+        let mut bob = Bob::local();
+        let alice_exchange = alice.signed_key_exchange();
+        let bob_exchange = bob.signed_key_exchange();
+        alice
+            .derive_session_key(&bob_exchange)
+            .expect("alice derives session key");
+        bob.derive_session_key(&alice_exchange)
+            .expect("bob derives session key");
+
+        let encrypted = bob
+            .encrypt_for_alice("hello alice")
+            .expect("bob encrypts to alice");
+
+        assert_eq!(
+            alice.decrypt_from_bob(&encrypted).expect("alice decrypts"),
+            "hello alice"
         );
     }
 

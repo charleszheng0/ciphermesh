@@ -23,12 +23,14 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
+    io::{self, BufRead},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::time;
+use tokio::{sync::mpsc, time};
 
 type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 const DISCOVERY_LISTEN_ADDR: &str = "/ip4/0.0.0.0/tcp/0";
@@ -66,6 +68,14 @@ async fn main() -> AppResult<()> {
                 .map(String::as_str)
                 .unwrap_or("hello bob over quic");
             run_alice(bob_addr, message).await
+        }
+        Some("chat-bob") => {
+            let listen_addr = parse_addr(args.get(2), "127.0.0.1:5000")?;
+            run_chat_bob(listen_addr).await
+        }
+        Some("chat-alice") => {
+            let bob_addr = parse_addr(args.get(2), "127.0.0.1:5000")?;
+            run_chat_alice(bob_addr).await
         }
         Some("alice-relay") => {
             let bob_peer_id = parse_peer_id(args.get(2))?;
@@ -168,6 +178,10 @@ fn print_usage() {
     println!("Phase 3A direct QUIC comparison:");
     println!("  Terminal 1: cargo run -- bob 127.0.0.1:5000");
     println!("  Terminal 2: cargo run -- alice-direct 127.0.0.1:5000 \"hello from alice\"");
+    println!();
+    println!("Interactive CLI chat:");
+    println!("  Terminal 1: cargo run -- chat-bob 127.0.0.1:5000");
+    println!("  Terminal 2: cargo run -- chat-alice 127.0.0.1:5000");
     println!();
     println!("Phase 3D mailbox demo:");
     println!("  Terminal 1: cargo run -- mailbox /ip4/0.0.0.0/tcp/7000 target/mailbox.db");
@@ -978,6 +992,170 @@ async fn run_alice(bob_addr: SocketAddr, message: &str) -> AppResult<()> {
     Ok(())
 }
 
+async fn run_chat_bob(listen_addr: SocketAddr) -> AppResult<()> {
+    let mut bob = Bob::local();
+    let endpoint = Endpoint::server(server_config()?, listen_addr)?;
+    println!("Bob chat listening on {}", endpoint.local_addr()?);
+
+    let incoming = endpoint.accept().await.ok_or("endpoint closed")?;
+    let connection = incoming.await?;
+    println!("Alice connected from {}", connection.remote_address());
+
+    let mut send = connection.open_uni().await?;
+    let bundle = bob.prekey_bundle()?;
+    send_bytes(&mut send, &bincode::serialize(&bundle)?).await?;
+
+    let mut recv = connection.accept_uni().await?;
+    let initial_bytes = receive_bytes(&mut recv).await?;
+    let initial_message: InitialMessage = bincode::deserialize(&initial_bytes)?;
+    let initial_plaintext = bob.decrypt_initial_message(&initial_message)?;
+    if !initial_plaintext.is_empty() {
+        println!("Alice: {initial_plaintext}");
+    }
+    println!("Connected to Alice");
+    println!("Type messages and press Enter:");
+
+    chat_loop_bob(connection, bob).await
+}
+
+async fn run_chat_alice(bob_addr: SocketAddr) -> AppResult<()> {
+    let mut alice = Alice::local();
+    let mut endpoint = Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?;
+    endpoint.set_default_client_config(insecure_client_config()?);
+
+    let connection = endpoint.connect(bob_addr, "localhost")?.await?;
+
+    let mut recv = connection.accept_uni().await?;
+    let bundle_bytes = receive_bytes(&mut recv).await?;
+    let bundle: PreKeyBundle = bincode::deserialize(&bundle_bytes)?;
+
+    let initial_message = alice.encrypt_initial_message(&bundle, "")?;
+    let mut send = connection.open_uni().await?;
+    send_bytes(&mut send, &bincode::serialize(&initial_message)?).await?;
+    println!("Connected to Bob");
+    println!("Type messages and press Enter:");
+
+    chat_loop_alice(connection, alice).await
+}
+
+async fn chat_loop_alice(connection: quinn::Connection, alice: Alice) -> AppResult<()> {
+    let alice = Arc::new(Mutex::new(alice));
+    let mut stdin_rx = spawn_stdin_reader();
+
+    loop {
+        tokio::select! {
+            line = stdin_rx.recv() => {
+                let Some(line) = line else {
+                    println!("stdin closed; chat ending");
+                    return Ok(());
+                };
+                send_alice_chat_line(&connection, Arc::clone(&alice), line).await?;
+            }
+            incoming = connection.accept_uni() => {
+                let mut recv = incoming?;
+                let frame_bytes = receive_bytes(&mut recv).await?;
+                let frame: ChatFrame = bincode::deserialize(&frame_bytes)?;
+                match frame {
+                    ChatFrame::Message(message) => {
+                        let plaintext = alice
+                            .lock()
+                            .map_err(|_| "Alice state lock poisoned")?
+                            .decrypt_from_bob(&message)?;
+                        println!("Bob: {plaintext}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn chat_loop_bob(connection: quinn::Connection, bob: Bob) -> AppResult<()> {
+    let bob = Arc::new(Mutex::new(bob));
+    let mut stdin_rx = spawn_stdin_reader();
+
+    loop {
+        tokio::select! {
+            line = stdin_rx.recv() => {
+                let Some(line) = line else {
+                    println!("stdin closed; chat ending");
+                    return Ok(());
+                };
+                send_bob_chat_line(&connection, Arc::clone(&bob), line).await?;
+            }
+            incoming = connection.accept_uni() => {
+                let mut recv = incoming?;
+                let frame_bytes = receive_bytes(&mut recv).await?;
+                let frame: ChatFrame = bincode::deserialize(&frame_bytes)?;
+                match frame {
+                    ChatFrame::Message(message) => {
+                        let plaintext = bob
+                            .lock()
+                            .map_err(|_| "Bob state lock poisoned")?
+                            .decrypt_from_alice(&message)?;
+                        println!("Alice: {plaintext}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn send_alice_chat_line(
+    connection: &quinn::Connection,
+    alice: Arc<Mutex<Alice>>,
+    line: String,
+) -> AppResult<()> {
+    if line.is_empty() {
+        return Ok(());
+    }
+
+    let message = alice
+        .lock()
+        .map_err(|_| "Alice state lock poisoned")?
+        .encrypt_for_bob(&line)?;
+    send_chat_frame(connection, ChatFrame::Message(message)).await
+}
+
+async fn send_bob_chat_line(
+    connection: &quinn::Connection,
+    bob: Arc<Mutex<Bob>>,
+    line: String,
+) -> AppResult<()> {
+    if line.is_empty() {
+        return Ok(());
+    }
+
+    let message = bob
+        .lock()
+        .map_err(|_| "Bob state lock poisoned")?
+        .encrypt_for_alice(&line)?;
+    send_chat_frame(connection, ChatFrame::Message(message)).await
+}
+
+async fn send_chat_frame(connection: &quinn::Connection, frame: ChatFrame) -> AppResult<()> {
+    let bytes = bincode::serialize(&frame)?;
+    let mut send = connection.open_uni().await?;
+    send_bytes(&mut send, &bytes).await
+}
+
+fn spawn_stdin_reader() -> mpsc::UnboundedReceiver<String> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        for line in stdin.lock().lines() {
+            match line {
+                Ok(line) => {
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    rx
+}
+
 async fn run_alice_relayed(
     bob_peer_id: PeerId,
     message: &str,
@@ -1181,6 +1359,11 @@ struct SyncRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SyncResponse {
     events: Vec<SyncEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum ChatFrame {
+    Message(RatchetMessage),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
