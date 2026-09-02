@@ -14,6 +14,8 @@ use std::{
 };
 use x25519_dalek::{PublicKey, StaticSecret};
 
+pub mod storage;
+
 const LOCAL_AAD: &[u8] = b"ciphermesh.local.alice-to-bob.v1";
 const HKDF_INFO: &[u8] = b"ciphermesh.phase-2a.x25519.chacha20poly1305";
 const PREKEY_HKDF_INFO: &[u8] = b"ciphermesh.phase-2c.prekey-initial-session";
@@ -79,6 +81,48 @@ pub struct RatchetMessage {
     pub ciphertext: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RatchetRoleState {
+    Alice,
+    Bob,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RatchetSessionState {
+    pub role: RatchetRoleState,
+    pub root_key: [u8; 32],
+    pub send_chain_key: [u8; 32],
+    pub recv_chain_key: [u8; 32],
+    pub send_count: u64,
+    pub recv_count: u64,
+    pub skipped_message_keys: Vec<(u64, [u8; 32])>,
+    pub consumed_message_numbers: Vec<u64>,
+    pub dh_private_key: [u8; 32],
+    pub peer_ratchet_public_key: PublicKeyBytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OneTimePreKeyState {
+    pub id: u64,
+    pub private_key: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AliceState {
+    pub identity_secret_key: [u8; 32],
+    pub x25519_private_key: [u8; 32],
+    pub session: Option<RatchetSessionState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BobState {
+    pub identity_secret_key: [u8; 32],
+    pub x25519_private_key: [u8; 32],
+    pub signed_prekey_private_key: [u8; 32],
+    pub one_time_prekey: Option<OneTimePreKeyState>,
+    pub session: Option<RatchetSessionState>,
+}
+
 struct X25519KeyPair {
     private: StaticSecret,
     public: PublicKey,
@@ -101,8 +145,19 @@ impl X25519KeyPair {
         Self { private, public }
     }
 
+    fn from_private_bytes(bytes: [u8; 32]) -> Self {
+        let private = StaticSecret::from(bytes);
+        let public = PublicKey::from(&private);
+
+        Self { private, public }
+    }
+
     fn public_key(&self) -> PublicKeyBytes {
         self.public.to_bytes()
+    }
+
+    fn private_key_bytes(&self) -> [u8; 32] {
+        self.private.to_bytes()
     }
 
     fn derive_aead_key(&self, peer_public_key: PublicKeyBytes) -> Result<[u8; 32], CryptoError> {
@@ -130,6 +185,20 @@ enum RatchetRole {
 }
 
 impl RatchetRole {
+    fn state(self) -> RatchetRoleState {
+        match self {
+            Self::Alice => RatchetRoleState::Alice,
+            Self::Bob => RatchetRoleState::Bob,
+        }
+    }
+
+    fn from_state(state: RatchetRoleState) -> Self {
+        match state {
+            RatchetRoleState::Alice => Self::Alice,
+            RatchetRoleState::Bob => Self::Bob,
+        }
+    }
+
     fn chains(self, first: [u8; 32], second: [u8; 32]) -> ([u8; 32], [u8; 32]) {
         match self {
             Self::Alice => (first, second),
@@ -287,6 +356,40 @@ impl RatchetSession {
 
         Ok(message_key)
     }
+
+    fn state(&self) -> RatchetSessionState {
+        RatchetSessionState {
+            role: self.role.state(),
+            root_key: self.root_key,
+            send_chain_key: self.send_chain_key,
+            recv_chain_key: self.recv_chain_key,
+            send_count: self.send_count,
+            recv_count: self.recv_count,
+            skipped_message_keys: self
+                .skipped_message_keys
+                .iter()
+                .map(|(number, key)| (*number, *key))
+                .collect(),
+            consumed_message_numbers: self.consumed_message_numbers.iter().copied().collect(),
+            dh_private_key: self.dh_keys.private_key_bytes(),
+            peer_ratchet_public_key: self.peer_ratchet_public_key,
+        }
+    }
+
+    fn from_state(state: RatchetSessionState) -> Self {
+        Self {
+            role: RatchetRole::from_state(state.role),
+            root_key: state.root_key,
+            send_chain_key: state.send_chain_key,
+            recv_chain_key: state.recv_chain_key,
+            send_count: state.send_count,
+            recv_count: state.recv_count,
+            skipped_message_keys: state.skipped_message_keys.into_iter().collect(),
+            consumed_message_numbers: state.consumed_message_numbers.into_iter().collect(),
+            dh_keys: X25519KeyPair::from_private_bytes(state.dh_private_key),
+            peer_ratchet_public_key: state.peer_ratchet_public_key,
+        }
+    }
 }
 
 fn derive_directional_chains(root_key: [u8; 32]) -> Result<([u8; 32], [u8; 32]), CryptoError> {
@@ -362,8 +465,18 @@ impl IdentityKeyPair {
         }
     }
 
+    fn from_secret_bytes(bytes: [u8; 32]) -> Self {
+        Self {
+            signing_key: SigningKey::from_bytes(&bytes),
+        }
+    }
+
     fn public_key(&self) -> IdentityPublicKeyBytes {
         self.signing_key.verifying_key().to_bytes()
+    }
+
+    fn secret_key_bytes(&self) -> [u8; 32] {
+        self.signing_key.to_bytes()
     }
 
     fn sign_key_exchange(&self, x25519_public_key: PublicKeyBytes) -> SignedKeyExchange {
@@ -462,6 +575,20 @@ impl OneTimePreKey {
         Self {
             id,
             keys: X25519KeyPair::generate(),
+        }
+    }
+
+    fn state(&self) -> OneTimePreKeyState {
+        OneTimePreKeyState {
+            id: self.id,
+            private_key: self.keys.private_key_bytes(),
+        }
+    }
+
+    fn from_state(state: OneTimePreKeyState) -> Self {
+        Self {
+            id: state.id,
+            keys: X25519KeyPair::from_private_bytes(state.private_key),
         }
     }
 }
@@ -578,6 +705,26 @@ impl Alice {
             .ok_or(CryptoError::MissingSessionKey)?
             .rotate_sending_ratchet()
     }
+
+    pub fn export_state(&self) -> AliceState {
+        AliceState {
+            identity_secret_key: self.identity.secret_key_bytes(),
+            x25519_private_key: self.keys.private_key_bytes(),
+            session: self.session.as_ref().map(RatchetSession::state),
+        }
+    }
+
+    pub fn from_state(state: AliceState) -> Self {
+        Self {
+            identity: IdentityKeyPair::from_secret_bytes(state.identity_secret_key),
+            keys: X25519KeyPair::from_private_bytes(state.x25519_private_key),
+            session: state.session.map(RatchetSession::from_state),
+        }
+    }
+
+    pub fn session_state(&self) -> Option<RatchetSessionState> {
+        self.session.as_ref().map(RatchetSession::state)
+    }
 }
 
 impl Bob {
@@ -589,6 +736,23 @@ impl Bob {
             one_time_prekey: Some(OneTimePreKey::generate(1)),
             session: None,
         }
+    }
+
+    pub fn mailbox_demo() -> Self {
+        Self {
+            identity: IdentityKeyPair::from_secret_bytes([0x3d; 32]),
+            keys: X25519KeyPair::from_private_bytes([0x3e; 32]),
+            signed_prekey: X25519KeyPair::from_private_bytes([0x3f; 32]),
+            one_time_prekey: Some(OneTimePreKey {
+                id: 1,
+                keys: X25519KeyPair::from_private_bytes([0x40; 32]),
+            }),
+            session: None,
+        }
+    }
+
+    pub fn mailbox_demo_prekey_bundle() -> Result<PreKeyBundle, CryptoError> {
+        Self::mailbox_demo().prekey_bundle()
     }
 
     pub fn public_key(&self) -> PublicKeyBytes {
@@ -669,6 +833,30 @@ impl Bob {
         )?);
 
         self.decrypt_from_alice(&message.message)
+    }
+
+    pub fn export_state(&self) -> BobState {
+        BobState {
+            identity_secret_key: self.identity.secret_key_bytes(),
+            x25519_private_key: self.keys.private_key_bytes(),
+            signed_prekey_private_key: self.signed_prekey.private_key_bytes(),
+            one_time_prekey: self.one_time_prekey.as_ref().map(OneTimePreKey::state),
+            session: self.session.as_ref().map(RatchetSession::state),
+        }
+    }
+
+    pub fn from_state(state: BobState) -> Self {
+        Self {
+            identity: IdentityKeyPair::from_secret_bytes(state.identity_secret_key),
+            keys: X25519KeyPair::from_private_bytes(state.x25519_private_key),
+            signed_prekey: X25519KeyPair::from_private_bytes(state.signed_prekey_private_key),
+            one_time_prekey: state.one_time_prekey.map(OneTimePreKey::from_state),
+            session: state.session.map(RatchetSession::from_state),
+        }
+    }
+
+    pub fn session_state(&self) -> Option<RatchetSessionState> {
+        self.session.as_ref().map(RatchetSession::state)
     }
 }
 
@@ -941,6 +1129,41 @@ mod tests {
         let replay = send_over_simulated_transport(encrypted);
 
         assert_eq!(bob.decrypt_from_alice(&replay), Err(CryptoError::Replay));
+    }
+
+    #[test]
+    fn exported_state_restores_ratchet_without_new_handshake() {
+        let mut alice = Alice::local();
+        let mut bob = Bob::local();
+        let alice_exchange = alice.signed_key_exchange();
+        let bob_exchange = bob.signed_key_exchange();
+        alice
+            .derive_session_key(&bob_exchange)
+            .expect("alice derives session key");
+        bob.derive_session_key(&alice_exchange)
+            .expect("bob derives session key");
+
+        let before_restart = alice
+            .encrypt_for_bob("before restart")
+            .expect("encrypt before restart");
+        assert_eq!(
+            bob.decrypt_from_alice(&before_restart)
+                .expect("decrypt before restart"),
+            "before restart"
+        );
+
+        let mut restored_alice = Alice::from_state(alice.export_state());
+        let mut restored_bob = Bob::from_state(bob.export_state());
+        let after_restart = restored_alice
+            .encrypt_for_bob("after restart")
+            .expect("encrypt after restart");
+
+        assert_eq!(
+            restored_bob
+                .decrypt_from_alice(&after_restart)
+                .expect("decrypt after restart"),
+            "after restart"
+        );
     }
 
     #[test]

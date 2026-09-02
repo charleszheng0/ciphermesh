@@ -13,6 +13,7 @@ hkdf = "0.13"
 libp2p = { version = "0.56", features = ["autonat", "cbor", "dcutr", "identify", "kad", "macros", "mdns", "noise", "relay", "request-response", "tcp", "tokio", "yamux"] }
 quinn = "0.11"
 rcgen = "0.14"
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.11"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
