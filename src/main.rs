@@ -22,15 +22,16 @@ use libp2p::{
 };
 use quinn::{ClientConfig, Endpoint, IdleTimeout, ServerConfig, TransportConfig};
 use rcgen::generate_simple_self_signed;
+use rustyline::{error::ReadlineError, DefaultEditor, ExternalPrinter};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
-    io::{self, BufRead, Write},
+    io::{self, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{mpsc as std_mpsc, Arc, Mutex},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -42,9 +43,9 @@ const DISCOVERY_PROTOCOL: &str = "/ciphermesh/discovery/3c/1.0.0";
 const APP_RELAY_PROTOCOL: &str = "/ciphermesh/app-bytes/3c/1.0.0";
 const MAILBOX_PROTOCOL: &str = "/ciphermesh/mailbox/3d/1.0.0";
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
-const DIRECT_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 const MAILBOX_ENVELOPE_TTL_SECS: u64 = 5 * 60;
 const MAILBOX_MAX_ENVELOPES: usize = 64;
+const CHAT_PROMPT: &str = "> You: ";
 
 #[tokio::main]
 async fn main() -> AppResult<()> {
@@ -55,14 +56,20 @@ async fn main() -> AppResult<()> {
         Some("bob") => {
             let listen_addr = parse_addr(args.get(2), "127.0.0.1:5000")?;
             let bootstrap_peers = parse_bootstrap_peers(tail_args(&args, 3))?;
-            run_bob(listen_addr, bootstrap_peers).await
+            run_bob(listen_addr, bootstrap_peers, &default_chat_db("bob")).await
         }
         Some("alice") => {
             let bob_peer_id = parse_peer_id(args.get(2))?;
             let (message, bootstrap_args) =
                 split_optional_message_and_bootstrap(tail_args(&args, 3));
             let bootstrap_peers = parse_bootstrap_peers(bootstrap_args)?;
-            run_alice_discovered(bob_peer_id, message, bootstrap_peers).await
+            run_alice_discovered(
+                bob_peer_id,
+                message,
+                bootstrap_peers,
+                &default_chat_db("alice"),
+            )
+            .await
         }
         Some("alice-direct") => {
             let bob_addr = parse_addr(args.get(2), "127.0.0.1:5000")?;
@@ -70,15 +77,23 @@ async fn main() -> AppResult<()> {
                 .get(3)
                 .map(String::as_str)
                 .unwrap_or("hello bob over quic");
-            run_alice(bob_addr, message).await
+            run_alice(bob_addr, message, &default_chat_db("alice")).await
         }
         Some("chat-bob") => {
             let listen_addr = parse_addr(args.get(2), "127.0.0.1:5000")?;
-            run_chat_bob(listen_addr).await
+            let db_path = args
+                .get(3)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| default_chat_db("bob"));
+            run_chat_bob(listen_addr, &db_path).await
         }
         Some("chat-alice") => {
             let bob_addr = parse_addr(args.get(2), "127.0.0.1:5000")?;
-            run_chat_alice(bob_addr).await
+            let db_path = args
+                .get(3)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| default_chat_db("alice"));
+            run_chat_alice(bob_addr, &db_path).await
         }
         Some("alice-relay") => {
             let bob_peer_id = parse_peer_id(args.get(2))?;
@@ -1498,14 +1513,23 @@ fn handle_ack(storage: &Storage, ack: DurableAck) -> AppResult<()> {
     Ok(())
 }
 
-async fn run_bob(listen_addr: SocketAddr, bootstrap_peers: Vec<Multiaddr>) -> AppResult<()> {
+async fn run_bob(
+    listen_addr: SocketAddr,
+    bootstrap_peers: Vec<Multiaddr>,
+    db_path: &Path,
+) -> AppResult<()> {
+    let local_display_name = load_or_prompt_display_name(db_path)?;
     let bob = Arc::new(Mutex::new(Bob::local()));
     let endpoint = Endpoint::server(server_config()?, listen_addr)?;
     let app_addr = endpoint.local_addr()?;
-    println!("Bob QUIC app listening on {app_addr}");
+    println!("Chat listening on {app_addr}");
 
     let direct_bob = Arc::clone(&bob);
-    let mut direct = tokio::spawn(async move { run_bob_quic_once(endpoint, direct_bob).await });
+    let direct_display_name = local_display_name.clone();
+    let mut direct =
+        tokio::spawn(
+            async move { run_bob_quic_once(endpoint, direct_bob, direct_display_name).await },
+        );
 
     let relayed_bob = Arc::clone(&bob);
     let mut relayed = tokio::spawn(async move {
@@ -1531,11 +1555,15 @@ async fn run_bob(listen_addr: SocketAddr, bootstrap_peers: Vec<Multiaddr>) -> Ap
     Ok(())
 }
 
-async fn run_bob_quic_once(endpoint: Endpoint, bob: Arc<Mutex<Bob>>) -> AppResult<()> {
+async fn run_bob_quic_once(
+    endpoint: Endpoint,
+    bob: Arc<Mutex<Bob>>,
+    local_display_name: String,
+) -> AppResult<()> {
     let incoming = endpoint.accept().await.ok_or("endpoint closed")?;
     let connection = incoming.await?;
     println!(
-        "direct connection established: Bob accepted QUIC connection from {}",
+        "direct connection established: accepted QUIC connection from {}",
         connection.remote_address()
     );
 
@@ -1544,122 +1572,141 @@ async fn run_bob_quic_once(endpoint: Endpoint, bob: Arc<Mutex<Bob>>) -> AppResul
         .lock()
         .map_err(|_| "Bob state lock poisoned")?
         .prekey_bundle()?;
-    let bundle_bytes = bincode::serialize(&bundle)?;
+    let bundle_bytes = bincode::serialize(&ChatPreKeyBundle {
+        sender_display_name: local_display_name.clone(),
+        bundle,
+    })?;
     log_boundary("Bob -> Alice PreKeyBundle", &bundle_bytes);
     send_bytes(&mut send, &bundle_bytes).await?;
 
     let mut recv = connection.accept_uni().await?;
     let encrypted_bytes = receive_bytes(&mut recv).await?;
     log_boundary("Alice -> Bob InitialMessage", &encrypted_bytes);
-    let initial_message: InitialMessage = bincode::deserialize(&encrypted_bytes)?;
+    let initial_message = decode_chat_initial_message(&encrypted_bytes)?;
+    let remote_display_name = initial_message.sender_display_name;
     let plaintext = {
         let mut bob = bob.lock().map_err(|_| "Bob state lock poisoned")?;
-        bob.decrypt_initial_message(&initial_message)?
+        bob.decrypt_initial_message(&initial_message.message)?
     };
 
     if !plaintext.is_empty() {
-        println!("Alice: {plaintext}");
+        println!(
+            "> {}: {}",
+            display_name_or_anonymous(&remote_display_name),
+            plaintext
+        );
         let mut ack = connection.open_uni().await?;
         send_bytes(&mut ack, b"ok").await?;
     }
 
-    println!("Connected to Alice");
-    println!("Type messages and press Enter:");
-    print_prompt()?;
-    chat_loop_bob_shared(connection, bob).await
+    println!("Connected to peer");
+    chat_loop_bob_shared(connection, bob, local_display_name).await
 }
 
 async fn run_alice_discovered(
     bob_peer_id: PeerId,
     message: Option<&str>,
     bootstrap_peers: Vec<Multiaddr>,
+    db_path: &Path,
 ) -> AppResult<()> {
-    println!("Alice looking for Bob PeerId {bob_peer_id}");
+    println!("Looking for peer {bob_peer_id}");
     let bob_addr = discover_app_addr(bob_peer_id, bootstrap_peers.clone()).await?;
-    println!("Alice discovered Bob's QUIC app address: {bob_addr}");
+    println!("Discovered peer QUIC app address: {bob_addr}");
 
     let Some(message) = message else {
-        return run_chat_alice(bob_addr).await;
+        return run_chat_alice(bob_addr, db_path).await;
     };
 
-    match time::timeout(DIRECT_DIAL_TIMEOUT, run_alice(bob_addr, message)).await {
-        Ok(Ok(())) => {
+    match run_alice(bob_addr, message, db_path).await {
+        Ok(()) => {
             println!("direct connection established; QUIC path used");
             Ok(())
         }
-        Ok(Err(error)) => {
+        Err(error) => {
             println!("direct connection failed: {error}");
-            println!("falling back to relay");
-            run_alice_relayed(bob_peer_id, message, bootstrap_peers).await
-        }
-        Err(_) => {
-            println!("direct connection attempt timed out after {DIRECT_DIAL_TIMEOUT:?}");
             println!("falling back to relay");
             run_alice_relayed(bob_peer_id, message, bootstrap_peers).await
         }
     }
 }
 
-async fn run_alice(bob_addr: SocketAddr, message: &str) -> AppResult<()> {
+async fn run_alice(bob_addr: SocketAddr, message: &str, db_path: &Path) -> AppResult<()> {
+    let local_display_name = load_or_prompt_display_name(db_path)?;
     let mut alice = Alice::local();
     let mut endpoint = Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?;
     endpoint.set_default_client_config(insecure_client_config()?);
 
     let connection = endpoint.connect(bob_addr, "localhost")?.await?;
-    println!("Alice connected to Bob at {}", connection.remote_address());
+    println!("Connected to peer at {}", connection.remote_address());
 
     let mut recv = connection.accept_uni().await?;
     let bundle_bytes = receive_bytes(&mut recv).await?;
     log_boundary("Bob -> Alice PreKeyBundle", &bundle_bytes);
-    let bundle: PreKeyBundle = bincode::deserialize(&bundle_bytes)?;
+    let (remote_display_name, bundle) = decode_chat_prekey_bundle(&bundle_bytes)?;
 
     let initial_message = alice.encrypt_initial_message(&bundle, message)?;
-    let encrypted_bytes = bincode::serialize(&initial_message)?;
+    let encrypted_bytes = bincode::serialize(&ChatInitialMessage {
+        sender_display_name: local_display_name.clone(),
+        message: initial_message,
+    })?;
     log_boundary("Alice -> Bob InitialMessage", &encrypted_bytes);
     let mut send = connection.open_uni().await?;
     send_bytes(&mut send, &encrypted_bytes).await?;
     let mut ack = connection.accept_uni().await?;
     let ack_bytes = receive_bytes(&mut ack).await?;
     println!(
-        "Alice received transport ack: {}",
+        "Received transport ack: {}",
         String::from_utf8_lossy(&ack_bytes)
     );
-    println!("Alice sent encrypted message and received transport ack");
-    println!("Connected to Bob");
-    println!("Type messages and press Enter:");
-    print_prompt()?;
+    println!("Connected to peer");
+    println!(
+        "Remote display name: {}",
+        display_name_or_anonymous(&remote_display_name)
+    );
 
-    chat_loop_alice(connection, alice).await
+    chat_loop_alice(connection, alice, local_display_name).await
 }
 
-async fn run_chat_bob(listen_addr: SocketAddr) -> AppResult<()> {
+async fn run_chat_bob(listen_addr: SocketAddr, db_path: &Path) -> AppResult<()> {
+    let local_display_name = load_or_prompt_display_name(db_path)?;
     let mut bob = Bob::local();
     let endpoint = Endpoint::server(server_config()?, listen_addr)?;
-    println!("Bob chat listening on {}", endpoint.local_addr()?);
+    println!("Chat listening on {}", endpoint.local_addr()?);
 
     let incoming = endpoint.accept().await.ok_or("endpoint closed")?;
     let connection = incoming.await?;
-    println!("Alice connected from {}", connection.remote_address());
+    println!("Peer connected from {}", connection.remote_address());
 
     let mut send = connection.open_uni().await?;
     let bundle = bob.prekey_bundle()?;
-    send_bytes(&mut send, &bincode::serialize(&bundle)?).await?;
+    send_bytes(
+        &mut send,
+        &bincode::serialize(&ChatPreKeyBundle {
+            sender_display_name: local_display_name.clone(),
+            bundle,
+        })?,
+    )
+    .await?;
 
     let mut recv = connection.accept_uni().await?;
     let initial_bytes = receive_bytes(&mut recv).await?;
-    let initial_message: InitialMessage = bincode::deserialize(&initial_bytes)?;
-    let initial_plaintext = bob.decrypt_initial_message(&initial_message)?;
+    let initial_message = decode_chat_initial_message(&initial_bytes)?;
+    let remote_display_name = initial_message.sender_display_name;
+    let initial_plaintext = bob.decrypt_initial_message(&initial_message.message)?;
     if !initial_plaintext.is_empty() {
-        println!("Alice: {initial_plaintext}");
+        println!(
+            "> {}: {}",
+            display_name_or_anonymous(&remote_display_name),
+            initial_plaintext
+        );
     }
-    println!("Connected to Alice");
-    println!("Type messages and press Enter:");
-    print_prompt()?;
+    println!("Connected to peer");
 
-    chat_loop_bob(connection, bob).await
+    chat_loop_bob(connection, bob, local_display_name).await
 }
 
-async fn run_chat_alice(bob_addr: SocketAddr) -> AppResult<()> {
+async fn run_chat_alice(bob_addr: SocketAddr, db_path: &Path) -> AppResult<()> {
+    let local_display_name = load_or_prompt_display_name(db_path)?;
     let mut alice = Alice::local();
     let mut endpoint = Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?;
     endpoint.set_default_client_config(insecure_client_config()?);
@@ -1668,21 +1715,34 @@ async fn run_chat_alice(bob_addr: SocketAddr) -> AppResult<()> {
 
     let mut recv = connection.accept_uni().await?;
     let bundle_bytes = receive_bytes(&mut recv).await?;
-    let bundle: PreKeyBundle = bincode::deserialize(&bundle_bytes)?;
+    let (remote_display_name, bundle) = decode_chat_prekey_bundle(&bundle_bytes)?;
 
     let initial_message = alice.encrypt_initial_message(&bundle, "")?;
     let mut send = connection.open_uni().await?;
-    send_bytes(&mut send, &bincode::serialize(&initial_message)?).await?;
-    println!("Connected to Bob");
-    println!("Type messages and press Enter:");
-    print_prompt()?;
+    send_bytes(
+        &mut send,
+        &bincode::serialize(&ChatInitialMessage {
+            sender_display_name: local_display_name.clone(),
+            message: initial_message,
+        })?,
+    )
+    .await?;
+    println!("Connected to peer");
+    println!(
+        "Remote display name: {}",
+        display_name_or_anonymous(&remote_display_name)
+    );
 
-    chat_loop_alice(connection, alice).await
+    chat_loop_alice(connection, alice, local_display_name).await
 }
 
-async fn chat_loop_alice(connection: quinn::Connection, alice: Alice) -> AppResult<()> {
+async fn chat_loop_alice(
+    connection: quinn::Connection,
+    alice: Alice,
+    local_display_name: String,
+) -> AppResult<()> {
     let alice = Arc::new(Mutex::new(alice));
-    let mut stdin_rx = spawn_stdin_reader();
+    let mut terminal = spawn_line_editor()?;
 
     loop {
         tokio::select! {
@@ -1690,26 +1750,24 @@ async fn chat_loop_alice(connection: quinn::Connection, alice: Alice) -> AppResu
                 println!("Ctrl+C received; chat shutting down cleanly");
                 return Ok(());
             }
-            line = stdin_rx.recv() => {
+            line = terminal.lines.recv() => {
                 let Some(line) = line else {
-                    println!("stdin closed; chat ending");
+                    println!("Terminal input closed; chat shutting down cleanly");
                     return Ok(());
                 };
-                send_alice_chat_line(&connection, Arc::clone(&alice), line).await?;
-                print_prompt()?;
+                send_alice_chat_line(&connection, Arc::clone(&alice), &local_display_name, line).await?;
             }
             incoming = connection.accept_uni() => {
                 let mut recv = incoming?;
                 let frame_bytes = receive_bytes(&mut recv).await?;
                 let frame: ChatFrame = bincode::deserialize(&frame_bytes)?;
                 match frame {
-                    ChatFrame::Message(message) => {
+                    ChatFrame::Message { sender_display_name, message } => {
                         let plaintext = alice
                             .lock()
                             .map_err(|_| "Alice state lock poisoned")?
                             .decrypt_from_bob(&message)?;
-                        println!("\nBob: {plaintext}");
-                        print_prompt()?;
+                        terminal.print_message(&sender_display_name, &plaintext)?;
                     }
                 }
             }
@@ -1717,15 +1775,20 @@ async fn chat_loop_alice(connection: quinn::Connection, alice: Alice) -> AppResu
     }
 }
 
-async fn chat_loop_bob(connection: quinn::Connection, bob: Bob) -> AppResult<()> {
-    chat_loop_bob_shared(connection, Arc::new(Mutex::new(bob))).await
+async fn chat_loop_bob(
+    connection: quinn::Connection,
+    bob: Bob,
+    local_display_name: String,
+) -> AppResult<()> {
+    chat_loop_bob_shared(connection, Arc::new(Mutex::new(bob)), local_display_name).await
 }
 
 async fn chat_loop_bob_shared(
     connection: quinn::Connection,
     bob: Arc<Mutex<Bob>>,
+    local_display_name: String,
 ) -> AppResult<()> {
-    let mut stdin_rx = spawn_stdin_reader();
+    let mut terminal = spawn_line_editor()?;
 
     loop {
         tokio::select! {
@@ -1733,26 +1796,24 @@ async fn chat_loop_bob_shared(
                 println!("Ctrl+C received; chat shutting down cleanly");
                 return Ok(());
             }
-            line = stdin_rx.recv() => {
+            line = terminal.lines.recv() => {
                 let Some(line) = line else {
-                    println!("stdin closed; chat ending");
+                    println!("Terminal input closed; chat shutting down cleanly");
                     return Ok(());
                 };
-                send_bob_chat_line(&connection, Arc::clone(&bob), line).await?;
-                print_prompt()?;
+                send_bob_chat_line(&connection, Arc::clone(&bob), &local_display_name, line).await?;
             }
             incoming = connection.accept_uni() => {
                 let mut recv = incoming?;
                 let frame_bytes = receive_bytes(&mut recv).await?;
                 let frame: ChatFrame = bincode::deserialize(&frame_bytes)?;
                 match frame {
-                    ChatFrame::Message(message) => {
+                    ChatFrame::Message { sender_display_name, message } => {
                         let plaintext = bob
                             .lock()
                             .map_err(|_| "Bob state lock poisoned")?
                             .decrypt_from_alice(&message)?;
-                        println!("\nAlice: {plaintext}");
-                        print_prompt()?;
+                        terminal.print_message(&sender_display_name, &plaintext)?;
                     }
                 }
             }
@@ -1763,6 +1824,7 @@ async fn chat_loop_bob_shared(
 async fn send_alice_chat_line(
     connection: &quinn::Connection,
     alice: Arc<Mutex<Alice>>,
+    local_display_name: &str,
     line: String,
 ) -> AppResult<()> {
     if line.is_empty() {
@@ -1773,12 +1835,20 @@ async fn send_alice_chat_line(
         .lock()
         .map_err(|_| "Alice state lock poisoned")?
         .encrypt_for_bob(&line)?;
-    send_chat_frame(connection, ChatFrame::Message(message)).await
+    send_chat_frame(
+        connection,
+        ChatFrame::Message {
+            sender_display_name: local_display_name.to_string(),
+            message,
+        },
+    )
+    .await
 }
 
 async fn send_bob_chat_line(
     connection: &quinn::Connection,
     bob: Arc<Mutex<Bob>>,
+    local_display_name: &str,
     line: String,
 ) -> AppResult<()> {
     if line.is_empty() {
@@ -1789,7 +1859,14 @@ async fn send_bob_chat_line(
         .lock()
         .map_err(|_| "Bob state lock poisoned")?
         .encrypt_for_alice(&line)?;
-    send_chat_frame(connection, ChatFrame::Message(message)).await
+    send_chat_frame(
+        connection,
+        ChatFrame::Message {
+            sender_display_name: local_display_name.to_string(),
+            message,
+        },
+    )
+    .await
 }
 
 async fn send_chat_frame(connection: &quinn::Connection, frame: ChatFrame) -> AppResult<()> {
@@ -1798,28 +1875,141 @@ async fn send_chat_frame(connection: &quinn::Connection, frame: ChatFrame) -> Ap
     send_bytes(&mut send, &bytes).await
 }
 
-fn print_prompt() -> AppResult<()> {
-    print!("> ");
-    io::stdout().flush()?;
-    Ok(())
+struct ChatTerminal {
+    lines: mpsc::UnboundedReceiver<String>,
+    print_tx: std_mpsc::Sender<String>,
 }
 
-fn spawn_stdin_reader() -> mpsc::UnboundedReceiver<String> {
-    let (tx, rx) = mpsc::unbounded_channel();
+impl ChatTerminal {
+    fn print_message(&mut self, sender_display_name: &str, plaintext: &str) -> AppResult<()> {
+        self.print_tx
+            .send(format!(
+                "> {}: {}",
+                display_name_or_anonymous(sender_display_name),
+                plaintext
+            ))
+            .map_err(|error| format!("terminal print failed: {error}").into())
+    }
+}
+
+fn spawn_line_editor() -> AppResult<ChatTerminal> {
+    let (line_tx, line_rx) = mpsc::unbounded_channel();
+    let (setup_tx, setup_rx) = std_mpsc::channel();
+
     thread::spawn(move || {
-        let stdin = io::stdin();
-        for line in stdin.lock().lines() {
-            match line {
+        let mut editor = match DefaultEditor::new() {
+            Ok(editor) => editor,
+            Err(error) => {
+                let _ = setup_tx.send(Err(error.to_string()));
+                return;
+            }
+        };
+        let mut printer = match editor.create_external_printer() {
+            Ok(printer) => printer,
+            Err(error) => {
+                let _ = setup_tx.send(Err(error.to_string()));
+                return;
+            }
+        };
+        let (print_tx, print_rx) = std_mpsc::channel::<String>();
+        thread::spawn(move || {
+            while let Ok(message) = print_rx.recv() {
+                let _ = printer.print(message);
+            }
+        });
+
+        if setup_tx.send(Ok(print_tx)).is_err() {
+            return;
+        }
+
+        loop {
+            match editor.readline(CHAT_PROMPT) {
                 Ok(line) => {
-                    if tx.send(line).is_err() {
+                    let _ = editor.add_history_entry(line.as_str());
+                    if line_tx.send(line).is_err() {
                         break;
                     }
                 }
-                Err(_) => break,
+                Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
+                Err(error) => {
+                    eprintln!("terminal input stopped: {error}");
+                    break;
+                }
             }
         }
     });
-    rx
+
+    let print_tx = setup_rx
+        .recv()
+        .map_err(|error| format!("line editor failed to start: {error}"))?
+        .map_err(|error| format!("line editor failed to start: {error}"))?;
+
+    Ok(ChatTerminal {
+        lines: line_rx,
+        print_tx,
+    })
+}
+
+fn load_or_prompt_display_name(db_path: &Path) -> AppResult<String> {
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let storage = Storage::open(db_path)?;
+    if let Some(display_name) = storage.load_display_name()? {
+        return Ok(display_name_or_anonymous(&display_name));
+    }
+
+    print!("Enter display name (blank for Anonymous): ");
+    io::stdout().flush()?;
+    let mut display_name = String::new();
+    io::stdin().read_line(&mut display_name)?;
+    let display_name = display_name_or_anonymous(display_name.trim());
+    storage.save_display_name(&display_name)?;
+
+    Ok(display_name)
+}
+
+fn display_name_or_anonymous(display_name: &str) -> String {
+    let display_name = display_name.trim();
+    if display_name.is_empty() {
+        "Anonymous".to_string()
+    } else {
+        display_name.chars().take(64).collect()
+    }
+}
+
+fn default_chat_db(role: &str) -> PathBuf {
+    PathBuf::from(format!("target/ciphermesh-{role}-profile.sqlite"))
+}
+
+fn decode_chat_prekey_bundle(bytes: &[u8]) -> AppResult<(String, PreKeyBundle)> {
+    match bincode::deserialize::<ChatPreKeyBundle>(bytes) {
+        Ok(bundle) => Ok((
+            display_name_or_anonymous(&bundle.sender_display_name),
+            bundle.bundle,
+        )),
+        Err(_) => {
+            let bundle: PreKeyBundle = bincode::deserialize(bytes)?;
+            Ok(("Anonymous".to_string(), bundle))
+        }
+    }
+}
+
+fn decode_chat_initial_message(bytes: &[u8]) -> AppResult<ChatInitialMessage> {
+    match bincode::deserialize::<ChatInitialMessage>(bytes) {
+        Ok(message) => Ok(ChatInitialMessage {
+            sender_display_name: display_name_or_anonymous(&message.sender_display_name),
+            message: message.message,
+        }),
+        Err(_) => {
+            let message: InitialMessage = bincode::deserialize(bytes)?;
+            Ok(ChatInitialMessage {
+                sender_display_name: "Anonymous".to_string(),
+                message,
+            })
+        }
+    }
 }
 
 async fn run_alice_relayed(
@@ -2028,8 +2218,23 @@ struct SyncResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChatPreKeyBundle {
+    sender_display_name: String,
+    bundle: PreKeyBundle,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChatInitialMessage {
+    sender_display_name: String,
+    message: InitialMessage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum ChatFrame {
-    Message(RatchetMessage),
+    Message {
+        sender_display_name: String,
+        message: RatchetMessage,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3298,8 +3503,17 @@ impl quinn::rustls::client::danger::ServerCertVerifier for SkipServerVerificatio
 }
 
 fn log_boundary(label: &str, bytes: &[u8]) {
+    if !env_verbose_enabled() {
+        return;
+    }
     println!("{label}: {} bytes", bytes.len());
     println!("{label} bytes: {}", hex_preview(bytes));
+}
+
+fn env_verbose_enabled() -> bool {
+    std::env::var("CIPHERMESH_VERBOSE")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
 }
 
 fn hex_preview(bytes: &[u8]) -> String {

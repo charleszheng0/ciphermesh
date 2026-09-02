@@ -145,6 +145,12 @@ impl Storage {
                 updated_at_unix_secs INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS local_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at_unix_secs INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS sessions (
                 conversation_id TEXT PRIMARY KEY,
                 peer_id TEXT NOT NULL,
@@ -272,6 +278,30 @@ impl Storage {
             .query_row(
                 "SELECT state FROM local_identity WHERE id = ?1",
                 params![id],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    pub fn save_display_name(&self, display_name: &str) -> StorageResult<()> {
+        self.conn.execute(
+            "
+            INSERT INTO local_settings (key, value, updated_at_unix_secs)
+            VALUES ('display_name', ?1, ?2)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at_unix_secs = excluded.updated_at_unix_secs
+            ",
+            params![display_name, now_unix_secs() as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_display_name(&self) -> StorageResult<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT value FROM local_settings WHERE key = 'display_name'",
+                [],
                 |row| row.get(0),
             )
             .optional()
@@ -1703,6 +1733,39 @@ mod tests {
                     .device_revocations_for_account("acct-1")
                     .expect("revocations"),
                 vec![b"revocation-v1".to_vec()]
+            );
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn display_name_persists_in_local_settings() {
+        let path = std::env::temp_dir().join(format!(
+            "ciphermesh-display-name-{}.sqlite",
+            now_unix_secs()
+        ));
+
+        {
+            let storage = Storage::open(&path).expect("open first");
+            assert_eq!(storage.load_display_name().expect("load empty"), None);
+            storage
+                .save_display_name("James")
+                .expect("save display name");
+        }
+
+        {
+            let storage = Storage::open(&path).expect("open second");
+            assert_eq!(
+                storage.load_display_name().expect("load display name"),
+                Some("James".to_string())
+            );
+            storage
+                .save_display_name("Anonymous")
+                .expect("update display name");
+            assert_eq!(
+                storage.load_display_name().expect("load updated name"),
+                Some("Anonymous".to_string())
             );
         }
 
