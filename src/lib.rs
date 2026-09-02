@@ -1934,3 +1934,682 @@ mod tests {
         assert_eq!(decoded_message, initial_message);
     }
 }
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+    use crate::{
+        crdt::{event_record, materialize_conversation, ConversationEvent},
+        mailbox_storage::{MailboxEnvelopeRecord, MailboxStorage},
+        storage::{
+            now_unix_secs, EventRecord, MessageDirection, MessageRecord, MessageStatus, OutboxItem,
+            OutboxStatus, Storage, VersionVector,
+        },
+    };
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct HardeningEnvelope {
+        message_id: String,
+        message: RatchetMessage,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct HardeningAck {
+        message_id: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct HardeningEventWire {
+        device_id: String,
+        counter: u64,
+        conversation_id: String,
+        event_type: String,
+        message_id: Option<String>,
+        payload: Vec<u8>,
+        created_at_unix_secs: u64,
+    }
+
+    impl From<EventRecord> for HardeningEventWire {
+        fn from(event: EventRecord) -> Self {
+            Self {
+                device_id: event.device_id,
+                counter: event.counter,
+                conversation_id: event.conversation_id,
+                event_type: event.event_type,
+                message_id: event.message_id,
+                payload: event.payload,
+                created_at_unix_secs: event.created_at_unix_secs,
+            }
+        }
+    }
+
+    impl From<HardeningEventWire> for EventRecord {
+        fn from(event: HardeningEventWire) -> Self {
+            Self {
+                device_id: event.device_id,
+                counter: event.counter,
+                conversation_id: event.conversation_id,
+                event_type: event.event_type,
+                message_id: event.message_id,
+                payload: event.payload,
+                created_at_unix_secs: event.created_at_unix_secs,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Fault {
+        Drop,
+        Delay,
+        Duplicate,
+        Reorder,
+        Replay,
+        Tamper(usize),
+        Partition,
+    }
+
+    #[derive(Default)]
+    struct FaultInjector {
+        delayed: Vec<(String, Vec<u8>)>,
+        replayed: Vec<(String, Vec<u8>)>,
+        logs: Vec<String>,
+    }
+
+    impl FaultInjector {
+        fn deliver(&mut self, id: &str, payload: Vec<u8>, faults: &[Fault]) -> Vec<Vec<u8>> {
+            if faults.contains(&Fault::Partition) {
+                self.logs.push(format!("[FAULT] partitioned {id}"));
+                return Vec::new();
+            }
+            if faults.contains(&Fault::Drop) {
+                self.logs.push(format!("[FAULT] dropped {id}"));
+                return Vec::new();
+            }
+
+            let mut payload = payload;
+            for fault in faults {
+                if let Fault::Tamper(index) = fault {
+                    if let Some(byte) = payload.get_mut(*index) {
+                        *byte ^= 0x01;
+                        self.logs.push(format!("[FAULT] tampered {id}"));
+                    }
+                }
+            }
+
+            if faults.contains(&Fault::Delay) {
+                self.logs.push(format!("[FAULT] delayed {id}"));
+                self.delayed.push((id.to_string(), payload.clone()));
+                return Vec::new();
+            }
+
+            let mut delivered = vec![payload.clone()];
+            if faults.contains(&Fault::Duplicate) {
+                self.logs.push(format!("[FAULT] duplicated {id}"));
+                delivered.push(payload.clone());
+            }
+            if faults.contains(&Fault::Replay) {
+                self.logs.push(format!("[FAULT] replay scheduled {id}"));
+                self.replayed.push((id.to_string(), payload));
+            }
+            if faults.contains(&Fault::Reorder) {
+                self.logs.push(format!("[FAULT] reordered batch"));
+                delivered.reverse();
+            }
+
+            delivered
+        }
+
+        fn flush_delayed(&mut self) -> Vec<Vec<u8>> {
+            let mut flushed = self.delayed.drain(..).collect::<Vec<_>>();
+            flushed.sort_by(|left, right| right.0.cmp(&left.0));
+            flushed.into_iter().map(|(_, payload)| payload).collect()
+        }
+
+        fn replay(&self) -> Vec<Vec<u8>> {
+            self.replayed
+                .iter()
+                .map(|(_, payload)| payload.clone())
+                .collect()
+        }
+    }
+
+    #[test]
+    fn fault_injector_is_deterministic_and_disabled_by_default() {
+        let payload = b"encrypted bytes".to_vec();
+        let mut injector = FaultInjector::default();
+
+        assert_eq!(
+            injector.deliver("M1", payload.clone(), &[]),
+            vec![payload.clone()]
+        );
+        assert!(injector.logs.is_empty());
+
+        assert!(injector
+            .deliver("M2", payload.clone(), &[Fault::Drop])
+            .is_empty());
+        assert!(injector
+            .deliver("M3", payload.clone(), &[Fault::Delay])
+            .is_empty());
+        assert_eq!(injector.flush_delayed(), vec![payload]);
+        assert!(injector
+            .logs
+            .iter()
+            .any(|line| line == "[FAULT] dropped M2"));
+        assert!(injector
+            .logs
+            .iter()
+            .any(|line| line == "[FAULT] delayed M3"));
+    }
+
+    #[test]
+    fn dropped_message_and_partition_leave_outbox_pending_until_retry() {
+        let mut sender = Storage::open_in_memory().expect("sender storage");
+        let receiver = Storage::open_in_memory().expect("receiver storage");
+        let (mut alice, mut bob) = paired_alice_bob();
+        let outbox = queue_alice_message(&mut sender, &mut alice, "M1", "drop then retry");
+        let mut fault = FaultInjector::default();
+
+        assert!(fault
+            .deliver(&outbox.message_id, outbox.payload.clone(), &[Fault::Drop])
+            .is_empty());
+        assert_eq!(sender.pending_outbox_items().unwrap().len(), 1);
+
+        sender.record_outbox_attempt(&outbox.message_id).unwrap();
+        for payload in fault.deliver(&outbox.message_id, outbox.payload.clone(), &[]) {
+            let ack = receive_for_bob(&receiver, &mut bob, &payload).expect("retry accepted");
+            sender.mark_outbox_delivered(&ack.message_id).unwrap();
+        }
+
+        assert!(sender.pending_outbox_items().unwrap().is_empty());
+        assert!(fault.logs.iter().any(|line| line == "[FAULT] dropped M1"));
+
+        let partitioned = queue_alice_message(&mut sender, &mut alice, "M2", "partitioned");
+        assert!(fault
+            .deliver(
+                &partitioned.message_id,
+                partitioned.payload,
+                &[Fault::Partition]
+            )
+            .is_empty());
+        assert_eq!(sender.pending_outbox_items().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn dropped_ack_causes_retry_without_duplicate_processing() {
+        let mut sender = Storage::open_in_memory().expect("sender storage");
+        let receiver = Storage::open_in_memory().expect("receiver storage");
+        let (mut alice, mut bob) = paired_alice_bob();
+        let outbox = queue_alice_message(&mut sender, &mut alice, "M1", "ack may drop");
+        let payload = outbox.payload.clone();
+
+        let ack = receive_for_bob(&receiver, &mut bob, &payload).expect("first receive");
+        let mut fault = FaultInjector::default();
+        assert!(fault
+            .deliver(
+                &ack.message_id,
+                bincode::serialize(&ack).unwrap(),
+                &[Fault::Drop]
+            )
+            .is_empty());
+        assert_eq!(sender.pending_outbox_items().unwrap().len(), 1);
+
+        sender.record_outbox_attempt(&outbox.message_id).unwrap();
+        let retry_ack = receive_for_bob(&receiver, &mut bob, &payload).expect("duplicate ack");
+        sender.mark_outbox_delivered(&retry_ack.message_id).unwrap();
+
+        assert!(sender.pending_outbox_items().unwrap().is_empty());
+        assert_eq!(
+            receiver
+                .messages_for_conversation("hardening")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn duplicate_delayed_reordered_and_replayed_delivery_processes_once() {
+        let receiver = Storage::open_in_memory().expect("receiver storage");
+        let (mut alice, mut bob) = paired_alice_bob();
+        let first = hardening_payload(&mut alice, "M1", "first");
+        let second = hardening_payload(&mut alice, "M2", "second");
+        let mut fault = FaultInjector::default();
+        let mut delivered = Vec::new();
+
+        delivered.extend(fault.deliver("M1", first.clone(), &[Fault::Delay, Fault::Replay]));
+        delivered.extend(fault.deliver("M2", second, &[Fault::Duplicate]));
+        delivered.extend(fault.flush_delayed());
+        delivered.extend(fault.replay());
+        delivered.reverse();
+
+        for payload in delivered {
+            let _ = receive_for_bob(&receiver, &mut bob, &payload);
+        }
+
+        assert_eq!(
+            receiver
+                .messages_for_conversation("hardening")
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(fault.logs.iter().any(|line| line == "[FAULT] delayed M1"));
+        assert!(fault
+            .logs
+            .iter()
+            .any(|line| line == "[FAULT] duplicated M2"));
+    }
+
+    #[test]
+    fn sender_and_receiver_restart_keep_pending_ciphertext_deliverable() {
+        let path = std::env::temp_dir().join(format!(
+            "ciphermesh-hardening-outbox-{}.sqlite",
+            now_unix_secs()
+        ));
+        let mut sender = Storage::open(&path).expect("sender storage");
+        let receiver = Storage::open_in_memory().expect("receiver storage");
+        let (mut alice, bob) = paired_alice_bob();
+        let bob_state = bob.export_state();
+        let outbox = queue_alice_message(&mut sender, &mut alice, "M1", "after restart");
+        drop(sender);
+
+        let sender = Storage::open(&path).expect("sender restarted");
+        let pending = sender
+            .pending_outbox_items()
+            .expect("pending after restart");
+        let mut restarted_bob = Bob::from_state(bob_state);
+        let ack = receive_for_bob(&receiver, &mut restarted_bob, &pending[0].payload)
+            .expect("receiver accepts after restart");
+
+        assert_eq!(pending[0].payload, outbox.payload);
+        sender.mark_outbox_delivered(&ack.message_id).unwrap();
+        assert!(sender.pending_outbox_items().unwrap().is_empty());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mailbox_fallback_and_duplicate_direct_mailbox_delivery_process_once() {
+        let receiver = Storage::open_in_memory().expect("receiver storage");
+        let mailbox = MailboxStorage::open_in_memory(8).expect("mailbox");
+        let (mut alice, mut bob) = paired_alice_bob();
+        let payload = hardening_payload(&mut alice, "M1", "via mailbox");
+
+        mailbox
+            .deposit(
+                &MailboxEnvelopeRecord {
+                    message_id: "M1".to_string(),
+                    recipient_token: "bob-device".to_string(),
+                    encrypted_payload: payload.clone(),
+                    created_at_unix_secs: 1,
+                    expires_at_unix_secs: None,
+                },
+                1,
+            )
+            .expect("deposit");
+        receive_for_bob(&receiver, &mut bob, &payload).expect("direct receive");
+        let fetched = mailbox.fetch_pending("bob-device", 2).expect("fetch");
+        let ack = receive_for_bob(&receiver, &mut bob, &fetched[0].encrypted_payload)
+            .expect("mailbox duplicate ack");
+        mailbox.acknowledge_retrieval(&ack.message_id, 3).unwrap();
+
+        assert_eq!(
+            receiver
+                .messages_for_conversation("hardening")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(mailbox.pending_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn tampered_ciphertext_and_authentication_tag_are_rejected() {
+        let (_alice, mut bob, mut payload) = encrypted_payload_for_bob("M1", "do not alter");
+        let receiver = Storage::open_in_memory().expect("receiver storage");
+        let mut tampered_body = payload.clone();
+
+        tampered_body[tampered_body.len() / 2] ^= 0x01;
+        assert!(receive_for_bob(&receiver, &mut bob, &tampered_body).is_err());
+
+        let (_alice, mut bob, tag_payload) = encrypted_payload_for_bob("M2", "tag check");
+        let mut tampered_tag = tag_payload;
+        let last = tampered_tag.len() - 1;
+        tampered_tag[last] ^= 0x01;
+        assert!(receive_for_bob(&receiver, &mut bob, &tampered_tag).is_err());
+
+        payload[0] ^= 0x01;
+        assert!(bincode::deserialize::<HardeningEnvelope>(&payload).is_err());
+    }
+
+    #[test]
+    fn skipped_key_bound_is_enforced() {
+        let mut alice = Alice::local();
+        let mut bob = Bob::local();
+        let alice_exchange = alice.signed_key_exchange();
+        let bob_exchange = bob.signed_key_exchange();
+        alice.derive_session_key(&bob_exchange).unwrap();
+        bob.derive_session_key(&alice_exchange).unwrap();
+
+        let mut messages = Vec::new();
+        for index in 0..=MAX_SKIPPED_MESSAGE_KEYS as u64 + 1 {
+            messages.push(
+                alice
+                    .encrypt_for_bob(&format!("message {index}"))
+                    .expect("encrypt"),
+            );
+        }
+
+        assert_eq!(
+            bob.decrypt_from_alice(messages.last().unwrap()),
+            Err(CryptoError::TooManySkippedMessages)
+        );
+    }
+
+    #[test]
+    fn revoked_device_gets_no_future_hardening_envelope() {
+        let account = AccountIdentity::generate();
+        let laptop = DeviceIdentity::generate(account.account_id());
+        let phone = DeviceIdentity::generate(account.account_id());
+        let bob = DeviceIdentity::generate("bob-account");
+        let laptop_cert = account.authorize_device(&laptop);
+        let phone_cert = account.authorize_device(&phone);
+        let revocation = account.revoke_device(phone.device_id().to_string(), 1);
+        let active = active_device_certificates(
+            account.public_key(),
+            &[laptop_cert.clone(), phone_cert],
+            &[revocation],
+        )
+        .expect("active devices");
+
+        let mut envelopes = Vec::new();
+        for certificate in active {
+            let mut session = bob
+                .create_outbound_session(account.public_key(), &certificate)
+                .expect("session");
+            envelopes.push(session.encrypt("M1", "future only").unwrap());
+        }
+
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(envelopes[0].recipient_device_id, laptop_cert.device_id);
+    }
+
+    #[test]
+    fn eventually_same_valid_event_set_converges_despite_faults() {
+        let alice = Storage::open_in_memory().expect("alice");
+        let bob = Storage::open_in_memory().expect("bob");
+        let conversation = "hardening-crdt";
+        let events = vec![
+            crdt_message(conversation, "AliceDevice", 1, "message-1", "alice"),
+            crdt_reaction(conversation, "BobDevice", 1, "message-1", "+1", "bob"),
+            crdt_delete(conversation, "AliceDevice", 2, "message-1"),
+            crdt_read(conversation, "BobDevice", 2, "AliceDevice", 2),
+        ];
+        let mut fault = FaultInjector::default();
+        let mut encoded = events
+            .iter()
+            .map(|event| bincode::serialize(event).unwrap())
+            .collect::<Vec<_>>();
+        encoded.reverse();
+
+        for payload in encoded.clone() {
+            let decoded: EventRecord = bincode::deserialize(&payload).unwrap();
+            alice.append_event(&decoded).unwrap();
+        }
+        for payload in fault.deliver(
+            "events",
+            bincode::serialize(&events[0]).unwrap(),
+            &[Fault::Duplicate],
+        ) {
+            let decoded: EventRecord = bincode::deserialize(&payload).unwrap();
+            bob.append_event(&decoded).unwrap();
+        }
+        for payload in encoded {
+            let decoded: EventRecord = bincode::deserialize(&payload).unwrap();
+            bob.append_event(&decoded).unwrap();
+        }
+
+        assert_eq!(
+            materialize_conversation(&all_events(&alice, conversation)),
+            materialize_conversation(&all_events(&bob, conversation))
+        );
+    }
+
+    #[test]
+    fn multiple_alice_devices_create_events_offline_then_sync_converges() {
+        let laptop = Storage::open_in_memory().expect("laptop");
+        let phone = Storage::open_in_memory().expect("phone");
+        let conversation = "hardening-own-devices";
+
+        laptop
+            .append_event(&crdt_message(
+                conversation,
+                "AliceLaptop",
+                1,
+                "laptop-message",
+                "alice",
+            ))
+            .unwrap();
+        phone
+            .append_event(&crdt_message(
+                conversation,
+                "AlicePhone",
+                1,
+                "phone-message",
+                "alice",
+            ))
+            .unwrap();
+
+        let phone_missing = laptop
+            .missing_events_for(conversation, &phone.version_vector(conversation).unwrap())
+            .unwrap();
+        let laptop_missing = phone
+            .missing_events_for(conversation, &laptop.version_vector(conversation).unwrap())
+            .unwrap();
+        phone.append_events(&phone_missing).unwrap();
+        laptop.append_events(&laptop_missing).unwrap();
+
+        assert_eq!(
+            materialize_conversation(&all_events(&laptop, conversation)),
+            materialize_conversation(&all_events(&phone, conversation))
+        );
+    }
+
+    fn paired_alice_bob() -> (Alice, Bob) {
+        let mut alice = Alice::local();
+        let mut bob = Bob::local();
+        let alice_exchange = alice.signed_key_exchange();
+        let bob_exchange = bob.signed_key_exchange();
+        alice.derive_session_key(&bob_exchange).unwrap();
+        bob.derive_session_key(&alice_exchange).unwrap();
+        (alice, bob)
+    }
+
+    fn encrypted_payload_for_bob(message_id: &str, plaintext: &str) -> (Alice, Bob, Vec<u8>) {
+        let (mut alice, bob) = paired_alice_bob();
+        let payload = hardening_payload(&mut alice, message_id, plaintext);
+        (alice, bob, payload)
+    }
+
+    fn hardening_payload(alice: &mut Alice, message_id: &str, plaintext: &str) -> Vec<u8> {
+        let message = alice.encrypt_for_bob(plaintext).expect("encrypt");
+        bincode::serialize(&HardeningEnvelope {
+            message_id: message_id.to_string(),
+            message,
+        })
+        .expect("serialize envelope")
+    }
+
+    fn queue_alice_message(
+        storage: &mut Storage,
+        alice: &mut Alice,
+        message_id: &str,
+        plaintext: &str,
+    ) -> OutboxItem {
+        let payload = hardening_payload(alice, message_id, plaintext);
+        let wire: HardeningEnvelope = bincode::deserialize(&payload).unwrap();
+        let outbox = OutboxItem {
+            message_id: message_id.to_string(),
+            recipient_id: "bob".to_string(),
+            payload,
+            status: OutboxStatus::Pending,
+            retry_count: 0,
+            created_at_unix_secs: 1,
+            last_attempt_unix_secs: None,
+        };
+        let message = MessageRecord {
+            message_id: message_id.to_string(),
+            conversation_id: "hardening".to_string(),
+            sender_id: "alice".to_string(),
+            recipient_id: "bob".to_string(),
+            direction: MessageDirection::Sent,
+            status: MessageStatus::Sent,
+            protocol_counter: Some(wire.message.number),
+            ciphertext: wire.message.ciphertext,
+            plaintext: Some(plaintext.to_string()),
+            created_at_unix_secs: 1,
+        };
+        let alice_state = bincode::serialize(&alice.export_state()).unwrap();
+        let session_state = bincode::serialize(&alice.session_state().unwrap()).unwrap();
+
+        storage
+            .save_state_session_message_and_outbox(
+                "alice",
+                "alice",
+                &alice_state,
+                "hardening",
+                "bob",
+                "alice",
+                &session_state,
+                &message,
+                &outbox,
+            )
+            .unwrap();
+
+        outbox
+    }
+
+    fn receive_for_bob(
+        storage: &Storage,
+        bob: &mut Bob,
+        payload: &[u8],
+    ) -> Result<HardeningAck, Box<dyn Error + Send + Sync>> {
+        let envelope: HardeningEnvelope = bincode::deserialize(payload)?;
+        if storage
+            .messages_for_conversation("hardening")?
+            .iter()
+            .any(|message| message.message_id == envelope.message_id)
+        {
+            return Ok(HardeningAck {
+                message_id: envelope.message_id,
+            });
+        }
+
+        let plaintext = bob.decrypt_from_alice(&envelope.message)?;
+        if !storage.accept_message_once(&envelope.message_id)? {
+            return Ok(HardeningAck {
+                message_id: envelope.message_id,
+            });
+        }
+        storage.insert_message(&MessageRecord {
+            message_id: envelope.message_id.clone(),
+            conversation_id: "hardening".to_string(),
+            sender_id: "alice".to_string(),
+            recipient_id: "bob".to_string(),
+            direction: MessageDirection::Received,
+            status: MessageStatus::Received,
+            protocol_counter: Some(envelope.message.number),
+            ciphertext: envelope.message.ciphertext,
+            plaintext: Some(plaintext),
+            created_at_unix_secs: 1,
+        })?;
+
+        Ok(HardeningAck {
+            message_id: envelope.message_id,
+        })
+    }
+
+    fn crdt_message(
+        conversation: &str,
+        device_id: &str,
+        counter: u64,
+        message_id: &str,
+        author_id: &str,
+    ) -> EventRecord {
+        event_record(
+            conversation,
+            device_id,
+            counter,
+            ConversationEvent::MessageCreated {
+                message_id: message_id.to_string(),
+                author_id: author_id.to_string(),
+                payload: format!("{message_id} body").into_bytes(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn crdt_reaction(
+        conversation: &str,
+        device_id: &str,
+        counter: u64,
+        message_id: &str,
+        reaction: &str,
+        actor_id: &str,
+    ) -> EventRecord {
+        event_record(
+            conversation,
+            device_id,
+            counter,
+            ConversationEvent::ReactionAdded {
+                message_id: message_id.to_string(),
+                reaction: reaction.to_string(),
+                actor_id: actor_id.to_string(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn crdt_delete(
+        conversation: &str,
+        device_id: &str,
+        counter: u64,
+        message_id: &str,
+    ) -> EventRecord {
+        event_record(
+            conversation,
+            device_id,
+            counter,
+            ConversationEvent::MessageDeleted {
+                message_id: message_id.to_string(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn crdt_read(
+        conversation: &str,
+        device_id: &str,
+        counter: u64,
+        read_device_id: &str,
+        read_counter: u64,
+    ) -> EventRecord {
+        event_record(
+            conversation,
+            device_id,
+            counter,
+            ConversationEvent::ReadAdvanced {
+                actor_id: "bob".to_string(),
+                read_device_id: read_device_id.to_string(),
+                read_counter,
+            },
+        )
+        .unwrap()
+    }
+
+    fn all_events(storage: &Storage, conversation: &str) -> Vec<EventRecord> {
+        storage
+            .missing_events_for(conversation, &VersionVector::new())
+            .unwrap()
+    }
+}
