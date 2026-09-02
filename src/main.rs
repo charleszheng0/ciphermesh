@@ -48,7 +48,8 @@ const MAILBOX_MAX_ENVELOPES: usize = 64;
 
 #[tokio::main]
 async fn main() -> AppResult<()> {
-    let args = std::env::args().collect::<Vec<_>>();
+    let mut args = std::env::args().collect::<Vec<_>>();
+    let verbose = take_verbose_flag(&mut args);
 
     match args.get(1).map(String::as_str) {
         Some("bob") => {
@@ -87,20 +88,20 @@ async fn main() -> AppResult<()> {
         }
         Some("kad-demo") => run_kademlia_demo().await,
         Some("relay") => {
-            let listen_addr = args
-                .get(2)
-                .map(String::as_str)
-                .unwrap_or("/ip4/0.0.0.0/tcp/4001")
-                .parse()?;
+            let listen_addr = parse_multiaddr(
+                args.get(2),
+                "/ip4/0.0.0.0/tcp/4001",
+                "relay listen multiaddr",
+            )?;
             run_relay_server(listen_addr).await
         }
         Some("relay-demo") => run_relay_demo().await,
         Some("mailbox") => {
-            let listen_addr = args
-                .get(2)
-                .map(String::as_str)
-                .unwrap_or("/ip4/0.0.0.0/tcp/7000")
-                .parse()?;
+            let listen_addr = parse_multiaddr(
+                args.get(2),
+                "/ip4/0.0.0.0/tcp/7000",
+                "mailbox listen multiaddr",
+            )?;
             let db_path = args
                 .get(3)
                 .map(PathBuf::from)
@@ -147,20 +148,51 @@ async fn main() -> AppResult<()> {
         Some("fanout-demo") => run_device_fanout_demo(),
         Some("own-device-sync-demo") => run_own_device_sync_demo(),
         Some("revocation-demo") => run_device_revocation_demo(),
-        _ => {
-            run_local_demo()?;
+        None => {
+            run_local_demo(verbose)?;
             print_usage();
             Ok(())
+        }
+        Some(command) => {
+            Err(format!("invalid command '{command}'; run without arguments to see usage").into())
         }
     }
 }
 
+fn take_verbose_flag(args: &mut Vec<String>) -> bool {
+    let env_verbose = std::env::var("CIPHERMESH_VERBOSE")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    let mut cli_verbose = false;
+
+    args.retain(|arg| {
+        if arg == "--verbose" || arg == "-v" {
+            cli_verbose = true;
+            false
+        } else {
+            true
+        }
+    });
+
+    env_verbose || cli_verbose
+}
+
 fn parse_addr(addr: Option<&String>, default: &str) -> AppResult<SocketAddr> {
-    Ok(addr.map(String::as_str).unwrap_or(default).parse()?)
+    addr.map(String::as_str)
+        .unwrap_or(default)
+        .parse()
+        .map_err(|error| format!("invalid socket address: {error}").into())
 }
 
 fn parse_required_multiaddr(addr: Option<&String>, label: &str) -> AppResult<Multiaddr> {
     addr.ok_or_else(|| format!("missing {label}"))?
+        .parse()
+        .map_err(|error| format!("invalid {label}: {error}").into())
+}
+
+fn parse_multiaddr(addr: Option<&String>, default: &str, label: &str) -> AppResult<Multiaddr> {
+    addr.map(String::as_str)
+        .unwrap_or(default)
         .parse()
         .map_err(|error| format!("invalid {label}: {error}").into())
 }
@@ -175,6 +207,15 @@ fn split_optional_message_and_bootstrap(values: &[String]) -> (Option<&str>, &[S
         Some((first, _)) if first.parse::<Multiaddr>().is_ok() => (None, values),
         Some((first, rest)) => (Some(first.as_str()), rest),
     }
+}
+
+fn short_hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 fn print_usage() {
@@ -234,38 +275,47 @@ fn print_usage() {
     println!("  cargo run -- revocation-demo");
 }
 
-fn run_local_demo() -> AppResult<()> {
+fn run_local_demo(verbose: bool) -> AppResult<()> {
     let mut alice = Alice::local();
     let mut bob = Bob::local();
     let message = "hello bob, this is alice";
 
     let alice_exchange = alice.signed_key_exchange();
     let bob_exchange = bob.signed_key_exchange();
+    println!("Local E2EE smoke test");
     println!(
-        "Alice identity public key: {:?}",
-        alice_exchange.identity_public_key
+        "Alice identity: {}",
+        short_hex(&alice_exchange.identity_public_key)
     );
     println!(
-        "Alice X25519 public key: {:?}",
-        alice_exchange.x25519_public_key
+        "Bob identity: {}",
+        short_hex(&bob_exchange.identity_public_key)
     );
-    println!("Alice signature: {:?}", alice_exchange.signature);
-    println!(
-        "Bob identity public key: {:?}",
-        bob_exchange.identity_public_key
-    );
-    println!(
-        "Bob X25519 public key: {:?}",
-        bob_exchange.x25519_public_key
-    );
-    println!("Bob signature: {:?}", bob_exchange.signature);
+    if verbose {
+        println!(
+            "Alice X25519 public key: {:?}",
+            alice_exchange.x25519_public_key
+        );
+        println!("Alice signature: {:?}", alice_exchange.signature);
+        println!(
+            "Bob X25519 public key: {:?}",
+            bob_exchange.x25519_public_key
+        );
+        println!("Bob signature: {:?}", bob_exchange.signature);
+    }
 
     alice.derive_session_key(&bob_exchange)?;
     bob.derive_session_key(&alice_exchange)?;
 
     let ciphertext = alice.encrypt_for_bob(message)?;
-    println!("Alice plaintext: {message}");
-    println!("Transport payload: {ciphertext:?}");
+    println!("Alice encrypted local demo message");
+    println!(
+        "Transport payload: encrypted message {} bytes",
+        ciphertext.ciphertext.len()
+    );
+    if verbose {
+        println!("Verbose transport payload: {ciphertext:?}");
+    }
 
     let plaintext = bob.decrypt_from_alice(&ciphertext)?;
     println!("Bob decrypted: {plaintext}");
@@ -278,9 +328,15 @@ fn run_local_demo() -> AppResult<()> {
     let bob_bundle = directory.take_bob_prekey_bundle()?;
     let initial_message = alice.encrypt_initial_message(&bob_bundle, "hello offline bob")?;
     println!(
-        "Offline initial transport payload: {:?}",
-        initial_message.message
+        "Offline initial transport payload: encrypted message {} bytes",
+        initial_message.message.ciphertext.len()
     );
+    if verbose {
+        println!(
+            "Verbose offline initial transport payload: {:?}",
+            initial_message.message
+        );
+    }
 
     let plaintext = offline_bob.decrypt_initial_message(&initial_message)?;
     println!("Offline Bob decrypted later: {plaintext}");
@@ -470,18 +526,19 @@ fn run_restart_demo(db_path: &Path) -> AppResult<()> {
     println!("Stored conversation events read back from SQLite:");
     for message in messages {
         println!(
-            "  id={} direction={:?} counter={:?} ciphertext_bytes={} local_plaintext={:?}",
+            "  id={} direction={:?} counter={:?} ciphertext_bytes={} local_plaintext_present={}",
             message.message_id,
             message.direction,
             message.protocol_counter,
             message.ciphertext.len(),
-            message.plaintext
+            message.plaintext.is_some()
         );
     }
 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn persist_actor_message(
     storage: &mut Storage,
     local_identity_id: &str,
@@ -637,12 +694,12 @@ fn run_outbox_demo(db_path: &Path) -> AppResult<()> {
     println!("Stored conversation events after retry demo:");
     for message in messages {
         println!(
-            "  id={} direction={:?} counter={:?} ciphertext_bytes={} local_plaintext={:?}",
+            "  id={} direction={:?} counter={:?} ciphertext_bytes={} local_plaintext_present={}",
             message.message_id,
             message.direction,
             message.protocol_counter,
             message.ciphertext.len(),
-            message.plaintext
+            message.plaintext.is_some()
         );
     }
 
@@ -1456,6 +1513,11 @@ async fn run_bob(listen_addr: SocketAddr, bootstrap_peers: Vec<Multiaddr>) -> Ap
     });
 
     tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            direct.abort();
+            relayed.abort();
+            println!("Ctrl+C received; Bob shutting down cleanly");
+        }
         result = &mut direct => {
             relayed.abort();
             result??;
@@ -1563,7 +1625,7 @@ async fn run_alice(bob_addr: SocketAddr, message: &str) -> AppResult<()> {
         "Alice received transport ack: {}",
         String::from_utf8_lossy(&ack_bytes)
     );
-    println!("Alice plaintext before network send: {message}");
+    println!("Alice sent encrypted message and received transport ack");
 
     Ok(())
 }
@@ -1620,6 +1682,10 @@ async fn chat_loop_alice(connection: quinn::Connection, alice: Alice) -> AppResu
 
     loop {
         tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!("Ctrl+C received; chat shutting down cleanly");
+                return Ok(());
+            }
             line = stdin_rx.recv() => {
                 let Some(line) = line else {
                     println!("stdin closed; chat ending");
@@ -1657,6 +1723,10 @@ async fn chat_loop_bob_shared(
 
     loop {
         tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!("Ctrl+C received; chat shutting down cleanly");
+                return Ok(());
+            }
             line = stdin_rx.recv() => {
                 let Some(line) = line else {
                     println!("stdin closed; chat ending");
@@ -1824,7 +1894,7 @@ async fn run_alice_relayed(
                                     "Alice received relay transport ack: {}",
                                     String::from_utf8_lossy(&ack_bytes)
                                 );
-                                println!("Alice plaintext before network send: {message}");
+                                println!("Alice sent encrypted message through relay and received transport ack");
                                 return Ok(());
                             }
                             CipherMeshResponse::Error(error) => return Err(error.into()),
@@ -2112,11 +2182,12 @@ async fn run_discovery_advertiser(
                 }
             }
             SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Kad(
-                kad::Event::OutboundQueryProgressed { result, .. },
+                kad::Event::OutboundQueryProgressed {
+                    result: kad::QueryResult::Bootstrap(result),
+                    ..
+                },
             )) => {
-                if let kad::QueryResult::Bootstrap(result) = result {
-                    println!("Bob Kademlia bootstrap result: {result:?}");
-                }
+                println!("Bob Kademlia bootstrap result: {result:?}");
             }
             SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Identify(
                 identify::Event::Received { peer_id, info, .. },
@@ -2361,27 +2432,35 @@ async fn run_relay_server(listen_addr: Multiaddr) -> AppResult<()> {
     println!("Relay PeerId: {local_peer_id}");
 
     loop {
-        match swarm.select_next_some().await {
-            SwarmEvent::NewListenAddr { address, .. } => {
-                swarm.add_external_address(address.clone().with(Protocol::P2p(local_peer_id)));
-                println!(
-                    "Relay listening on {}",
-                    address.with(Protocol::P2p(local_peer_id))
-                );
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!("Ctrl+C received; relay shutting down cleanly");
+                return Ok(());
             }
-            SwarmEvent::ConnectionEstablished {
-                peer_id, endpoint, ..
-            } => {
-                if endpoint.is_relayed() {
-                    println!("Relay observed relayed connection with {peer_id}");
-                } else {
-                    println!("Relay direct control connection established with {peer_id}");
+            event = swarm.select_next_some() => {
+                match event {
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        swarm.add_external_address(address.clone().with(Protocol::P2p(local_peer_id)));
+                        println!(
+                            "Relay listening on {}",
+                            address.with(Protocol::P2p(local_peer_id))
+                        );
+                    }
+                    SwarmEvent::ConnectionEstablished {
+                        peer_id, endpoint, ..
+                    } => {
+                        if endpoint.is_relayed() {
+                            println!("Relay observed relayed connection with {peer_id}");
+                        } else {
+                            println!("Relay direct control connection established with {peer_id}");
+                        }
+                    }
+                    SwarmEvent::Behaviour(RelayServerBehaviourEvent::Relay(event)) => {
+                        println!("Relay server event: {event:?}");
+                    }
+                    _ => {}
                 }
             }
-            SwarmEvent::Behaviour(RelayServerBehaviourEvent::Relay(event)) => {
-                println!("Relay server event: {event:?}");
-            }
-            _ => {}
         }
     }
 }
@@ -2447,123 +2526,131 @@ async fn run_mailbox_node(listen_addr: Multiaddr, db_path: &Path) -> AppResult<(
     println!("Mailbox is untrusted: it stores routing tokens and encrypted bytes only");
 
     loop {
-        match swarm.select_next_some().await {
-            SwarmEvent::NewListenAddr { address, .. } => {
-                println!(
-                    "Mailbox listening on {}",
-                    address.with(Protocol::P2p(local_peer_id))
-                );
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!("Ctrl+C received; mailbox shutting down cleanly");
+                return Ok(());
             }
-            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                println!("Mailbox connected to peer {peer_id}");
-            }
-            SwarmEvent::Behaviour(MailboxBehaviourEvent::Mailbox(
-                request_response::Event::Message {
-                    peer,
-                    message:
-                        request_response::Message::Request {
-                            request, channel, ..
+            event = swarm.select_next_some() => {
+                match event {
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        println!(
+                            "Mailbox listening on {}",
+                            address.with(Protocol::P2p(local_peer_id))
+                        );
+                    }
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        println!("Mailbox connected to peer {peer_id}");
+                    }
+                    SwarmEvent::Behaviour(MailboxBehaviourEvent::Mailbox(
+                        request_response::Event::Message {
+                            peer,
+                            message:
+                                request_response::Message::Request {
+                                    request, channel, ..
+                                },
+                            ..
                         },
-                    ..
-                },
-            )) => match request {
-                MailboxRequest::Deposit(envelope) => {
-                    println!(
-                        "[MAILBOX] storing opaque envelope id={} recipient_token={} encrypted_bytes={} expires_at={:?}",
-                        envelope.message_id,
-                        envelope.recipient_token,
-                        envelope.encrypted_payload.len(),
-                        envelope.expires_at_unix_secs
-                    );
-                    let message_id = envelope.message_id.clone();
-                    let record = MailboxEnvelopeRecord {
-                        message_id: envelope.message_id,
-                        recipient_token: envelope.recipient_token,
-                        encrypted_payload: envelope.encrypted_payload,
-                        created_at_unix_secs: mailbox_now_unix_secs(),
-                        expires_at_unix_secs: envelope.expires_at_unix_secs,
-                    };
-                    let response = match store.deposit(&record, mailbox_now_unix_secs()) {
-                        Ok(inserted) => {
-                            if inserted {
-                                println!(
-                                    "[MAILBOX] stored envelope {}, {} bytes",
-                                    record.message_id,
-                                    record.encrypted_payload.len()
-                                );
-                            } else {
-                                println!(
-                                    "[MAILBOX] duplicate deposit {}, keeping one row",
-                                    record.message_id
-                                );
-                            }
-                            MailboxResponse::Deposited { message_id }
+                    )) => match request {
+                        MailboxRequest::Deposit(envelope) => {
+                            println!(
+                                "[MAILBOX] storing opaque envelope id={} recipient_token={} encrypted_bytes={} expires_at={:?}",
+                                envelope.message_id,
+                                envelope.recipient_token,
+                                envelope.encrypted_payload.len(),
+                                envelope.expires_at_unix_secs
+                            );
+                            let message_id = envelope.message_id.clone();
+                            let record = MailboxEnvelopeRecord {
+                                message_id: envelope.message_id,
+                                recipient_token: envelope.recipient_token,
+                                encrypted_payload: envelope.encrypted_payload,
+                                created_at_unix_secs: mailbox_now_unix_secs(),
+                                expires_at_unix_secs: envelope.expires_at_unix_secs,
+                            };
+                            let response = match store.deposit(&record, mailbox_now_unix_secs()) {
+                                Ok(inserted) => {
+                                    if inserted {
+                                        println!(
+                                            "[MAILBOX] stored envelope {}, {} bytes",
+                                            record.message_id,
+                                            record.encrypted_payload.len()
+                                        );
+                                    } else {
+                                        println!(
+                                            "[MAILBOX] duplicate deposit {}, keeping one row",
+                                            record.message_id
+                                        );
+                                    }
+                                    MailboxResponse::Deposited { message_id }
+                                }
+                                Err(error) => MailboxResponse::Error(error.to_string()),
+                            };
+                            let _ = swarm
+                                .behaviour_mut()
+                                .mailbox
+                                .send_response(channel, response);
+                            println!("Mailbox accepted deposit request from {peer}");
                         }
-                        Err(error) => MailboxResponse::Error(error.to_string()),
-                    };
-                    let _ = swarm
-                        .behaviour_mut()
-                        .mailbox
-                        .send_response(channel, response);
-                    println!("Mailbox accepted deposit request from {peer}");
+                        MailboxRequest::Fetch { recipient_token } => {
+                            let envelopes =
+                                match store.fetch_pending(&recipient_token, mailbox_now_unix_secs()) {
+                                    Ok(records) => records
+                                        .into_iter()
+                                        .map(|record| OfflineEnvelope {
+                                            recipient_token: record.recipient_token,
+                                            message_id: record.message_id,
+                                            encrypted_payload: record.encrypted_payload,
+                                            expires_at_unix_secs: record.expires_at_unix_secs,
+                                        })
+                                        .collect::<Vec<_>>(),
+                                    Err(error) => {
+                                        let _ = swarm.behaviour_mut().mailbox.send_response(
+                                            channel,
+                                            MailboxResponse::Error(error.to_string()),
+                                        );
+                                        continue;
+                                    }
+                                };
+                            println!(
+                                "[MAILBOX] returning {} pending opaque envelope(s) for recipient_token={recipient_token}",
+                                envelopes.len()
+                            );
+                            let _ = swarm
+                                .behaviour_mut()
+                                .mailbox
+                                .send_response(channel, MailboxResponse::Pending { envelopes });
+                            println!("Mailbox accepted fetch request from {peer}");
+                        }
+                        MailboxRequest::Acknowledge { message_id } => {
+                            let response =
+                                match store.acknowledge_retrieval(&message_id, mailbox_now_unix_secs()) {
+                                    Ok(()) => {
+                                        println!("[MAILBOX] marked envelope {message_id} delivered");
+                                        MailboxResponse::Acknowledged { message_id }
+                                    }
+                                    Err(error) => MailboxResponse::Error(error.to_string()),
+                                };
+                            let _ = swarm
+                                .behaviour_mut()
+                                .mailbox
+                                .send_response(channel, response);
+                            println!("Mailbox accepted retrieval ACK from {peer}");
+                        }
+                    },
+                    SwarmEvent::Behaviour(MailboxBehaviourEvent::Mailbox(
+                        request_response::Event::ResponseSent { peer, .. },
+                    )) => {
+                        println!("Mailbox response sent to {peer}");
+                    }
+                    SwarmEvent::Behaviour(MailboxBehaviourEvent::Mailbox(
+                        request_response::Event::InboundFailure { peer, error, .. },
+                    )) => {
+                        println!("Mailbox inbound failure from {peer}: {error}");
+                    }
+                    _ => {}
                 }
-                MailboxRequest::Fetch { recipient_token } => {
-                    let envelopes =
-                        match store.fetch_pending(&recipient_token, mailbox_now_unix_secs()) {
-                            Ok(records) => records
-                                .into_iter()
-                                .map(|record| OfflineEnvelope {
-                                    recipient_token: record.recipient_token,
-                                    message_id: record.message_id,
-                                    encrypted_payload: record.encrypted_payload,
-                                    expires_at_unix_secs: record.expires_at_unix_secs,
-                                })
-                                .collect::<Vec<_>>(),
-                            Err(error) => {
-                                let _ = swarm.behaviour_mut().mailbox.send_response(
-                                    channel,
-                                    MailboxResponse::Error(error.to_string()),
-                                );
-                                continue;
-                            }
-                        };
-                    println!(
-                        "[MAILBOX] returning {} pending opaque envelope(s) for recipient_token={recipient_token}",
-                        envelopes.len()
-                    );
-                    let _ = swarm
-                        .behaviour_mut()
-                        .mailbox
-                        .send_response(channel, MailboxResponse::Pending { envelopes });
-                    println!("Mailbox accepted fetch request from {peer}");
-                }
-                MailboxRequest::Acknowledge { message_id } => {
-                    let response =
-                        match store.acknowledge_retrieval(&message_id, mailbox_now_unix_secs()) {
-                            Ok(()) => {
-                                println!("[MAILBOX] marked envelope {message_id} delivered");
-                                MailboxResponse::Acknowledged { message_id }
-                            }
-                            Err(error) => MailboxResponse::Error(error.to_string()),
-                        };
-                    let _ = swarm
-                        .behaviour_mut()
-                        .mailbox
-                        .send_response(channel, response);
-                    println!("Mailbox accepted retrieval ACK from {peer}");
-                }
-            },
-            SwarmEvent::Behaviour(MailboxBehaviourEvent::Mailbox(
-                request_response::Event::ResponseSent { peer, .. },
-            )) => {
-                println!("Mailbox response sent to {peer}");
             }
-            SwarmEvent::Behaviour(MailboxBehaviourEvent::Mailbox(
-                request_response::Event::InboundFailure { peer, error, .. },
-            )) => {
-                println!("Mailbox inbound failure from {peer}: {error}");
-            }
-            _ => {}
         }
     }
 }
@@ -2634,7 +2721,7 @@ async fn run_alice_mailbox_deposit(
         envelope.message_id,
         envelope.encrypted_payload.len()
     );
-    println!("Alice plaintext before mailbox deposit: {message}");
+    println!("Alice deposited encrypted mailbox envelope");
 
     let response = mailbox_request(
         mailbox_addr.clone(),

@@ -396,6 +396,7 @@ impl Storage {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn save_state_session_and_insert_message(
         &mut self,
         local_identity_id: &str,
@@ -470,6 +471,7 @@ impl Storage {
         tx.commit()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn save_state_session_message_and_outbox(
         &mut self,
         local_identity_id: &str,

@@ -491,6 +491,7 @@ fn advance_chain(chain_key: [u8; 32]) -> Result<([u8; 32], [u8; 32]), CryptoErro
     Ok((next_chain_key, message_key))
 }
 
+#[allow(clippy::type_complexity)]
 fn derive_dh_ratchet_state(
     root_key: [u8; 32],
     dh_output: [u8; 32],
@@ -2052,7 +2053,7 @@ mod hardening_tests {
                 self.replayed.push((id.to_string(), payload));
             }
             if faults.contains(&Fault::Reorder) {
-                self.logs.push(format!("[FAULT] reordered batch"));
+                self.logs.push("[FAULT] reordered batch".to_string());
                 delivered.reverse();
             }
 
@@ -2060,7 +2061,7 @@ mod hardening_tests {
         }
 
         fn flush_delayed(&mut self) -> Vec<Vec<u8>> {
-            let mut flushed = self.delayed.drain(..).collect::<Vec<_>>();
+            let mut flushed = std::mem::take(&mut self.delayed);
             flushed.sort_by(|left, right| right.0.cmp(&left.0));
             flushed.into_iter().map(|(_, payload)| payload).collect()
         }
@@ -2090,6 +2091,10 @@ mod hardening_tests {
         assert!(injector
             .deliver("M3", payload.clone(), &[Fault::Delay])
             .is_empty());
+        assert_ne!(
+            injector.deliver("M4", payload.clone(), &[Fault::Tamper(0)]),
+            vec![payload.clone()]
+        );
         assert_eq!(injector.flush_delayed(), vec![payload]);
         assert!(injector
             .logs
@@ -2099,6 +2104,10 @@ mod hardening_tests {
             .logs
             .iter()
             .any(|line| line == "[FAULT] delayed M3"));
+        assert!(injector
+            .logs
+            .iter()
+            .any(|line| line == "[FAULT] tampered M4"));
     }
 
     #[test]
@@ -2269,7 +2278,8 @@ mod hardening_tests {
         let receiver = Storage::open_in_memory().expect("receiver storage");
         let mut tampered_body = payload.clone();
 
-        tampered_body[tampered_body.len() / 2] ^= 0x01;
+        let middle = tampered_body.len() / 2;
+        tampered_body[middle] ^= 0x01;
         assert!(receive_for_bob(&receiver, &mut bob, &tampered_body).is_err());
 
         let (_alice, mut bob, tag_payload) = encrypted_payload_for_bob("M2", "tag check");
@@ -2339,7 +2349,7 @@ mod hardening_tests {
         let alice = Storage::open_in_memory().expect("alice");
         let bob = Storage::open_in_memory().expect("bob");
         let conversation = "hardening-crdt";
-        let events = vec![
+        let events = [
             crdt_message(conversation, "AliceDevice", 1, "message-1", "alice"),
             crdt_reaction(conversation, "BobDevice", 1, "message-1", "+1", "bob"),
             crdt_delete(conversation, "AliceDevice", 2, "message-1"),
@@ -2348,24 +2358,29 @@ mod hardening_tests {
         let mut fault = FaultInjector::default();
         let mut encoded = events
             .iter()
-            .map(|event| bincode::serialize(event).unwrap())
+            .cloned()
+            .map(HardeningEventWire::from)
+            .map(|event| bincode::serialize(&event).unwrap())
             .collect::<Vec<_>>();
         encoded.reverse();
 
         for payload in encoded.clone() {
-            let decoded: EventRecord = bincode::deserialize(&payload).unwrap();
+            let decoded: HardeningEventWire = bincode::deserialize(&payload).unwrap();
+            let decoded = EventRecord::from(decoded);
             alice.append_event(&decoded).unwrap();
         }
         for payload in fault.deliver(
             "events",
-            bincode::serialize(&events[0]).unwrap(),
+            bincode::serialize(&HardeningEventWire::from(events[0].clone())).unwrap(),
             &[Fault::Duplicate],
         ) {
-            let decoded: EventRecord = bincode::deserialize(&payload).unwrap();
+            let decoded: HardeningEventWire = bincode::deserialize(&payload).unwrap();
+            let decoded = EventRecord::from(decoded);
             bob.append_event(&decoded).unwrap();
         }
         for payload in encoded {
-            let decoded: EventRecord = bincode::deserialize(&payload).unwrap();
+            let decoded: HardeningEventWire = bincode::deserialize(&payload).unwrap();
+            let decoded = EventRecord::from(decoded);
             bob.append_event(&decoded).unwrap();
         }
 
