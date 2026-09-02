@@ -5,8 +5,9 @@ use ciphermesh::{
         now_unix_secs, EventRecord, MessageDirection, MessageRecord, MessageStatus, OutboxItem,
         OutboxStatus, Storage, VersionVector,
     },
-    verify_device_certificate, AccountIdentity, Alice, AliceState, Bob, BobState, DeviceIdentity,
-    InitialMessage, PreKeyBundle, RatchetMessage, SimulatedDirectory,
+    verify_authorized_sibling_devices, verify_device_certificate, AccountIdentity, Alice,
+    AliceState, Bob, BobState, DeviceCertificate, DeviceDeliveryEnvelope, DeviceIdentity,
+    DeviceSession, InitialMessage, PreKeyBundle, RatchetMessage, SimulatedDirectory,
 };
 use futures::StreamExt;
 use libp2p::{
@@ -140,6 +141,8 @@ async fn main() -> AppResult<()> {
         Some("sync-demo") => run_sync_demo(),
         Some("crdt-demo") => run_crdt_demo(),
         Some("device-demo") => run_device_identity_demo(),
+        Some("fanout-demo") => run_device_fanout_demo(),
+        Some("own-device-sync-demo") => run_own_device_sync_demo(),
         _ => {
             run_local_demo()?;
             print_usage();
@@ -216,6 +219,12 @@ fn print_usage() {
     println!();
     println!("Phase 5A account/device identity demo:");
     println!("  cargo run -- device-demo");
+    println!();
+    println!("Phase 5B per-device fanout demo:");
+    println!("  cargo run -- fanout-demo");
+    println!();
+    println!("Phase 5C own-device sync demo:");
+    println!("  cargo run -- own-device-sync-demo");
 }
 
 fn run_local_demo() -> AppResult<()> {
@@ -838,6 +847,123 @@ fn run_device_identity_demo() -> AppResult<()> {
     Ok(())
 }
 
+fn run_device_fanout_demo() -> AppResult<()> {
+    let mut storage = Storage::open_in_memory()?;
+    let alice_account = AccountIdentity::generate();
+    let alice_laptop = DeviceIdentity::generate(alice_account.account_id());
+    let alice_phone = DeviceIdentity::generate(alice_account.account_id());
+    let bob_device = DeviceIdentity::generate("bob-account");
+    let laptop_certificate = alice_account.authorize_device(&alice_laptop);
+    let phone_certificate = alice_account.authorize_device(&alice_phone);
+
+    persist_phase_5a_identity(&storage, &alice_account, &alice_laptop, &laptop_certificate)?;
+    persist_phase_5a_identity(&storage, &alice_account, &alice_phone, &phone_certificate)?;
+
+    let authorized_devices = storage
+        .device_certificates_for_account(alice_account.account_id())?
+        .into_iter()
+        .map(|blob| bincode::deserialize::<DeviceCertificate>(&blob))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut bob_sessions = BTreeMap::new();
+    for certificate in &authorized_devices {
+        let session =
+            bob_device.create_outbound_session(alice_account.public_key(), certificate)?;
+        bob_sessions.insert(certificate.device_id.clone(), session);
+    }
+    let mut laptop_session = alice_laptop.create_inbound_session(
+        bob_device.device_id().to_string(),
+        bob_device.x25519_public_key(),
+    )?;
+    let mut phone_session = alice_phone.create_inbound_session(
+        bob_device.device_id().to_string(),
+        bob_device.x25519_public_key(),
+    )?;
+
+    println!("Alice AccountId: {}", alice_account.account_id());
+    println!(
+        "Authorized Alice devices found: {}",
+        authorized_devices.len()
+    );
+    println!("Laptop DeviceId: {}", alice_laptop.device_id());
+    println!("Phone DeviceId: {}", alice_phone.device_id());
+
+    let laptop_first = encrypt_and_queue_device_delivery(
+        &mut storage,
+        bob_sessions
+            .get_mut(alice_laptop.device_id())
+            .ok_or("missing laptop session")?,
+        "logical-1",
+        "hello alice",
+    )?;
+    let phone_first = encrypt_and_queue_device_delivery(
+        &mut storage,
+        bob_sessions
+            .get_mut(alice_phone.device_id())
+            .ok_or("missing phone session")?,
+        "logical-1",
+        "hello alice",
+    )?;
+
+    println!(
+        "Logical message ID shared by both deliveries: {}",
+        laptop_first.logical_message_id == phone_first.logical_message_id
+    );
+    println!(
+        "Ciphertexts differ across devices: {}",
+        laptop_first.message.ciphertext != phone_first.message.ciphertext
+    );
+
+    let laptop_plaintext = laptop_session.decrypt(&laptop_first)?;
+    let phone_plaintext = phone_session.decrypt(&phone_first)?;
+    storage.mark_outbox_delivered(&delivery_outbox_id(&laptop_first))?;
+    storage.mark_outbox_delivered(&delivery_outbox_id(&phone_first))?;
+    println!("Laptop decrypted: {laptop_plaintext}");
+    println!("Phone decrypted: {phone_plaintext}");
+
+    let laptop_second = encrypt_and_queue_device_delivery(
+        &mut storage,
+        bob_sessions
+            .get_mut(alice_laptop.device_id())
+            .ok_or("missing laptop session")?,
+        "logical-2",
+        "second message",
+    )?;
+    let phone_second = encrypt_and_queue_device_delivery(
+        &mut storage,
+        bob_sessions
+            .get_mut(alice_phone.device_id())
+            .ok_or("missing phone session")?,
+        "logical-2",
+        "second message",
+    )?;
+
+    let laptop_second_plaintext = laptop_session.decrypt(&laptop_second)?;
+    storage.mark_outbox_delivered(&delivery_outbox_id(&laptop_second))?;
+    println!("Laptop received while Phone is offline: {laptop_second_plaintext}");
+    println!(
+        "Pending outbox deliveries while Phone is offline: {}",
+        storage.pending_outbox_items()?.len()
+    );
+
+    let pending_phone_delivery = storage
+        .pending_outbox_items()?
+        .into_iter()
+        .find(|item| item.recipient_id == alice_phone.device_id())
+        .ok_or("phone delivery did not remain pending")?;
+    let restored_phone_envelope: DeviceDeliveryEnvelope =
+        bincode::deserialize(&pending_phone_delivery.payload)?;
+    assert_eq!(restored_phone_envelope, phone_second);
+    let phone_second_plaintext = phone_session.decrypt(&restored_phone_envelope)?;
+    storage.mark_outbox_delivered(&pending_phone_delivery.message_id)?;
+    println!("Phone later reconnected and decrypted: {phone_second_plaintext}");
+    println!(
+        "Pending outbox deliveries after Phone ACK: {}",
+        storage.pending_outbox_items()?.len()
+    );
+
+    Ok(())
+}
+
 fn persist_phase_5a_identity(
     storage: &Storage,
     account: &AccountIdentity,
@@ -867,6 +993,41 @@ fn persist_phase_5a_identity(
     )?;
 
     Ok(())
+}
+
+fn encrypt_and_queue_device_delivery(
+    storage: &mut Storage,
+    session: &mut DeviceSession,
+    logical_message_id: &str,
+    plaintext: &str,
+) -> AppResult<DeviceDeliveryEnvelope> {
+    let envelope = session.encrypt(logical_message_id, plaintext)?;
+    let outbox_item = OutboxItem {
+        message_id: delivery_outbox_id(&envelope),
+        recipient_id: envelope.recipient_device_id.clone(),
+        payload: bincode::serialize(&envelope)?,
+        status: OutboxStatus::Pending,
+        retry_count: 0,
+        created_at_unix_secs: now_unix_secs(),
+        last_attempt_unix_secs: None,
+    };
+    let session_state = bincode::serialize(&session.export_state())?;
+
+    storage.save_device_pair_session_and_outbox(
+        session.local_device_id(),
+        session.remote_device_id(),
+        &session_state,
+        &outbox_item,
+    )?;
+
+    Ok(envelope)
+}
+
+fn delivery_outbox_id(envelope: &DeviceDeliveryEnvelope) -> String {
+    format!(
+        "{}:{}",
+        envelope.logical_message_id, envelope.recipient_device_id
+    )
 }
 
 fn demo_sync_event(device_id: &str, counter: u64) -> EventRecord {

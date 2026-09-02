@@ -153,6 +153,14 @@ impl Storage {
                 updated_at_unix_secs INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS device_pair_sessions (
+                local_device_id TEXT NOT NULL,
+                remote_device_id TEXT NOT NULL,
+                state BLOB NOT NULL,
+                updated_at_unix_secs INTEGER NOT NULL,
+                PRIMARY KEY (local_device_id, remote_device_id)
+            );
+
             CREATE TABLE IF NOT EXISTS messages (
                 message_id TEXT PRIMARY KEY,
                 conversation_id TEXT NOT NULL,
@@ -293,6 +301,54 @@ impl Storage {
             .query_row(
                 "SELECT state FROM sessions WHERE conversation_id = ?1",
                 params![conversation_id],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    pub fn save_device_pair_session(
+        &self,
+        local_device_id: &str,
+        remote_device_id: &str,
+        state: &[u8],
+    ) -> StorageResult<()> {
+        self.conn.execute(
+            "
+            INSERT INTO device_pair_sessions (
+                local_device_id,
+                remote_device_id,
+                state,
+                updated_at_unix_secs
+            )
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(local_device_id, remote_device_id) DO UPDATE SET
+                state = excluded.state,
+                updated_at_unix_secs = excluded.updated_at_unix_secs
+            ",
+            params![
+                local_device_id,
+                remote_device_id,
+                state,
+                now_unix_secs() as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_device_pair_session(
+        &self,
+        local_device_id: &str,
+        remote_device_id: &str,
+    ) -> StorageResult<Option<Vec<u8>>> {
+        self.conn
+            .query_row(
+                "
+                SELECT state
+                FROM device_pair_sessions
+                WHERE local_device_id = ?1
+                  AND remote_device_id = ?2
+                ",
+                params![local_device_id, remote_device_id],
                 |row| row.get(0),
             )
             .optional()
@@ -476,6 +532,61 @@ impl Storage {
                 &message.plaintext,
                 message.created_at_unix_secs as i64,
             ],
+        )?;
+        tx.execute(
+            "
+            INSERT INTO outbox (
+                message_id,
+                recipient_id,
+                payload,
+                status,
+                retry_count,
+                created_at_unix_secs,
+                last_attempt_unix_secs
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(message_id) DO UPDATE SET
+                recipient_id = excluded.recipient_id,
+                payload = excluded.payload,
+                status = excluded.status
+            ",
+            params![
+                &outbox.message_id,
+                &outbox.recipient_id,
+                &outbox.payload,
+                outbox.status.as_str(),
+                outbox.retry_count as i64,
+                outbox.created_at_unix_secs as i64,
+                outbox.last_attempt_unix_secs.map(|value| value as i64),
+            ],
+        )?;
+        tx.commit()
+    }
+
+    pub fn save_device_pair_session_and_outbox(
+        &mut self,
+        local_device_id: &str,
+        remote_device_id: &str,
+        session_state: &[u8],
+        outbox: &OutboxItem,
+    ) -> StorageResult<()> {
+        let tx = self.conn.transaction()?;
+        let now = now_unix_secs() as i64;
+
+        tx.execute(
+            "
+            INSERT INTO device_pair_sessions (
+                local_device_id,
+                remote_device_id,
+                state,
+                updated_at_unix_secs
+            )
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(local_device_id, remote_device_id) DO UPDATE SET
+                state = excluded.state,
+                updated_at_unix_secs = excluded.updated_at_unix_secs
+            ",
+            params![local_device_id, remote_device_id, session_state, now],
         )?;
         tx.execute(
             "
@@ -1088,6 +1199,66 @@ mod tests {
             .pending_outbox_items()
             .expect("pending after ack")
             .is_empty());
+    }
+
+    #[test]
+    fn device_pair_sessions_are_keyed_by_both_devices() {
+        let mut storage = Storage::open_in_memory().expect("open storage");
+        let laptop_outbox = OutboxItem {
+            message_id: "logical-1:alice-laptop".to_string(),
+            recipient_id: "alice-laptop".to_string(),
+            payload: b"laptop-envelope".to_vec(),
+            status: OutboxStatus::Pending,
+            retry_count: 0,
+            created_at_unix_secs: 10,
+            last_attempt_unix_secs: None,
+        };
+        let phone_outbox = OutboxItem {
+            message_id: "logical-1:alice-phone".to_string(),
+            recipient_id: "alice-phone".to_string(),
+            payload: b"phone-envelope".to_vec(),
+            status: OutboxStatus::Pending,
+            retry_count: 0,
+            created_at_unix_secs: 10,
+            last_attempt_unix_secs: None,
+        };
+
+        storage
+            .save_device_pair_session_and_outbox(
+                "bob-device",
+                "alice-laptop",
+                b"laptop-session",
+                &laptop_outbox,
+            )
+            .expect("save laptop session");
+        storage
+            .save_device_pair_session_and_outbox(
+                "bob-device",
+                "alice-phone",
+                b"phone-session",
+                &phone_outbox,
+            )
+            .expect("save phone session");
+
+        assert_eq!(
+            storage
+                .load_device_pair_session("bob-device", "alice-laptop")
+                .expect("load laptop"),
+            Some(b"laptop-session".to_vec())
+        );
+        assert_eq!(
+            storage
+                .load_device_pair_session("bob-device", "alice-phone")
+                .expect("load phone"),
+            Some(b"phone-session".to_vec())
+        );
+
+        storage
+            .mark_outbox_delivered("logical-1:alice-laptop")
+            .expect("deliver laptop");
+        let pending = storage.pending_outbox_items().expect("pending");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].recipient_id, "alice-phone");
     }
 
     #[test]

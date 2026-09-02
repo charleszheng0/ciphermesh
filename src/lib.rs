@@ -152,6 +152,21 @@ pub struct DeviceCertificate {
     pub signature: SignatureBytes,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceSessionState {
+    pub local_device_id: DeviceId,
+    pub remote_device_id: DeviceId,
+    pub session: RatchetSessionState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceDeliveryEnvelope {
+    pub logical_message_id: String,
+    pub sender_device_id: DeviceId,
+    pub recipient_device_id: DeviceId,
+    pub message: RatchetMessage,
+}
+
 pub struct AccountIdentity {
     account_id: AccountId,
     identity: IdentityKeyPair,
@@ -162,6 +177,12 @@ pub struct DeviceIdentity {
     device_id: DeviceId,
     signing: IdentityKeyPair,
     x25519: X25519KeyPair,
+}
+
+pub struct DeviceSession {
+    local_device_id: DeviceId,
+    remote_device_id: DeviceId,
+    session: RatchetSession,
 }
 
 struct X25519KeyPair {
@@ -759,6 +780,102 @@ impl DeviceIdentity {
     pub fn x25519_public_key(&self) -> PublicKeyBytes {
         self.x25519.public_key()
     }
+
+    pub fn create_outbound_session(
+        &self,
+        remote_account_public_key: IdentityPublicKeyBytes,
+        remote_certificate: &DeviceCertificate,
+    ) -> Result<DeviceSession, CryptoError> {
+        verify_device_certificate(remote_account_public_key, remote_certificate)?;
+        let key = self
+            .x25519
+            .derive_aead_key(remote_certificate.device_x25519_public_key)?;
+
+        Ok(DeviceSession {
+            local_device_id: self.device_id.clone(),
+            remote_device_id: remote_certificate.device_id.clone(),
+            session: RatchetSession::new(
+                key,
+                RatchetRole::Alice,
+                self.x25519.clone(),
+                remote_certificate.device_x25519_public_key,
+            )?,
+        })
+    }
+
+    pub fn create_inbound_session(
+        &self,
+        remote_device_id: impl Into<DeviceId>,
+        remote_device_x25519_public_key: PublicKeyBytes,
+    ) -> Result<DeviceSession, CryptoError> {
+        let key = self
+            .x25519
+            .derive_aead_key(remote_device_x25519_public_key)?;
+
+        Ok(DeviceSession {
+            local_device_id: self.device_id.clone(),
+            remote_device_id: remote_device_id.into(),
+            session: RatchetSession::new(
+                key,
+                RatchetRole::Bob,
+                self.x25519.clone(),
+                remote_device_x25519_public_key,
+            )?,
+        })
+    }
+}
+
+impl DeviceSession {
+    pub fn from_state(state: DeviceSessionState) -> Self {
+        Self {
+            local_device_id: state.local_device_id,
+            remote_device_id: state.remote_device_id,
+            session: RatchetSession::from_state(state.session),
+        }
+    }
+
+    pub fn export_state(&self) -> DeviceSessionState {
+        DeviceSessionState {
+            local_device_id: self.local_device_id.clone(),
+            remote_device_id: self.remote_device_id.clone(),
+            session: self.session.state(),
+        }
+    }
+
+    pub fn local_device_id(&self) -> &str {
+        &self.local_device_id
+    }
+
+    pub fn remote_device_id(&self) -> &str {
+        &self.remote_device_id
+    }
+
+    pub fn encrypt(
+        &mut self,
+        logical_message_id: impl Into<String>,
+        plaintext: &str,
+    ) -> Result<DeviceDeliveryEnvelope, CryptoError> {
+        Ok(DeviceDeliveryEnvelope {
+            logical_message_id: logical_message_id.into(),
+            sender_device_id: self.local_device_id.clone(),
+            recipient_device_id: self.remote_device_id.clone(),
+            message: self.session.encrypt(plaintext)?,
+        })
+    }
+
+    pub fn decrypt(&mut self, envelope: &DeviceDeliveryEnvelope) -> Result<String, CryptoError> {
+        if envelope.recipient_device_id != self.local_device_id
+            || envelope.sender_device_id != self.remote_device_id
+        {
+            return Err(CryptoError::Decrypt);
+        }
+
+        self.session.decrypt(&envelope.message)
+    }
+
+    pub fn session_state(&self) -> RatchetSessionState {
+        self.session.state()
+    }
 }
 
 pub fn verify_device_certificate(
@@ -777,6 +894,21 @@ pub fn verify_device_certificate(
     verifying_key
         .verify(&device_certificate_bytes(certificate), &signature)
         .map_err(|_| CryptoError::SignatureVerification)
+}
+
+pub fn verify_authorized_sibling_devices(
+    account_public_key: IdentityPublicKeyBytes,
+    first: &DeviceCertificate,
+    second: &DeviceCertificate,
+) -> Result<(), CryptoError> {
+    verify_device_certificate(account_public_key, first)?;
+    verify_device_certificate(account_public_key, second)?;
+
+    if first.account_id != second.account_id || first.device_id == second.device_id {
+        return Err(CryptoError::SignatureVerification);
+    }
+
+    Ok(())
 }
 
 fn account_id_for_public_key(public_key: IdentityPublicKeyBytes) -> AccountId {
@@ -1370,6 +1502,137 @@ mod tests {
 
         assert_eq!(account.account_id(), restored.account_id());
         assert_eq!(account.public_key(), restored.public_key());
+    }
+
+    #[test]
+    fn authorized_sibling_devices_verify_for_same_account() {
+        let account = AccountIdentity::generate();
+        let laptop = DeviceIdentity::generate(account.account_id());
+        let phone = DeviceIdentity::generate(account.account_id());
+        let laptop_cert = account.authorize_device(&laptop);
+        let phone_cert = account.authorize_device(&phone);
+
+        verify_authorized_sibling_devices(account.public_key(), &laptop_cert, &phone_cert)
+            .expect("same account siblings verify");
+    }
+
+    #[test]
+    fn sibling_device_check_rejects_other_account_certificate() {
+        let account = AccountIdentity::generate();
+        let other = AccountIdentity::generate();
+        let laptop = DeviceIdentity::generate(account.account_id());
+        let phone = DeviceIdentity::generate(other.account_id());
+        let laptop_cert = account.authorize_device(&laptop);
+        let phone_cert = other.authorize_device(&phone);
+
+        assert_eq!(
+            verify_authorized_sibling_devices(account.public_key(), &laptop_cert, &phone_cert),
+            Err(CryptoError::SignatureVerification)
+        );
+    }
+
+    #[test]
+    fn fanout_encrypts_separately_per_authorized_device() {
+        let (account, laptop, phone, bob, laptop_cert, phone_cert) = fanout_identities();
+        let mut laptop_sender = bob
+            .create_outbound_session(account.public_key(), &laptop_cert)
+            .expect("laptop sender session");
+        let mut phone_sender = bob
+            .create_outbound_session(account.public_key(), &phone_cert)
+            .expect("phone sender session");
+        let mut laptop_receiver = laptop
+            .create_inbound_session(bob.device_id().to_string(), bob.x25519_public_key())
+            .expect("laptop receiver session");
+        let mut phone_receiver = phone
+            .create_inbound_session(bob.device_id().to_string(), bob.x25519_public_key())
+            .expect("phone receiver session");
+
+        let laptop_envelope = laptop_sender
+            .encrypt("logical-1", "hello alice")
+            .expect("laptop encrypt");
+        let phone_envelope = phone_sender
+            .encrypt("logical-1", "hello alice")
+            .expect("phone encrypt");
+
+        assert_eq!(
+            laptop_envelope.logical_message_id,
+            phone_envelope.logical_message_id
+        );
+        assert_ne!(
+            laptop_envelope.message.ciphertext,
+            phone_envelope.message.ciphertext
+        );
+        assert_eq!(
+            laptop_receiver
+                .decrypt(&laptop_envelope)
+                .expect("laptop decrypt"),
+            "hello alice"
+        );
+        assert_eq!(
+            phone_receiver
+                .decrypt(&phone_envelope)
+                .expect("phone decrypt"),
+            "hello alice"
+        );
+    }
+
+    #[test]
+    fn incorrect_device_cannot_decrypt_another_device_envelope() {
+        let (account, laptop, phone, bob, laptop_cert, _) = fanout_identities();
+        let mut laptop_sender = bob
+            .create_outbound_session(account.public_key(), &laptop_cert)
+            .expect("laptop sender session");
+        let mut phone_receiver = phone
+            .create_inbound_session(bob.device_id().to_string(), bob.x25519_public_key())
+            .expect("phone receiver session");
+        let envelope = laptop_sender
+            .encrypt("logical-1", "for laptop only")
+            .expect("encrypt");
+
+        assert_eq!(phone_receiver.decrypt(&envelope), Err(CryptoError::Decrypt));
+        assert_eq!(envelope.recipient_device_id, laptop.device_id());
+    }
+
+    #[test]
+    fn per_device_session_counters_advance_independently() {
+        let (account, _, _, bob, laptop_cert, phone_cert) = fanout_identities();
+        let mut laptop_sender = bob
+            .create_outbound_session(account.public_key(), &laptop_cert)
+            .expect("laptop sender session");
+        let mut phone_sender = bob
+            .create_outbound_session(account.public_key(), &phone_cert)
+            .expect("phone sender session");
+
+        laptop_sender
+            .encrypt("logical-1", "first laptop copy")
+            .expect("first laptop encrypt");
+        laptop_sender
+            .encrypt("logical-2", "second laptop copy")
+            .expect("second laptop encrypt");
+        phone_sender
+            .encrypt("logical-1", "first phone copy")
+            .expect("phone encrypt");
+
+        assert_eq!(laptop_sender.session_state().send_count, 2);
+        assert_eq!(phone_sender.session_state().send_count, 1);
+    }
+
+    fn fanout_identities() -> (
+        AccountIdentity,
+        DeviceIdentity,
+        DeviceIdentity,
+        DeviceIdentity,
+        DeviceCertificate,
+        DeviceCertificate,
+    ) {
+        let account = AccountIdentity::generate();
+        let laptop = DeviceIdentity::generate(account.account_id());
+        let phone = DeviceIdentity::generate(account.account_id());
+        let bob = DeviceIdentity::generate("bob-account");
+        let laptop_cert = account.authorize_device(&laptop);
+        let phone_cert = account.authorize_device(&phone);
+
+        (account, laptop, phone, bob, laptop_cert, phone_cert)
     }
 
     #[test]
