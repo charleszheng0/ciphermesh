@@ -114,6 +114,24 @@ pub struct EventRecord {
     pub created_at_unix_secs: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContactRecord {
+    pub contact_id: String,
+    pub display_name: String,
+    pub identity_public_key: Vec<u8>,
+    pub discovery_hint: String,
+    pub saved_at_unix_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InviteRecord {
+    pub code_hash: String,
+    pub rendezvous_payload: String,
+    pub expires_at_unix_secs: u64,
+    pub consumed_at_unix_secs: Option<u64>,
+    pub created_at_unix_secs: u64,
+}
+
 pub struct Storage {
     conn: Connection,
 }
@@ -254,6 +272,22 @@ impl Storage {
                 updated_at_unix_secs INTEGER NOT NULL,
                 PRIMARY KEY (account_id, device_id)
             );
+
+            CREATE TABLE IF NOT EXISTS contacts (
+                contact_id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                identity_public_key BLOB NOT NULL,
+                discovery_hint TEXT NOT NULL,
+                saved_at_unix_secs INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS invite_records (
+                code_hash TEXT PRIMARY KEY,
+                rendezvous_payload TEXT NOT NULL,
+                expires_at_unix_secs INTEGER NOT NULL,
+                consumed_at_unix_secs INTEGER,
+                created_at_unix_secs INTEGER NOT NULL
+            );
             ",
         )
     }
@@ -305,6 +339,120 @@ impl Storage {
                 |row| row.get(0),
             )
             .optional()
+    }
+
+    pub fn save_contact(&self, contact: &ContactRecord) -> StorageResult<()> {
+        self.conn.execute(
+            "
+            INSERT INTO contacts (
+                contact_id,
+                display_name,
+                identity_public_key,
+                discovery_hint,
+                saved_at_unix_secs
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(contact_id) DO UPDATE SET
+                display_name = excluded.display_name,
+                identity_public_key = excluded.identity_public_key,
+                discovery_hint = excluded.discovery_hint,
+                saved_at_unix_secs = excluded.saved_at_unix_secs
+            ",
+            params![
+                &contact.contact_id,
+                &contact.display_name,
+                &contact.identity_public_key,
+                &contact.discovery_hint,
+                contact.saved_at_unix_secs as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_contact(&self, contact_id: &str) -> StorageResult<Option<ContactRecord>> {
+        self.conn
+            .query_row(
+                "
+                SELECT
+                    contact_id,
+                    display_name,
+                    identity_public_key,
+                    discovery_hint,
+                    saved_at_unix_secs
+                FROM contacts
+                WHERE contact_id = ?1
+                ",
+                params![contact_id],
+                contact_from_row,
+            )
+            .optional()
+    }
+
+    pub fn save_invite_record(&self, invite: &InviteRecord) -> StorageResult<()> {
+        self.conn.execute(
+            "
+            INSERT INTO invite_records (
+                code_hash,
+                rendezvous_payload,
+                expires_at_unix_secs,
+                consumed_at_unix_secs,
+                created_at_unix_secs
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(code_hash) DO UPDATE SET
+                rendezvous_payload = excluded.rendezvous_payload,
+                expires_at_unix_secs = excluded.expires_at_unix_secs,
+                consumed_at_unix_secs = excluded.consumed_at_unix_secs,
+                created_at_unix_secs = excluded.created_at_unix_secs
+            ",
+            params![
+                &invite.code_hash,
+                &invite.rendezvous_payload,
+                invite.expires_at_unix_secs as i64,
+                invite.consumed_at_unix_secs.map(|value| value as i64),
+                invite.created_at_unix_secs as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn consume_invite_record(
+        &self,
+        code_hash: &str,
+        now_unix_secs: u64,
+    ) -> StorageResult<Option<InviteRecord>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "
+            UPDATE invite_records
+            SET consumed_at_unix_secs = ?2
+            WHERE code_hash = ?1
+              AND consumed_at_unix_secs IS NULL
+              AND expires_at_unix_secs > ?2
+            ",
+            params![code_hash, now_unix_secs as i64],
+        )?;
+        if changed == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+
+        let invite = tx.query_row(
+            "
+            SELECT
+                code_hash,
+                rendezvous_payload,
+                expires_at_unix_secs,
+                consumed_at_unix_secs,
+                created_at_unix_secs
+            FROM invite_records
+            WHERE code_hash = ?1
+            ",
+            params![code_hash],
+            invite_from_row,
+        )?;
+        tx.commit()?;
+        Ok(Some(invite))
     }
 
     pub fn save_session(
@@ -1160,6 +1308,32 @@ fn outbox_item_from_row(row: &rusqlite::Row<'_>) -> StorageResult<OutboxItem> {
     })
 }
 
+fn contact_from_row(row: &rusqlite::Row<'_>) -> StorageResult<ContactRecord> {
+    let saved_at: i64 = row.get(4)?;
+
+    Ok(ContactRecord {
+        contact_id: row.get(0)?,
+        display_name: row.get(1)?,
+        identity_public_key: row.get(2)?,
+        discovery_hint: row.get(3)?,
+        saved_at_unix_secs: saved_at as u64,
+    })
+}
+
+fn invite_from_row(row: &rusqlite::Row<'_>) -> StorageResult<InviteRecord> {
+    let expires_at: i64 = row.get(2)?;
+    let consumed_at: Option<i64> = row.get(3)?;
+    let created_at: i64 = row.get(4)?;
+
+    Ok(InviteRecord {
+        code_hash: row.get(0)?,
+        rendezvous_payload: row.get(1)?,
+        expires_at_unix_secs: expires_at as u64,
+        consumed_at_unix_secs: consumed_at.map(|value| value as u64),
+        created_at_unix_secs: created_at as u64,
+    })
+}
+
 fn event_from_row(row: &rusqlite::Row<'_>) -> StorageResult<EventRecord> {
     let counter: i64 = row.get(1)?;
     let created_at: i64 = row.get(6)?;
@@ -1767,6 +1941,80 @@ mod tests {
                 storage.load_display_name().expect("load updated name"),
                 Some("Anonymous".to_string())
             );
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn invite_records_are_single_use_and_expire() {
+        let storage = Storage::open_in_memory().expect("storage");
+        storage
+            .save_invite_record(&InviteRecord {
+                code_hash: "hash-1".to_string(),
+                rendezvous_payload: "peer-hint".to_string(),
+                expires_at_unix_secs: 105,
+                consumed_at_unix_secs: None,
+                created_at_unix_secs: 100,
+            })
+            .expect("save invite");
+
+        let consumed = storage
+            .consume_invite_record("hash-1", 101)
+            .expect("consume")
+            .expect("invite");
+        assert_eq!(consumed.rendezvous_payload, "peer-hint");
+        assert_eq!(
+            storage
+                .consume_invite_record("hash-1", 102)
+                .expect("consume again"),
+            None
+        );
+
+        storage
+            .save_invite_record(&InviteRecord {
+                code_hash: "hash-2".to_string(),
+                rendezvous_payload: "expired".to_string(),
+                expires_at_unix_secs: 200,
+                consumed_at_unix_secs: None,
+                created_at_unix_secs: 100,
+            })
+            .expect("save expired invite");
+        assert_eq!(
+            storage
+                .consume_invite_record("hash-2", 200)
+                .expect("consume expired"),
+            None
+        );
+    }
+
+    #[test]
+    fn contact_records_persist_across_reopen() {
+        let path =
+            std::env::temp_dir().join(format!("ciphermesh-contact-{}.sqlite", now_unix_secs()));
+
+        {
+            let storage = Storage::open(&path).expect("open first");
+            storage
+                .save_contact(&ContactRecord {
+                    contact_id: "bob".to_string(),
+                    display_name: "Bob".to_string(),
+                    identity_public_key: b"bob-identity".to_vec(),
+                    discovery_hint: "rendezvous-hint".to_string(),
+                    saved_at_unix_secs: 123,
+                })
+                .expect("save contact");
+        }
+
+        {
+            let storage = Storage::open(&path).expect("open second");
+            let contact = storage
+                .load_contact("bob")
+                .expect("load contact")
+                .expect("contact");
+            assert_eq!(contact.display_name, "Bob");
+            assert_eq!(contact.identity_public_key, b"bob-identity");
+            assert_eq!(contact.discovery_hint, "rendezvous-hint");
         }
 
         let _ = std::fs::remove_file(path);

@@ -4,8 +4,8 @@ use ciphermesh::{
     is_device_currently_authorized,
     mailbox_storage::{mailbox_now_unix_secs, MailboxEnvelopeRecord, MailboxStorage},
     storage::{
-        now_unix_secs, EventRecord, MessageDirection, MessageRecord, MessageStatus, OutboxItem,
-        OutboxStatus, Storage, VersionVector,
+        now_unix_secs, ContactRecord, EventRecord, InviteRecord, MessageDirection, MessageRecord,
+        MessageStatus, OutboxItem, OutboxStatus, Storage, VersionVector,
     },
     verify_authorized_sibling_devices, verify_device_certificate, verify_device_revocation,
     AccountIdentity, Alice, AliceState, Bob, BobState, DeviceCertificate, DeviceDeliveryEnvelope,
@@ -13,6 +13,7 @@ use ciphermesh::{
     SimulatedDirectory,
 };
 use futures::StreamExt;
+use getrandom::fill as fill_random;
 use libp2p::{
     autonat, dcutr, identify, identity, kad, mdns,
     multiaddr::Protocol,
@@ -46,6 +47,9 @@ const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAILBOX_ENVELOPE_TTL_SECS: u64 = 5 * 60;
 const MAILBOX_MAX_ENVELOPES: usize = 64;
 const CHAT_PROMPT: &str = "> You: ";
+const INVITE_CODE_LEN: usize = 6;
+const INVITE_TTL_SECS: u64 = 5 * 60;
+const INVITE_CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 #[tokio::main]
 async fn main() -> AppResult<()> {
@@ -142,6 +146,13 @@ async fn main() -> AppResult<()> {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("target/ciphermesh-bob-mailbox.sqlite"));
             run_bob_mailbox_fetch(mailbox_addr, &db_path).await
+        }
+        Some("invite-demo") => {
+            let db_path = args
+                .get(2)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("target/ciphermesh-invite-demo.sqlite"));
+            run_invite_demo(&db_path)
         }
         Some("restart-demo") => {
             let db_path = args
@@ -264,6 +275,9 @@ fn print_usage() {
         "  Terminal 2: cargo run -- alice-mailbox <mailbox-multiaddr> \"hello offline bob\" target/alice-mailbox.db"
     );
     println!("  Terminal 3: cargo run -- bob-mailbox <mailbox-multiaddr> target/bob-mailbox.db");
+    println!();
+    println!("Short-lived invite-code pairing demo:");
+    println!("  cargo run -- invite-demo [target/ciphermesh-invite-demo.sqlite]");
     println!();
     println!("Phase 4A SQLite restart demo:");
     println!("  cargo run -- restart-demo [target/ciphermesh-4a-demo.sqlite]");
@@ -719,6 +733,171 @@ fn run_outbox_demo(db_path: &Path) -> AppResult<()> {
     }
 
     Ok(())
+}
+
+fn run_invite_demo(db_path: &Path) -> AppResult<()> {
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if db_path.exists() {
+        std::fs::remove_file(db_path)?;
+    }
+
+    let storage = Storage::open(db_path)?;
+    let code = generate_invite_code()?;
+    let code_hash = invite_code_hash(&code);
+    let now = now_unix_secs();
+    let mut alice = Alice::local();
+    let mut bob = Bob::local();
+    let alice_exchange = alice.signed_key_exchange();
+    let bob_exchange = bob.signed_key_exchange();
+    let rendezvous_payload = bincode::serialize(&bob_exchange)?;
+
+    storage.save_invite_record(&InviteRecord {
+        code_hash: code_hash.clone(),
+        rendezvous_payload: hex_encode(&rendezvous_payload),
+        expires_at_unix_secs: now + INVITE_TTL_SECS,
+        consumed_at_unix_secs: None,
+        created_at_unix_secs: now,
+    })?;
+
+    println!("Create invite");
+    println!("Invite: {code}");
+    println!("Invite expires in 5 minutes");
+    println!("Waiting for peer");
+
+    let entered_code = normalize_invite_code(&code)?;
+    let invite = storage
+        .consume_invite_record(&invite_code_hash(&entered_code), now + 1)?
+        .ok_or("invalid invite")?;
+    let resolved_bob_exchange = bob_exchange_from_payload(&invite.rendezvous_payload)?;
+
+    println!("Join with invite code");
+    println!("Pairing...");
+    alice.derive_session_key(&resolved_bob_exchange)?;
+    bob.derive_session_key(&alice_exchange)?;
+
+    let safety_number = safety_number(
+        &alice_exchange.identity_public_key,
+        &resolved_bob_exchange.identity_public_key,
+    );
+    let conversation_id = format!("invite-{}", invite_code_hash(&entered_code));
+    storage.save_local_identity(
+        "alice-invite-demo",
+        "alice",
+        &bincode::serialize(&alice.export_state())?,
+    )?;
+    storage.save_local_identity(
+        "bob-invite-demo",
+        "bob",
+        &bincode::serialize(&bob.export_state())?,
+    )?;
+    storage.save_session(
+        &conversation_id,
+        "bob-contact",
+        "alice",
+        &bincode::serialize(
+            &alice
+                .session_state()
+                .ok_or("Alice session missing after invite pairing")?,
+        )?,
+    )?;
+    storage.save_contact(&ContactRecord {
+        contact_id: "bob-contact".to_string(),
+        display_name: "Bob".to_string(),
+        identity_public_key: resolved_bob_exchange.identity_public_key.to_vec(),
+        discovery_hint: "resolved through short-lived invite rendezvous".to_string(),
+        saved_at_unix_secs: now + 1,
+    })?;
+
+    println!("Identity established");
+    println!("Contact saved");
+    println!("Connected securely to Bob");
+    println!("Safety number: {safety_number}");
+
+    if storage
+        .consume_invite_record(&code_hash, now + 2)?
+        .is_none()
+    {
+        println!("Invite already used");
+    }
+
+    Ok(())
+}
+
+fn generate_invite_code() -> AppResult<String> {
+    let mut random = [0u8; INVITE_CODE_LEN];
+    fill_random(&mut random)?;
+    Ok(random
+        .iter()
+        .map(|byte| {
+            let index = (*byte as usize) % INVITE_CODE_ALPHABET.len();
+            INVITE_CODE_ALPHABET[index] as char
+        })
+        .collect())
+}
+
+fn normalize_invite_code(code: &str) -> AppResult<String> {
+    let normalized = code
+        .chars()
+        .filter(|ch| !ch.is_whitespace() && *ch != '-')
+        .map(|ch| ch.to_ascii_uppercase())
+        .collect::<String>();
+
+    if normalized.len() != INVITE_CODE_LEN {
+        return Err(format!("invite code must be {INVITE_CODE_LEN} characters").into());
+    }
+    if !normalized
+        .bytes()
+        .all(|byte| INVITE_CODE_ALPHABET.contains(&byte))
+    {
+        return Err("invite code contains unsupported characters".into());
+    }
+
+    Ok(normalized)
+}
+
+fn invite_code_hash(code: &str) -> String {
+    let normalized = code.to_ascii_uppercase();
+    let mut hasher = Sha256::new();
+    hasher.update(b"ciphermesh.invite-code.v1");
+    hasher.update(normalized.as_bytes());
+    hex_encode(&hasher.finalize()[..16])
+}
+
+fn bob_exchange_from_payload(payload_hex: &str) -> AppResult<ciphermesh::SignedKeyExchange> {
+    let payload = hex_decode(payload_hex)?;
+    Ok(bincode::deserialize(&payload)?)
+}
+
+fn safety_number(first_identity: &[u8; 32], second_identity: &[u8; 32]) -> String {
+    let (low, high) = if first_identity <= second_identity {
+        (first_identity, second_identity)
+    } else {
+        (second_identity, first_identity)
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(b"ciphermesh.safety-number.v1");
+    hasher.update(low);
+    hasher.update(high);
+    hex_encode(&hasher.finalize()[..20])
+}
+
+fn hex_decode(value: &str) -> AppResult<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        return Err("hex value has odd length".into());
+    }
+
+    value
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| {
+            let text = std::str::from_utf8(chunk)?;
+            Ok(u8::from_str_radix(text, 16)?)
+        })
+        .collect::<AppResult<Vec<_>>>()
 }
 
 fn run_sync_demo() -> AppResult<()> {
@@ -3607,5 +3786,26 @@ mod discovery_tests {
 
         assert_eq!(message, Some("hello bob"));
         assert!(bootstrap.is_empty());
+    }
+
+    #[test]
+    fn generated_invite_code_is_six_characters() {
+        let code = generate_invite_code().expect("invite code");
+
+        assert_eq!(code.len(), INVITE_CODE_LEN);
+        assert_eq!(code.len(), 6);
+        assert!(code
+            .bytes()
+            .all(|byte| INVITE_CODE_ALPHABET.contains(&byte)));
+    }
+
+    #[test]
+    fn invite_code_normalization_accepts_exactly_six_characters() {
+        assert_eq!(
+            normalize_invite_code("ab-c2d3").expect("normalized"),
+            "ABC2D3"
+        );
+        assert!(normalize_invite_code("ABCDE").is_err());
+        assert!(normalize_invite_code("ABCDEFG").is_err());
     }
 }
