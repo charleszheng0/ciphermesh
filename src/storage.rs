@@ -136,6 +136,28 @@ pub struct InviteRecord {
 pub struct ChatSummary {
     pub contact: ContactRecord,
     pub last_message: Option<MessageRecord>,
+    pub pending_count: usize,
+    pub last_seen_at_unix_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnownPeerRecord {
+    pub peer_id: String,
+    pub identity_public_key: Vec<u8>,
+    pub display_name: String,
+    pub conversation_id: String,
+    pub last_seen_at_unix_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPeerMessage {
+    pub message_id: String,
+    pub peer_id: String,
+    pub conversation_id: String,
+    pub plaintext: String,
+    pub created_at_unix_secs: u64,
+    pub retry_count: u64,
+    pub last_attempt_unix_secs: Option<u64>,
 }
 
 pub struct Storage {
@@ -287,6 +309,27 @@ impl Storage {
                 saved_at_unix_secs INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS known_peers (
+                peer_id TEXT PRIMARY KEY,
+                identity_public_key BLOB NOT NULL,
+                display_name TEXT NOT NULL,
+                conversation_id TEXT NOT NULL UNIQUE,
+                last_seen_at_unix_secs INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS pending_peer_messages (
+                message_id TEXT PRIMARY KEY,
+                peer_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                plaintext TEXT NOT NULL,
+                created_at_unix_secs INTEGER NOT NULL,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                last_attempt_unix_secs INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS pending_peer_messages_peer_idx
+            ON pending_peer_messages (peer_id, created_at_unix_secs, message_id);
+
             CREATE TABLE IF NOT EXISTS invite_records (
                 code_hash TEXT PRIMARY KEY,
                 rendezvous_payload TEXT NOT NULL,
@@ -416,12 +459,213 @@ impl Storage {
             .into_iter()
             .map(|contact| {
                 let last_message = self.last_message_for_conversation(&contact.contact_id)?;
+                let pending_count = self.pending_peer_message_count(&contact.contact_id)?;
+                let last_seen_at_unix_secs = self
+                    .known_peer_for_conversation(&contact.contact_id)?
+                    .map(|peer| peer.last_seen_at_unix_secs);
                 Ok(ChatSummary {
                     contact,
                     last_message,
+                    pending_count,
+                    last_seen_at_unix_secs,
                 })
             })
             .collect()
+    }
+
+    pub fn recent_chat_summaries(&self, limit: usize) -> StorageResult<Vec<ChatSummary>> {
+        self.chat_summaries_page(limit, 0)
+    }
+
+    pub fn chat_summary_count(&self) -> StorageResult<usize> {
+        let count = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM contacts", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        Ok(count as usize)
+    }
+
+    pub fn chat_summaries_page(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> StorageResult<Vec<ChatSummary>> {
+        let mut statement = self.conn.prepare(
+            "
+            SELECT
+                c.contact_id,
+                c.display_name,
+                c.identity_public_key,
+                c.discovery_hint,
+                c.saved_at_unix_secs,
+                m.message_id,
+                m.conversation_id,
+                m.sender_id,
+                m.recipient_id,
+                m.direction,
+                m.status,
+                m.protocol_counter,
+                m.ciphertext,
+                m.plaintext,
+                m.created_at_unix_secs,
+                kp.last_seen_at_unix_secs,
+                (
+                    SELECT COUNT(*)
+                    FROM pending_peer_messages ppm
+                    WHERE ppm.conversation_id = c.contact_id
+                ) AS pending_count
+            FROM contacts c
+            LEFT JOIN known_peers kp
+              ON kp.conversation_id = c.contact_id
+            LEFT JOIN messages m
+              ON m.message_id = (
+                  SELECT message_id
+                  FROM messages
+                  WHERE conversation_id = c.contact_id
+                  ORDER BY created_at_unix_secs DESC, protocol_counter DESC, message_id DESC
+                  LIMIT 1
+              )
+            ORDER BY
+                COALESCE(m.created_at_unix_secs, c.saved_at_unix_secs) DESC,
+                c.display_name COLLATE NOCASE,
+                c.contact_id
+            LIMIT ?1 OFFSET ?2
+            ",
+        )?;
+        let rows =
+            statement.query_map(params![limit as i64, offset as i64], chat_summary_from_row)?;
+        rows.collect()
+    }
+
+    pub fn save_known_peer(&self, peer: &KnownPeerRecord) -> StorageResult<()> {
+        self.conn.execute(
+            "
+            INSERT INTO known_peers (
+                peer_id,
+                identity_public_key,
+                display_name,
+                conversation_id,
+                last_seen_at_unix_secs
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(peer_id) DO UPDATE SET
+                identity_public_key = excluded.identity_public_key,
+                display_name = excluded.display_name,
+                conversation_id = excluded.conversation_id,
+                last_seen_at_unix_secs = excluded.last_seen_at_unix_secs
+            ",
+            params![
+                &peer.peer_id,
+                &peer.identity_public_key,
+                &peer.display_name,
+                &peer.conversation_id,
+                peer.last_seen_at_unix_secs as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn known_peer_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> StorageResult<Option<KnownPeerRecord>> {
+        self.conn
+            .query_row(
+                "
+                SELECT
+                    peer_id,
+                    identity_public_key,
+                    display_name,
+                    conversation_id,
+                    last_seen_at_unix_secs
+                FROM known_peers
+                WHERE conversation_id = ?1
+                ",
+                params![conversation_id],
+                known_peer_from_row,
+            )
+            .optional()
+    }
+
+    pub fn pending_peer_message_count(&self, conversation_id: &str) -> StorageResult<usize> {
+        let count = self.conn.query_row(
+            "SELECT COUNT(*) FROM pending_peer_messages WHERE conversation_id = ?1",
+            params![conversation_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    pub fn queue_pending_peer_message(&self, message: &PendingPeerMessage) -> StorageResult<()> {
+        self.conn.execute(
+            "
+            INSERT OR IGNORE INTO pending_peer_messages (
+                message_id,
+                peer_id,
+                conversation_id,
+                plaintext,
+                created_at_unix_secs,
+                retry_count,
+                last_attempt_unix_secs
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ",
+            params![
+                &message.message_id,
+                &message.peer_id,
+                &message.conversation_id,
+                &message.plaintext,
+                message.created_at_unix_secs as i64,
+                message.retry_count as i64,
+                message.last_attempt_unix_secs.map(|value| value as i64),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn pending_peer_messages_for_peer(
+        &self,
+        peer_id: &str,
+    ) -> StorageResult<Vec<PendingPeerMessage>> {
+        let mut statement = self.conn.prepare(
+            "
+            SELECT
+                message_id,
+                peer_id,
+                conversation_id,
+                plaintext,
+                created_at_unix_secs,
+                retry_count,
+                last_attempt_unix_secs
+            FROM pending_peer_messages
+            WHERE peer_id = ?1
+            ORDER BY created_at_unix_secs, message_id
+            ",
+        )?;
+        let rows = statement.query_map(params![peer_id], pending_peer_message_from_row)?;
+        rows.collect()
+    }
+
+    pub fn record_pending_peer_message_attempt(&self, message_id: &str) -> StorageResult<()> {
+        self.conn.execute(
+            "
+            UPDATE pending_peer_messages
+            SET retry_count = retry_count + 1,
+                last_attempt_unix_secs = ?2
+            WHERE message_id = ?1
+            ",
+            params![message_id, now_unix_secs() as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_pending_peer_message(&self, message_id: &str) -> StorageResult<()> {
+        self.conn.execute(
+            "DELETE FROM pending_peer_messages WHERE message_id = ?1",
+            params![message_id],
+        )?;
+        Ok(())
     }
 
     pub fn save_invite_record(&self, invite: &InviteRecord) -> StorageResult<()> {
@@ -608,6 +852,27 @@ impl Storage {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn update_message_status(
+        &self,
+        message_id: &str,
+        status: MessageStatus,
+    ) -> StorageResult<()> {
+        self.conn.execute(
+            "UPDATE messages SET status = ?2 WHERE message_id = ?1",
+            params![message_id, status.as_str()],
+        )?;
+        Ok(())
+    }
+
+    pub fn message_exists(&self, message_id: &str) -> StorageResult<bool> {
+        let count = self.conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE message_id = ?1",
+            params![message_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count > 0)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1374,6 +1639,68 @@ fn contact_from_row(row: &rusqlite::Row<'_>) -> StorageResult<ContactRecord> {
     })
 }
 
+fn chat_summary_from_row(row: &rusqlite::Row<'_>) -> StorageResult<ChatSummary> {
+    let contact = contact_from_row(row)?;
+    let message_id = row.get::<_, Option<String>>(5)?;
+    let last_message = match message_id {
+        Some(message_id) => {
+            let direction: String = row.get(9)?;
+            let status: String = row.get(10)?;
+            let protocol_counter: Option<i64> = row.get(11)?;
+            let created_at: i64 = row.get(14)?;
+
+            Some(MessageRecord {
+                message_id,
+                conversation_id: row.get(6)?,
+                sender_id: row.get(7)?,
+                recipient_id: row.get(8)?,
+                direction: MessageDirection::from_str(&direction),
+                status: MessageStatus::from_str(&status),
+                protocol_counter: protocol_counter.map(|value| value as u64),
+                ciphertext: row.get(12)?,
+                plaintext: row.get(13)?,
+                created_at_unix_secs: created_at as u64,
+            })
+        }
+        None => None,
+    };
+
+    Ok(ChatSummary {
+        contact,
+        last_message,
+        last_seen_at_unix_secs: row.get::<_, Option<i64>>(15)?.map(|value| value as u64),
+        pending_count: row.get::<_, i64>(16)? as usize,
+    })
+}
+
+fn known_peer_from_row(row: &rusqlite::Row<'_>) -> StorageResult<KnownPeerRecord> {
+    let last_seen_at: i64 = row.get(4)?;
+
+    Ok(KnownPeerRecord {
+        peer_id: row.get(0)?,
+        identity_public_key: row.get(1)?,
+        display_name: row.get(2)?,
+        conversation_id: row.get(3)?,
+        last_seen_at_unix_secs: last_seen_at as u64,
+    })
+}
+
+fn pending_peer_message_from_row(row: &rusqlite::Row<'_>) -> StorageResult<PendingPeerMessage> {
+    let created_at: i64 = row.get(4)?;
+    let retry_count: i64 = row.get(5)?;
+    let last_attempt: Option<i64> = row.get(6)?;
+
+    Ok(PendingPeerMessage {
+        message_id: row.get(0)?,
+        peer_id: row.get(1)?,
+        conversation_id: row.get(2)?,
+        plaintext: row.get(3)?,
+        created_at_unix_secs: created_at as u64,
+        retry_count: retry_count as u64,
+        last_attempt_unix_secs: last_attempt.map(|value| value as u64),
+    })
+}
+
 fn message_from_row(row: &rusqlite::Row<'_>) -> StorageResult<MessageRecord> {
     let direction: String = row.get(4)?;
     let status: String = row.get(5)?;
@@ -2124,6 +2451,149 @@ mod tests {
     }
 
     #[test]
+    fn recent_chat_summaries_sort_by_activity_and_paginate() {
+        let storage = Storage::open_in_memory().expect("storage");
+        for (contact_id, display_name, saved_at) in [
+            ("contact-alice", "Alice", 100),
+            ("contact-bob", "Bob", 200),
+            ("contact-charles", "Charles", 300),
+            ("contact-david", "David", 400),
+        ] {
+            storage
+                .save_contact(&ContactRecord {
+                    contact_id: contact_id.to_string(),
+                    display_name: display_name.to_string(),
+                    identity_public_key: format!("{display_name}-identity").into_bytes(),
+                    discovery_hint: "direct QUIC".to_string(),
+                    saved_at_unix_secs: saved_at,
+                })
+                .expect("save contact");
+        }
+        storage
+            .insert_message(&message_at(
+                "msg-alice",
+                "contact-alice",
+                "newest message",
+                900,
+            ))
+            .expect("insert alice message");
+        storage
+            .insert_message(&message_at(
+                "msg-charles",
+                "contact-charles",
+                "older message",
+                500,
+            ))
+            .expect("insert charles message");
+
+        let recent = storage.recent_chat_summaries(3).expect("recent chats");
+        assert_eq!(
+            recent
+                .iter()
+                .map(|summary| summary.contact.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Alice", "Charles", "David"]
+        );
+        assert_eq!(storage.chat_summary_count().expect("chat count"), 4);
+
+        let second_page = storage.chat_summaries_page(2, 2).expect("second chat page");
+        assert_eq!(
+            second_page
+                .iter()
+                .map(|summary| summary.contact.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["David", "Bob"]
+        );
+    }
+
+    #[test]
+    fn known_peers_and_pending_messages_persist_without_duplicates() {
+        let path =
+            std::env::temp_dir().join(format!("ciphermesh-known-peer-{}.sqlite", now_unix_secs()));
+
+        {
+            let storage = Storage::open(&path).expect("open first");
+            storage
+                .save_known_peer(&KnownPeerRecord {
+                    peer_id: "peer-1".to_string(),
+                    identity_public_key: b"identity-1".to_vec(),
+                    display_name: "Alice".to_string(),
+                    conversation_id: "conversation-1".to_string(),
+                    last_seen_at_unix_secs: 100,
+                })
+                .expect("save known peer");
+            storage
+                .save_known_peer(&KnownPeerRecord {
+                    peer_id: "peer-1".to_string(),
+                    identity_public_key: b"identity-1".to_vec(),
+                    display_name: "Alice Updated".to_string(),
+                    conversation_id: "conversation-1".to_string(),
+                    last_seen_at_unix_secs: 200,
+                })
+                .expect("update known peer");
+            storage
+                .queue_pending_peer_message(&PendingPeerMessage {
+                    message_id: "pending-1".to_string(),
+                    peer_id: "peer-1".to_string(),
+                    conversation_id: "conversation-1".to_string(),
+                    plaintext: "hello offline".to_string(),
+                    created_at_unix_secs: 300,
+                    retry_count: 0,
+                    last_attempt_unix_secs: None,
+                })
+                .expect("queue pending");
+            storage
+                .queue_pending_peer_message(&PendingPeerMessage {
+                    message_id: "pending-1".to_string(),
+                    peer_id: "peer-1".to_string(),
+                    conversation_id: "conversation-1".to_string(),
+                    plaintext: "hello offline".to_string(),
+                    created_at_unix_secs: 300,
+                    retry_count: 0,
+                    last_attempt_unix_secs: None,
+                })
+                .expect("ignore duplicate pending");
+        }
+
+        {
+            let storage = Storage::open(&path).expect("open second");
+            let peer = storage
+                .known_peer_for_conversation("conversation-1")
+                .expect("load peer")
+                .expect("peer exists");
+            assert_eq!(peer.peer_id, "peer-1");
+            assert_eq!(peer.display_name, "Alice Updated");
+            assert_eq!(peer.last_seen_at_unix_secs, 200);
+
+            let pending = storage
+                .pending_peer_messages_for_peer("peer-1")
+                .expect("pending");
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].plaintext, "hello offline");
+
+            storage
+                .record_pending_peer_message_attempt("pending-1")
+                .expect("record attempt");
+            assert_eq!(
+                storage
+                    .pending_peer_messages_for_peer("peer-1")
+                    .expect("pending after attempt")[0]
+                    .retry_count,
+                1
+            );
+            storage
+                .remove_pending_peer_message("pending-1")
+                .expect("remove pending");
+            assert!(storage
+                .pending_peer_messages_for_peer("peer-1")
+                .expect("pending after remove")
+                .is_empty());
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn chat_history_survives_reopen_and_clear_is_local() {
         let path =
             std::env::temp_dir().join(format!("ciphermesh-history-{}.sqlite", now_unix_secs()));
@@ -2219,6 +2689,15 @@ mod tests {
     }
 
     fn message(message_id: &str, conversation_id: &str, plaintext: &str) -> MessageRecord {
+        message_at(message_id, conversation_id, plaintext, 120)
+    }
+
+    fn message_at(
+        message_id: &str,
+        conversation_id: &str,
+        plaintext: &str,
+        created_at_unix_secs: u64,
+    ) -> MessageRecord {
         MessageRecord {
             message_id: message_id.to_string(),
             conversation_id: conversation_id.to_string(),
@@ -2229,7 +2708,7 @@ mod tests {
             protocol_counter: Some(1),
             ciphertext: b"ciphertext".to_vec(),
             plaintext: Some(plaintext.to_string()),
-            created_at_unix_secs: 120,
+            created_at_unix_secs,
         }
     }
 }

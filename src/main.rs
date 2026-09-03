@@ -4,8 +4,9 @@ use ciphermesh::{
     is_device_currently_authorized,
     mailbox_storage::{mailbox_now_unix_secs, MailboxEnvelopeRecord, MailboxStorage},
     storage::{
-        now_unix_secs, ContactRecord, EventRecord, InviteRecord, MessageDirection, MessageRecord,
-        MessageStatus, OutboxItem, OutboxStatus, Storage, VersionVector,
+        now_unix_secs, ChatSummary, ContactRecord, EventRecord, InviteRecord, KnownPeerRecord,
+        MessageDirection, MessageRecord, MessageStatus, OutboxItem, OutboxStatus,
+        PendingPeerMessage, Storage, VersionVector,
     },
     verify_authorized_sibling_devices, verify_device_certificate, verify_device_revocation,
     AccountIdentity, Alice, AliceState, Bob, BobState, DeviceCertificate, DeviceDeliveryEnvelope,
@@ -46,12 +47,16 @@ const MAILBOX_PROTOCOL: &str = "/ciphermesh/mailbox/3d/1.0.0";
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAILBOX_ENVELOPE_TTL_SECS: u64 = 5 * 60;
 const MAILBOX_MAX_ENVELOPES: usize = 64;
-const CHAT_PROMPT: &str = "> You: ";
+const CHAT_PROMPT: &str = "> ";
+const CHAT_INPUT_INSTRUCTION: &str = "Type a message, or /back to return to Chat History.";
 const INVITE_CODE_LEN: usize = 6;
 const INVITE_TTL_SECS: u64 = 5 * 60;
 const INVITE_CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const DEFAULT_INVITE_DB: &str = "target/ciphermesh-invites.sqlite";
 const DEFAULT_INVITE_LISTEN_ADDR: &str = "127.0.0.1:5000";
+const RECENT_CHAT_LIMIT: usize = 3;
+const CHAT_HISTORY_PAGE_SIZE: usize = 6;
+const PENDING_DELIVERY_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> AppResult<()> {
@@ -869,93 +874,304 @@ fn run_invite_demo(db_path: &Path) -> AppResult<()> {
     Ok(())
 }
 
+enum ScreenAction {
+    Stay,
+    Back,
+    Quit,
+}
+
 async fn run_product_menu() -> AppResult<()> {
+    loop {
+        match run_main_menu_screen().await? {
+            ScreenAction::Stay | ScreenAction::Back => {}
+            ScreenAction::Quit => return Ok(()),
+        }
+    }
+}
+
+async fn run_main_menu_screen() -> AppResult<ScreenAction> {
     println!("CipherMesh");
     println!();
     println!("[1] Create invite");
     println!("[2] Join invite");
-    println!("[3] Open chats");
+    println!("[3] Chat History");
+    println!("[Q] Quit");
     println!();
 
     match prompt_line("Select: ")?.trim() {
         "1" => {
-            let rendezvous_db = PathBuf::from(DEFAULT_INVITE_DB);
-            let listen_addr = DEFAULT_INVITE_LISTEN_ADDR.parse()?;
-            run_create_invite(listen_addr, &rendezvous_db, &default_chat_db("invite-host")).await
+            run_create_invite_menu().await?;
+            Ok(ScreenAction::Stay)
         }
         "2" => {
-            let code = prompt_line("Invite code: ")?;
-            let rendezvous_db = PathBuf::from(DEFAULT_INVITE_DB);
-            run_join_invite(
-                code.trim(),
-                &rendezvous_db,
-                &default_chat_db("invite-joiner"),
-            )
-            .await
+            run_join_invite_menu().await?;
+            Ok(ScreenAction::Stay)
         }
-        "3" => run_open_chats_menu().await,
-        _ => Err("invalid selection".into()),
+        "3" => {
+            run_chat_history_menu().await?;
+            Ok(ScreenAction::Stay)
+        }
+        selection if is_quit_selection(selection) => Ok(ScreenAction::Quit),
+        selection if is_back_selection(selection) => Ok(ScreenAction::Back),
+        _ => {
+            println!("Invalid selection");
+            println!();
+            Ok(ScreenAction::Stay)
+        }
     }
 }
 
-async fn run_open_chats_menu() -> AppResult<()> {
-    let profile_db = default_chat_db("invite-joiner");
-    let storage = Storage::open(&profile_db)?;
-    let chats = storage.chat_summaries()?;
-
-    println!();
-    println!("Chats");
-    println!();
-
-    if chats.is_empty() {
-        println!("No saved chats yet.");
+async fn run_create_invite_menu() -> AppResult<()> {
+    loop {
         println!();
+        println!("Create Invite");
+        println!();
+        println!("[1] Create invite");
         println!("[B] Back");
         println!();
-        let _ = prompt_line("Select: ")?;
-        return Ok(());
-    }
 
-    for (index, summary) in chats.iter().enumerate() {
-        println!("[{}] {}", index + 1, summary.contact.display_name);
-        match &summary.last_message {
-            Some(message) => {
-                println!(
-                    "    last message: {}",
-                    message.plaintext.as_deref().unwrap_or("[encrypted]")
-                );
-                println!("    {}", relative_time(message.created_at_unix_secs));
+        match prompt_line("Select: ")?.trim() {
+            "1" => {
+                let rendezvous_db = PathBuf::from(DEFAULT_INVITE_DB);
+                let listen_addr = DEFAULT_INVITE_LISTEN_ADDR.parse()?;
+                run_create_invite(listen_addr, &rendezvous_db, &default_chat_db("invite-host"))
+                    .await?;
+                return Ok(());
             }
-            None => {
-                println!("    last message: no messages yet");
-                println!(
-                    "    saved {}",
-                    relative_time(summary.contact.saved_at_unix_secs)
-                );
+            selection if is_back_selection(selection) => return Ok(()),
+            _ => {
+                println!("Invalid selection");
+                println!();
             }
         }
+    }
+}
+
+async fn run_join_invite_menu() -> AppResult<()> {
+    loop {
         println!();
+        println!("Join Invite");
+        println!();
+        println!("[1] Enter invite code");
+        println!("[B] Back");
+        println!();
+
+        match prompt_line("Select: ")?.trim() {
+            "1" => {
+                let code = prompt_line("Invite code: ")?;
+                if is_back_selection(&code) {
+                    return Ok(());
+                }
+                let rendezvous_db = PathBuf::from(DEFAULT_INVITE_DB);
+                run_join_invite(
+                    code.trim(),
+                    &rendezvous_db,
+                    &default_chat_db("invite-joiner"),
+                )
+                .await?;
+                return Ok(());
+            }
+            selection if is_back_selection(selection) => return Ok(()),
+            _ => {
+                println!("Invalid selection");
+                println!();
+            }
+        }
     }
-    println!("[B] Back");
+}
+
+async fn run_chat_history_menu() -> AppResult<()> {
+    loop {
+        let profile_db = default_chat_db("invite-joiner");
+        let storage = Storage::open(&profile_db)?;
+        let chats = storage.recent_chat_summaries(RECENT_CHAT_LIMIT)?;
+
+        println!();
+        println!("Chat History");
+        println!();
+
+        if chats.is_empty() {
+            println!("No saved chats yet.");
+            println!();
+            println!("[B] Back");
+            println!();
+
+            let selection = prompt_line("Select: ")?;
+            if is_back_selection(&selection) {
+                return Ok(());
+            }
+            println!("Invalid selection");
+            println!();
+            continue;
+        }
+
+        let recent_count = chats.len().min(RECENT_CHAT_LIMIT);
+        for (index, summary) in chats.iter().take(recent_count).enumerate() {
+            print_recent_chat_summary(index + 1, summary);
+        }
+        println!("[A] View All Chats");
+        println!("[B] Back");
+        println!();
+
+        let selection = prompt_line("Select: ")?;
+        if is_back_selection(&selection) {
+            return Ok(());
+        }
+        if selection.eq_ignore_ascii_case("a") {
+            run_all_chat_history_menu(&profile_db)?;
+            continue;
+        }
+
+        match selection
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|index| (1..=recent_count).contains(index))
+            .and_then(|index| chats.get(index.saturating_sub(1)))
+        {
+            Some(selected) => open_saved_conversation(
+                &profile_db,
+                &selected.contact.contact_id,
+                &selected.contact.display_name,
+            )?,
+            None => {
+                println!("Invalid selection");
+                println!();
+            }
+        }
+    }
+}
+
+fn run_all_chat_history_menu(profile_db: &Path) -> AppResult<()> {
+    let mut page = 0usize;
+
+    loop {
+        let storage = Storage::open(profile_db)?;
+        let chat_count = storage.chat_summary_count()?;
+        let total_pages = chat_count.div_ceil(CHAT_HISTORY_PAGE_SIZE).max(1);
+        page = page.min(total_pages - 1);
+        let page_start = page * CHAT_HISTORY_PAGE_SIZE;
+        let page_chats = storage.chat_summaries_page(CHAT_HISTORY_PAGE_SIZE, page_start)?;
+
+        println!();
+        println!("Chat History (Page {} of {})", page + 1, total_pages);
+        println!();
+
+        if page_chats.is_empty() {
+            println!("No saved chats yet.");
+            println!();
+        } else {
+            for (index, summary) in page_chats.iter().enumerate() {
+                print_all_chat_summary(index + 1, summary);
+            }
+        }
+
+        if page > 0 {
+            println!("[P] Previous Page");
+        }
+        if page + 1 < total_pages {
+            println!("[N] Next Page");
+        }
+        println!("[B] Back");
+        println!();
+
+        let selection = prompt_line("Select: ")?;
+        if is_back_selection(&selection) {
+            return Ok(());
+        }
+        if selection.eq_ignore_ascii_case("p") {
+            if page > 0 {
+                page -= 1;
+            } else {
+                println!("Already on first page");
+                println!();
+            }
+            continue;
+        }
+        if selection.eq_ignore_ascii_case("n") {
+            if page + 1 < total_pages {
+                page += 1;
+            } else {
+                println!("Already on last page");
+                println!();
+            }
+            continue;
+        }
+
+        match selection
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|index| (1..=page_chats.len()).contains(index))
+            .and_then(|index| page_chats.get(index.saturating_sub(1)))
+        {
+            Some(selected) => open_saved_conversation(
+                profile_db,
+                &selected.contact.contact_id,
+                &selected.contact.display_name,
+            )?,
+            None => {
+                println!("Invalid selection");
+                println!();
+            }
+        }
+    }
+}
+
+fn print_recent_chat_summary(index: usize, summary: &ChatSummary) {
+    println!("[{}] {}", index, summary.contact.display_name);
+    println!("    {}", chat_preview_line(summary));
     println!();
+}
 
-    let selection = prompt_line("Select: ")?;
-    if selection.eq_ignore_ascii_case("b") {
-        return Ok(());
+fn print_all_chat_summary(index: usize, summary: &ChatSummary) {
+    println!("[{}] {}", index, summary.contact.display_name);
+    println!("    {}", chat_preview_line(summary));
+    println!();
+}
+
+fn chat_preview_line(summary: &ChatSummary) -> String {
+    if summary.pending_count > 0 {
+        let label = if summary.pending_count == 1 {
+            "1 pending message".to_string()
+        } else {
+            format!("{} pending messages", summary.pending_count)
+        };
+        return format!("Offline · {label}");
     }
 
-    let selected = selection
-        .trim()
-        .parse::<usize>()
-        .ok()
-        .and_then(|index| chats.get(index.saturating_sub(1)))
-        .ok_or("invalid selection")?;
+    match &summary.last_message {
+        Some(message) => {
+            let mut plaintext = message
+                .plaintext
+                .as_deref()
+                .unwrap_or("[encrypted]")
+                .trim()
+                .to_string();
+            if plaintext.is_empty() {
+                plaintext = "[empty message]".to_string();
+            }
+            if matches!(message.direction, MessageDirection::Sent) {
+                plaintext = format!("you: {plaintext}");
+            }
+            format!(
+                "Offline · last message: {} · {}",
+                truncate_preview(&plaintext, 48),
+                relative_time(message.created_at_unix_secs)
+            )
+        }
+        None => "Offline · No messages".to_string(),
+    }
+}
 
-    open_saved_conversation(
-        &profile_db,
-        &selected.contact.contact_id,
-        &selected.contact.display_name,
-    )
+fn truncate_preview(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
 }
 
 fn open_saved_conversation(
@@ -963,19 +1179,99 @@ fn open_saved_conversation(
     conversation_id: &str,
     display_name: &str,
 ) -> AppResult<()> {
-    print_conversation_history(profile_db, conversation_id, display_name)?;
-    println!("[C] Clear local history");
-    println!("[B] Back");
-    println!();
+    let peer = load_known_peer_for_conversation(profile_db, conversation_id)?;
 
-    let selection = prompt_line("Select: ")?;
-    if selection.eq_ignore_ascii_case("c") {
-        let storage = Storage::open(profile_db)?;
-        let removed = storage.clear_conversation_history(conversation_id)?;
-        println!(
-            "Cleared {removed} local message(s). This does not delete copies on other devices."
-        );
+    loop {
+        print_offline_conversation(profile_db, conversation_id, display_name)?;
+        println!("{CHAT_INPUT_INSTRUCTION}");
+        println!("Use /clear to clear local history.");
+        println!();
+
+        let line = prompt_line(CHAT_PROMPT)?;
+        if is_chat_back_command(&line) {
+            return Ok(());
+        }
+        if line.trim().eq_ignore_ascii_case("/clear") {
+            let storage = Storage::open(profile_db)?;
+            let removed = storage.clear_conversation_history(conversation_id)?;
+            println!(
+                "Cleared {removed} local message(s). This does not delete copies on other devices."
+            );
+            println!();
+            continue;
+        }
+        if line.is_empty() {
+            continue;
+        }
+
+        match &peer {
+            Some(peer) => {
+                queue_offline_peer_message(profile_db, peer, &line)?;
+                println!("✓ Queued for delivery");
+            }
+            None => {
+                println!("This legacy conversation is missing a cryptographic peer profile.");
+                println!("Reconnect with this peer once before queueing offline messages.");
+            }
+        }
+        println!();
     }
+}
+
+fn load_known_peer_for_conversation(
+    profile_db: &Path,
+    conversation_id: &str,
+) -> AppResult<Option<KnownPeerRecord>> {
+    let storage = Storage::open(profile_db)?;
+    if let Some(peer) = storage.known_peer_for_conversation(conversation_id)? {
+        return Ok(Some(peer));
+    }
+
+    let Some(contact) = storage.load_contact(conversation_id)? else {
+        return Ok(None);
+    };
+    let Ok(identity) = <&[u8; 32]>::try_from(contact.identity_public_key.as_slice()) else {
+        return Ok(None);
+    };
+
+    Ok(Some(KnownPeerRecord {
+        peer_id: contact_id_for_identity(identity),
+        identity_public_key: contact.identity_public_key,
+        display_name: contact.display_name,
+        conversation_id: contact.contact_id,
+        last_seen_at_unix_secs: contact.saved_at_unix_secs,
+    }))
+}
+
+fn queue_offline_peer_message(
+    profile_db: &Path,
+    peer: &KnownPeerRecord,
+    plaintext: &str,
+) -> AppResult<()> {
+    let message_id = pending_peer_message_id(&peer.peer_id, plaintext)?;
+    let created_at = now_unix_secs();
+    let storage = Storage::open(profile_db)?;
+    storage.queue_pending_peer_message(&PendingPeerMessage {
+        message_id: message_id.clone(),
+        peer_id: peer.peer_id.clone(),
+        conversation_id: peer.conversation_id.clone(),
+        plaintext: plaintext.to_string(),
+        created_at_unix_secs: created_at,
+        retry_count: 0,
+        last_attempt_unix_secs: None,
+    })?;
+    storage.insert_message(&MessageRecord {
+        message_id,
+        conversation_id: peer.conversation_id.clone(),
+        sender_id: "you".to_string(),
+        recipient_id: peer.display_name.clone(),
+        direction: MessageDirection::Sent,
+        status: MessageStatus::Stored,
+        protocol_counter: None,
+        ciphertext: plaintext.as_bytes().to_vec(),
+        plaintext: Some(plaintext.to_string()),
+        created_at_unix_secs: created_at,
+    })?;
     Ok(())
 }
 
@@ -1031,6 +1327,21 @@ fn prompt_line(prompt: &str) -> AppResult<String> {
     let mut line = String::new();
     io::stdin().read_line(&mut line)?;
     Ok(line.trim_end().to_string())
+}
+
+fn is_back_selection(selection: &str) -> bool {
+    let selection = selection.trim();
+    selection.eq_ignore_ascii_case("b") || selection.eq_ignore_ascii_case("back")
+}
+
+fn is_quit_selection(selection: &str) -> bool {
+    let selection = selection.trim();
+    selection.eq_ignore_ascii_case("q") || selection.eq_ignore_ascii_case("quit")
+}
+
+fn is_chat_back_command(line: &str) -> bool {
+    let line = line.trim();
+    line.eq_ignore_ascii_case("/back") || line.eq_ignore_ascii_case("/exit")
 }
 
 fn generate_invite_code() -> AppResult<String> {
@@ -1972,12 +2283,20 @@ async fn run_bob_quic_once(
     log_boundary("Alice -> Bob InitialMessage", &encrypted_bytes);
     let initial_message = decode_chat_initial_message(&encrypted_bytes)?;
     let remote_display_name = initial_message.sender_display_name;
-    let conversation_id = contact_id_for_display_name(&remote_display_name);
+    let conversation_id = initial_message
+        .sender_identity_public_key
+        .as_ref()
+        .map(contact_id_for_identity)
+        .unwrap_or_else(|| contact_id_for_display_name(&remote_display_name));
     save_contact_for_chat(
         &db_path,
         &conversation_id,
         &remote_display_name,
-        b"remote identity established during discovery pairing",
+        initial_message
+            .sender_identity_public_key
+            .as_ref()
+            .map(|key| key.as_slice())
+            .unwrap_or(b"legacy display-name contact"),
         "direct QUIC",
     )?;
     let plaintext = {
@@ -1989,6 +2308,7 @@ async fn run_bob_quic_once(
         persist_chat_message(
             &db_path,
             ChatHistoryEntry {
+                message_id: None,
                 conversation_id: &conversation_id,
                 sender_display_name: &remote_display_name,
                 peer_display_name: &local_display_name,
@@ -2013,6 +2333,7 @@ async fn run_bob_quic_once(
         db_path,
     )
     .await
+    .map(|_| ())
 }
 
 async fn run_alice_discovered(
@@ -2067,6 +2388,7 @@ async fn run_alice(bob_addr: SocketAddr, message: &str, db_path: &Path) -> AppRe
     let initial_message = alice.encrypt_initial_message(&bundle, message)?;
     let encrypted_bytes = bincode::serialize(&ChatInitialMessage {
         sender_display_name: local_display_name.clone(),
+        sender_identity_public_key: Some(alice.signed_key_exchange().identity_public_key),
         message: initial_message,
     })?;
     log_boundary("Alice -> Bob InitialMessage", &encrypted_bytes);
@@ -2083,11 +2405,21 @@ async fn run_alice(bob_addr: SocketAddr, message: &str, db_path: &Path) -> AppRe
         "Remote display name: {}",
         display_name_or_anonymous(&remote_display_name)
     );
+    flush_pending_messages_to_bob(
+        &connection,
+        &mut alice,
+        &local_display_name,
+        &remote_display_name,
+        &conversation_id,
+        db_path,
+    )
+    .await?;
 
     if !message.is_empty() {
         persist_chat_message(
             db_path,
             ChatHistoryEntry {
+                message_id: None,
                 conversation_id: &conversation_id,
                 sender_display_name: &local_display_name,
                 peer_display_name: &remote_display_name,
@@ -2109,6 +2441,7 @@ async fn run_alice(bob_addr: SocketAddr, message: &str, db_path: &Path) -> AppRe
         db_path.to_path_buf(),
     )
     .await
+    .map(|_| ())
 }
 
 async fn run_chat_bob(listen_addr: SocketAddr, db_path: &Path) -> AppResult<()> {
@@ -2136,18 +2469,27 @@ async fn run_chat_bob(listen_addr: SocketAddr, db_path: &Path) -> AppResult<()> 
     let initial_message = decode_chat_initial_message(&initial_bytes)?;
     let remote_display_name = initial_message.sender_display_name;
     let initial_plaintext = bob.decrypt_initial_message(&initial_message.message)?;
-    let conversation_id = contact_id_for_display_name(&remote_display_name);
+    let conversation_id = initial_message
+        .sender_identity_public_key
+        .as_ref()
+        .map(contact_id_for_identity)
+        .unwrap_or_else(|| contact_id_for_display_name(&remote_display_name));
     save_contact_for_chat(
         db_path,
         &conversation_id,
         &remote_display_name,
-        b"remote identity established during invite pairing",
+        initial_message
+            .sender_identity_public_key
+            .as_ref()
+            .map(|key| key.as_slice())
+            .unwrap_or(b"legacy display-name contact"),
         "direct QUIC",
     )?;
     if !initial_plaintext.is_empty() {
         persist_chat_message(
             db_path,
             ChatHistoryEntry {
+                message_id: None,
                 conversation_id: &conversation_id,
                 sender_display_name: &remote_display_name,
                 peer_display_name: &local_display_name,
@@ -2160,6 +2502,15 @@ async fn run_chat_bob(listen_addr: SocketAddr, db_path: &Path) -> AppResult<()> 
         )?;
     }
     println!("Connected securely");
+    flush_pending_messages_to_alice(
+        &connection,
+        &mut bob,
+        &local_display_name,
+        &remote_display_name,
+        &conversation_id,
+        db_path,
+    )
+    .await?;
 
     chat_loop_bob(
         connection,
@@ -2198,11 +2549,21 @@ async fn run_chat_alice(bob_addr: SocketAddr, db_path: &Path) -> AppResult<()> {
         &mut send,
         &bincode::serialize(&ChatInitialMessage {
             sender_display_name: local_display_name.clone(),
+            sender_identity_public_key: Some(alice.signed_key_exchange().identity_public_key),
             message: initial_message,
         })?,
     )
     .await?;
     println!("Connected securely");
+    flush_pending_messages_to_bob(
+        &connection,
+        &mut alice,
+        &local_display_name,
+        &remote_display_name,
+        &conversation_id,
+        db_path,
+    )
+    .await?;
 
     chat_loop_alice(
         connection,
@@ -2238,6 +2599,10 @@ async fn chat_loop_alice(
                     println!("Terminal input closed; chat shutting down cleanly");
                     return Ok(());
                 };
+                if is_chat_back_command(&line) {
+                    println!("Returning to Chat History");
+                    return Ok(());
+                }
                 send_alice_chat_line(
                     &connection,
                     Arc::clone(&alice),
@@ -2253,26 +2618,32 @@ async fn chat_loop_alice(
                 let frame_bytes = receive_bytes(&mut recv).await?;
                 let frame: ChatFrame = bincode::deserialize(&frame_bytes)?;
                 match frame {
-                    ChatFrame::Message { sender_display_name, message } => {
-                        let plaintext = alice
-                            .lock()
-                            .map_err(|_| "Alice state lock poisoned")?
-                            .decrypt_from_bob(&message)?;
-                        persist_chat_message(
-                            &db_path,
-                            ChatHistoryEntry {
-                                conversation_id: &conversation_id,
-                                sender_display_name: &sender_display_name,
-                                peer_display_name: &local_display_name,
-                                direction: MessageDirection::Received,
-                                status: MessageStatus::Received,
-                                protocol_counter: Some(message.number),
-                                ciphertext: &frame_bytes,
-                                plaintext: &plaintext,
-                            },
-                        )?;
-                        terminal.print_message(&sender_display_name, &plaintext)?;
+                    ChatFrame::Message { message_id, sender_display_name, message } => {
+                        if !chat_message_already_saved(&db_path, &message_id)? {
+                            let plaintext = alice
+                                .lock()
+                                .map_err(|_| "Alice state lock poisoned")?
+                                .decrypt_from_bob(&message)?;
+                            persist_chat_message(
+                                &db_path,
+                                ChatHistoryEntry {
+                                    message_id: Some(message_id.clone()),
+                                    conversation_id: &conversation_id,
+                                    sender_display_name: &sender_display_name,
+                                    peer_display_name: &local_display_name,
+                                    direction: MessageDirection::Received,
+                                    status: MessageStatus::Received,
+                                    protocol_counter: Some(message.number),
+                                    ciphertext: &frame_bytes,
+                                    plaintext: &plaintext,
+                                },
+                            )?;
+                            mark_incoming_chat_message_accepted(&db_path, &message_id)?;
+                            terminal.print_message(&sender_display_name, &plaintext)?;
+                        }
+                        send_chat_ack(&connection, &message_id).await?;
                     }
+                    ChatFrame::Ack { .. } => {}
                 }
             }
         }
@@ -2320,6 +2691,10 @@ async fn chat_loop_bob_shared(
                     println!("Terminal input closed; chat shutting down cleanly");
                     return Ok(());
                 };
+                if is_chat_back_command(&line) {
+                    println!("Returning to Chat History");
+                    return Ok(());
+                }
                 send_bob_chat_line(
                     &connection,
                     Arc::clone(&bob),
@@ -2335,26 +2710,32 @@ async fn chat_loop_bob_shared(
                 let frame_bytes = receive_bytes(&mut recv).await?;
                 let frame: ChatFrame = bincode::deserialize(&frame_bytes)?;
                 match frame {
-                    ChatFrame::Message { sender_display_name, message } => {
-                        let plaintext = bob
-                            .lock()
-                            .map_err(|_| "Bob state lock poisoned")?
-                            .decrypt_from_alice(&message)?;
-                        persist_chat_message(
-                            &db_path,
-                            ChatHistoryEntry {
-                                conversation_id: &conversation_id,
-                                sender_display_name: &sender_display_name,
-                                peer_display_name: &local_display_name,
-                                direction: MessageDirection::Received,
-                                status: MessageStatus::Received,
-                                protocol_counter: Some(message.number),
-                                ciphertext: &frame_bytes,
-                                plaintext: &plaintext,
-                            },
-                        )?;
-                        terminal.print_message(&sender_display_name, &plaintext)?;
+                    ChatFrame::Message { message_id, sender_display_name, message } => {
+                        if !chat_message_already_saved(&db_path, &message_id)? {
+                            let plaintext = bob
+                                .lock()
+                                .map_err(|_| "Bob state lock poisoned")?
+                                .decrypt_from_alice(&message)?;
+                            persist_chat_message(
+                                &db_path,
+                                ChatHistoryEntry {
+                                    message_id: Some(message_id.clone()),
+                                    conversation_id: &conversation_id,
+                                    sender_display_name: &sender_display_name,
+                                    peer_display_name: &local_display_name,
+                                    direction: MessageDirection::Received,
+                                    status: MessageStatus::Received,
+                                    protocol_counter: Some(message.number),
+                                    ciphertext: &frame_bytes,
+                                    plaintext: &plaintext,
+                                },
+                            )?;
+                            mark_incoming_chat_message_accepted(&db_path, &message_id)?;
+                            terminal.print_message(&sender_display_name, &plaintext)?;
+                        }
+                        send_chat_ack(&connection, &message_id).await?;
                     }
+                    ChatFrame::Ack { .. } => {}
                 }
             }
         }
@@ -2373,12 +2754,46 @@ async fn send_alice_chat_line(
     if line.is_empty() {
         return Ok(());
     }
+    send_alice_chat_line_with_id(
+        connection,
+        alice,
+        local_display_name,
+        remote_display_name,
+        conversation_id,
+        db_path,
+        line,
+        None,
+    )
+    .await
+    .map(|_| ())
+}
 
+#[allow(clippy::too_many_arguments)]
+async fn send_alice_chat_line_with_id(
+    connection: &quinn::Connection,
+    alice: Arc<Mutex<Alice>>,
+    local_display_name: &str,
+    remote_display_name: &str,
+    conversation_id: &str,
+    db_path: &Path,
+    line: String,
+    existing_message_id: Option<String>,
+) -> AppResult<String> {
     let message = alice
         .lock()
         .map_err(|_| "Alice state lock poisoned")?
         .encrypt_for_bob(&line)?;
+    let message_bytes = bincode::serialize(&message)?;
+    let message_id = existing_message_id.unwrap_or_else(|| {
+        chat_message_id(
+            conversation_id,
+            &MessageDirection::Sent,
+            Some(message.number),
+            &message_bytes,
+        )
+    });
     let frame = ChatFrame::Message {
+        message_id: message_id.clone(),
         sender_display_name: local_display_name.to_string(),
         message,
     };
@@ -2387,6 +2802,7 @@ async fn send_alice_chat_line(
     persist_chat_message(
         db_path,
         ChatHistoryEntry {
+            message_id: Some(message_id.clone()),
             conversation_id,
             sender_display_name: local_display_name,
             peer_display_name: remote_display_name,
@@ -2396,7 +2812,8 @@ async fn send_alice_chat_line(
             ciphertext: &frame_bytes,
             plaintext: &line,
         },
-    )
+    )?;
+    Ok(message_id)
 }
 
 async fn send_bob_chat_line(
@@ -2411,12 +2828,46 @@ async fn send_bob_chat_line(
     if line.is_empty() {
         return Ok(());
     }
+    send_bob_chat_line_with_id(
+        connection,
+        bob,
+        local_display_name,
+        remote_display_name,
+        conversation_id,
+        db_path,
+        line,
+        None,
+    )
+    .await
+    .map(|_| ())
+}
 
+#[allow(clippy::too_many_arguments)]
+async fn send_bob_chat_line_with_id(
+    connection: &quinn::Connection,
+    bob: Arc<Mutex<Bob>>,
+    local_display_name: &str,
+    remote_display_name: &str,
+    conversation_id: &str,
+    db_path: &Path,
+    line: String,
+    existing_message_id: Option<String>,
+) -> AppResult<String> {
     let message = bob
         .lock()
         .map_err(|_| "Bob state lock poisoned")?
         .encrypt_for_alice(&line)?;
+    let message_bytes = bincode::serialize(&message)?;
+    let message_id = existing_message_id.unwrap_or_else(|| {
+        chat_message_id(
+            conversation_id,
+            &MessageDirection::Sent,
+            Some(message.number),
+            &message_bytes,
+        )
+    });
     let frame = ChatFrame::Message {
+        message_id: message_id.clone(),
         sender_display_name: local_display_name.to_string(),
         message,
     };
@@ -2425,6 +2876,7 @@ async fn send_bob_chat_line(
     persist_chat_message(
         db_path,
         ChatHistoryEntry {
+            message_id: Some(message_id.clone()),
             conversation_id,
             sender_display_name: local_display_name,
             peer_display_name: remote_display_name,
@@ -2434,13 +2886,295 @@ async fn send_bob_chat_line(
             ciphertext: &frame_bytes,
             plaintext: &line,
         },
-    )
+    )?;
+    Ok(message_id)
 }
 
 async fn send_chat_frame(connection: &quinn::Connection, frame: ChatFrame) -> AppResult<()> {
     let bytes = bincode::serialize(&frame)?;
     let mut send = connection.open_uni().await?;
     send_bytes(&mut send, &bytes).await
+}
+
+async fn send_chat_ack(connection: &quinn::Connection, message_id: &str) -> AppResult<()> {
+    send_chat_frame(
+        connection,
+        ChatFrame::Ack {
+            message_id: message_id.to_string(),
+        },
+    )
+    .await
+}
+
+fn chat_message_already_saved(db_path: &Path, message_id: &str) -> AppResult<bool> {
+    let storage = Storage::open(db_path)?;
+    Ok(storage.message_exists(message_id)?)
+}
+
+fn mark_incoming_chat_message_accepted(db_path: &Path, message_id: &str) -> AppResult<()> {
+    let storage = Storage::open(db_path)?;
+    let _ = storage.accept_message_once(message_id)?;
+    Ok(())
+}
+
+async fn flush_pending_messages_to_bob(
+    connection: &quinn::Connection,
+    alice: &mut Alice,
+    local_display_name: &str,
+    remote_display_name: &str,
+    conversation_id: &str,
+    db_path: &Path,
+) -> AppResult<()> {
+    let peer_id = conversation_id;
+    let pending = Storage::open(db_path)?.pending_peer_messages_for_peer(peer_id)?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    println!("Delivering {} pending message(s)", pending.len());
+    for pending_message in pending {
+        let storage = Storage::open(db_path)?;
+        storage.record_pending_peer_message_attempt(&pending_message.message_id)?;
+        let message = alice.encrypt_for_bob(&pending_message.plaintext)?;
+        let frame = ChatFrame::Message {
+            message_id: pending_message.message_id.clone(),
+            sender_display_name: local_display_name.to_string(),
+            message,
+        };
+        send_chat_frame(connection, frame).await?;
+
+        if wait_for_chat_ack_as_alice(
+            connection,
+            alice,
+            &pending_message.message_id,
+            local_display_name,
+            remote_display_name,
+            conversation_id,
+            db_path,
+        )
+        .await?
+        {
+            let storage = Storage::open(db_path)?;
+            storage.remove_pending_peer_message(&pending_message.message_id)?;
+            storage.update_message_status(&pending_message.message_id, MessageStatus::Sent)?;
+        } else {
+            println!("Peer disconnected before confirming pending delivery");
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn flush_pending_messages_to_alice(
+    connection: &quinn::Connection,
+    bob: &mut Bob,
+    local_display_name: &str,
+    remote_display_name: &str,
+    conversation_id: &str,
+    db_path: &Path,
+) -> AppResult<()> {
+    let peer_id = conversation_id;
+    let pending = Storage::open(db_path)?.pending_peer_messages_for_peer(peer_id)?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    println!("Delivering {} pending message(s)", pending.len());
+    for pending_message in pending {
+        let storage = Storage::open(db_path)?;
+        storage.record_pending_peer_message_attempt(&pending_message.message_id)?;
+        let message = bob.encrypt_for_alice(&pending_message.plaintext)?;
+        let frame = ChatFrame::Message {
+            message_id: pending_message.message_id.clone(),
+            sender_display_name: local_display_name.to_string(),
+            message,
+        };
+        send_chat_frame(connection, frame).await?;
+
+        if wait_for_chat_ack_as_bob(
+            connection,
+            bob,
+            &pending_message.message_id,
+            local_display_name,
+            remote_display_name,
+            conversation_id,
+            db_path,
+        )
+        .await?
+        {
+            let storage = Storage::open(db_path)?;
+            storage.remove_pending_peer_message(&pending_message.message_id)?;
+            storage.update_message_status(&pending_message.message_id, MessageStatus::Sent)?;
+        } else {
+            println!("Peer disconnected before confirming pending delivery");
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_for_chat_ack_as_alice(
+    connection: &quinn::Connection,
+    alice: &mut Alice,
+    expected_message_id: &str,
+    local_display_name: &str,
+    remote_display_name: &str,
+    conversation_id: &str,
+    db_path: &Path,
+) -> AppResult<bool> {
+    loop {
+        let incoming =
+            match time::timeout(PENDING_DELIVERY_ACK_TIMEOUT, connection.accept_uni()).await {
+                Ok(result) => result?,
+                Err(_) => return Ok(false),
+            };
+        let mut recv = incoming;
+        let frame_bytes = receive_bytes(&mut recv).await?;
+        let frame: ChatFrame = bincode::deserialize(&frame_bytes)?;
+        match frame {
+            ChatFrame::Ack { message_id } if message_id == expected_message_id => {
+                return Ok(true);
+            }
+            other => {
+                handle_incoming_during_alice_flush(
+                    connection,
+                    alice,
+                    local_display_name,
+                    remote_display_name,
+                    conversation_id,
+                    db_path,
+                    frame_bytes,
+                    other,
+                )
+                .await?;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_for_chat_ack_as_bob(
+    connection: &quinn::Connection,
+    bob: &mut Bob,
+    expected_message_id: &str,
+    local_display_name: &str,
+    remote_display_name: &str,
+    conversation_id: &str,
+    db_path: &Path,
+) -> AppResult<bool> {
+    loop {
+        let incoming =
+            match time::timeout(PENDING_DELIVERY_ACK_TIMEOUT, connection.accept_uni()).await {
+                Ok(result) => result?,
+                Err(_) => return Ok(false),
+            };
+        let mut recv = incoming;
+        let frame_bytes = receive_bytes(&mut recv).await?;
+        let frame: ChatFrame = bincode::deserialize(&frame_bytes)?;
+        match frame {
+            ChatFrame::Ack { message_id } if message_id == expected_message_id => {
+                return Ok(true);
+            }
+            other => {
+                handle_incoming_during_bob_flush(
+                    connection,
+                    bob,
+                    local_display_name,
+                    remote_display_name,
+                    conversation_id,
+                    db_path,
+                    frame_bytes,
+                    other,
+                )
+                .await?;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_incoming_during_alice_flush(
+    connection: &quinn::Connection,
+    alice: &mut Alice,
+    local_display_name: &str,
+    _remote_display_name: &str,
+    conversation_id: &str,
+    db_path: &Path,
+    frame_bytes: Vec<u8>,
+    frame: ChatFrame,
+) -> AppResult<()> {
+    match frame {
+        ChatFrame::Message {
+            message_id,
+            sender_display_name,
+            message,
+        } => {
+            if !chat_message_already_saved(db_path, &message_id)? {
+                let plaintext = alice.decrypt_from_bob(&message)?;
+                persist_chat_message(
+                    db_path,
+                    ChatHistoryEntry {
+                        message_id: Some(message_id.clone()),
+                        conversation_id,
+                        sender_display_name: &sender_display_name,
+                        peer_display_name: local_display_name,
+                        direction: MessageDirection::Received,
+                        status: MessageStatus::Received,
+                        protocol_counter: Some(message.number),
+                        ciphertext: &frame_bytes,
+                        plaintext: &plaintext,
+                    },
+                )?;
+                mark_incoming_chat_message_accepted(db_path, &message_id)?;
+            }
+            send_chat_ack(connection, &message_id).await?;
+        }
+        ChatFrame::Ack { .. } => {}
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_incoming_during_bob_flush(
+    connection: &quinn::Connection,
+    bob: &mut Bob,
+    local_display_name: &str,
+    _remote_display_name: &str,
+    conversation_id: &str,
+    db_path: &Path,
+    frame_bytes: Vec<u8>,
+    frame: ChatFrame,
+) -> AppResult<()> {
+    match frame {
+        ChatFrame::Message {
+            message_id,
+            sender_display_name,
+            message,
+        } => {
+            if !chat_message_already_saved(db_path, &message_id)? {
+                let plaintext = bob.decrypt_from_alice(&message)?;
+                persist_chat_message(
+                    db_path,
+                    ChatHistoryEntry {
+                        message_id: Some(message_id.clone()),
+                        conversation_id,
+                        sender_display_name: &sender_display_name,
+                        peer_display_name: local_display_name,
+                        direction: MessageDirection::Received,
+                        status: MessageStatus::Received,
+                        protocol_counter: Some(message.number),
+                        ciphertext: &frame_bytes,
+                        plaintext: &plaintext,
+                    },
+                )?;
+                mark_incoming_chat_message_accepted(db_path, &message_id)?;
+            }
+            send_chat_ack(connection, &message_id).await?;
+        }
+        ChatFrame::Ack { .. } => {}
+    }
+    Ok(())
 }
 
 struct ChatTerminal {
@@ -2494,7 +3228,11 @@ fn spawn_line_editor() -> AppResult<ChatTerminal> {
             match editor.readline(CHAT_PROMPT) {
                 Ok(line) => {
                     let _ = editor.add_history_entry(line.as_str());
+                    let should_stop = is_chat_back_command(&line);
                     if line_tx.send(line).is_err() {
+                        break;
+                    }
+                    if should_stop {
                         break;
                     }
                 }
@@ -2546,17 +3284,28 @@ fn save_contact_for_chat(
     discovery_hint: &str,
 ) -> AppResult<()> {
     let storage = Storage::open(db_path)?;
+    let display_name = display_name_or_anonymous(display_name);
     storage.save_contact(&ContactRecord {
         contact_id: contact_id.to_string(),
-        display_name: display_name_or_anonymous(display_name),
+        display_name: display_name.clone(),
         identity_public_key: identity_public_key.to_vec(),
         discovery_hint: discovery_hint.to_string(),
         saved_at_unix_secs: now_unix_secs(),
     })?;
+    if let Ok(identity) = <&[u8; 32]>::try_from(identity_public_key) {
+        storage.save_known_peer(&KnownPeerRecord {
+            peer_id: contact_id_for_identity(identity),
+            identity_public_key: identity_public_key.to_vec(),
+            display_name,
+            conversation_id: contact_id.to_string(),
+            last_seen_at_unix_secs: now_unix_secs(),
+        })?;
+    }
     Ok(())
 }
 
 struct ChatHistoryEntry<'a> {
+    message_id: Option<String>,
     conversation_id: &'a str,
     sender_display_name: &'a str,
     peer_display_name: &'a str,
@@ -2569,12 +3318,14 @@ struct ChatHistoryEntry<'a> {
 
 fn persist_chat_message(db_path: &Path, entry: ChatHistoryEntry<'_>) -> AppResult<()> {
     let storage = Storage::open(db_path)?;
-    let message_id = chat_message_id(
-        entry.conversation_id,
-        &entry.direction,
-        entry.protocol_counter,
-        entry.ciphertext,
-    );
+    let message_id = entry.message_id.clone().unwrap_or_else(|| {
+        chat_message_id(
+            entry.conversation_id,
+            &entry.direction,
+            entry.protocol_counter,
+            entry.ciphertext,
+        )
+    });
     let (sender_id, recipient_id) = match entry.direction {
         MessageDirection::Sent => ("you", entry.peer_display_name),
         MessageDirection::Received => (entry.sender_display_name, "you"),
@@ -2600,12 +3351,38 @@ fn print_conversation_history(
     conversation_id: &str,
     display_name: &str,
 ) -> AppResult<()> {
+    print_conversation(
+        db_path,
+        conversation_id,
+        display_name,
+        Some("End-to-end encrypted"),
+    )?;
+    println!("{CHAT_INPUT_INSTRUCTION}");
+    Ok(())
+}
+
+fn print_offline_conversation(
+    db_path: &Path,
+    conversation_id: &str,
+    display_name: &str,
+) -> AppResult<()> {
+    print_conversation(db_path, conversation_id, display_name, Some("Offline"))
+}
+
+fn print_conversation(
+    db_path: &Path,
+    conversation_id: &str,
+    display_name: &str,
+    status: Option<&str>,
+) -> AppResult<()> {
     let storage = Storage::open(db_path)?;
     let messages = storage.messages_for_conversation(conversation_id)?;
 
     println!();
-    println!("{}", display_name_or_anonymous(display_name));
-    println!("End-to-end encrypted");
+    match status {
+        Some(status) => println!("{} - {status}", display_name_or_anonymous(display_name)),
+        None => println!("{}", display_name_or_anonymous(display_name)),
+    }
     println!();
     println!("--------------------------------");
     for message in messages {
@@ -2613,7 +3390,12 @@ fn print_conversation_history(
         match message.direction {
             MessageDirection::Sent => {
                 println!("You: {body}");
-                println!("    {}", message_status_label(&message.status));
+                let status = message_status_label(&message.status);
+                if status == "queued for delivery" {
+                    println!("✓ Queued for delivery");
+                } else {
+                    println!("    {status}");
+                }
             }
             MessageDirection::Received => {
                 println!("{}: {body}", display_name_or_anonymous(display_name));
@@ -2622,7 +3404,6 @@ fn print_conversation_history(
     }
     println!("--------------------------------");
     println!();
-    println!("> Type a message...");
     Ok(())
 }
 
@@ -2652,6 +3433,18 @@ fn chat_message_id(
     }
     hasher.update(ciphertext);
     hex_encode(&hasher.finalize()[..16])
+}
+
+fn pending_peer_message_id(peer_id: &str, plaintext: &str) -> AppResult<String> {
+    let mut random = [0u8; 16];
+    fill_random(&mut random)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"ciphermesh.pending-peer-message.v1");
+    hasher.update(peer_id.as_bytes());
+    hasher.update(now_unix_secs().to_be_bytes());
+    hasher.update(plaintext.as_bytes());
+    hasher.update(random);
+    Ok(hex_encode(&hasher.finalize()[..16]))
 }
 
 fn contact_id_for_identity(identity_public_key: &[u8; 32]) -> String {
@@ -2714,15 +3507,24 @@ fn decode_chat_initial_message(bytes: &[u8]) -> AppResult<ChatInitialMessage> {
     match bincode::deserialize::<ChatInitialMessage>(bytes) {
         Ok(message) => Ok(ChatInitialMessage {
             sender_display_name: display_name_or_anonymous(&message.sender_display_name),
+            sender_identity_public_key: message.sender_identity_public_key,
             message: message.message,
         }),
-        Err(_) => {
-            let message: InitialMessage = bincode::deserialize(bytes)?;
-            Ok(ChatInitialMessage {
-                sender_display_name: "Anonymous".to_string(),
-                message,
-            })
-        }
+        Err(_) => match bincode::deserialize::<LegacyChatInitialMessage>(bytes) {
+            Ok(message) => Ok(ChatInitialMessage {
+                sender_display_name: display_name_or_anonymous(&message.sender_display_name),
+                sender_identity_public_key: None,
+                message: message.message,
+            }),
+            Err(_) => {
+                let message: InitialMessage = bincode::deserialize(bytes)?;
+                Ok(ChatInitialMessage {
+                    sender_display_name: "Anonymous".to_string(),
+                    sender_identity_public_key: None,
+                    message,
+                })
+            }
+        },
     }
 }
 
@@ -2940,14 +3742,25 @@ struct ChatPreKeyBundle {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChatInitialMessage {
     sender_display_name: String,
+    sender_identity_public_key: Option<ciphermesh::IdentityPublicKeyBytes>,
+    message: InitialMessage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyChatInitialMessage {
+    sender_display_name: String,
     message: InitialMessage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum ChatFrame {
     Message {
+        message_id: String,
         sender_display_name: String,
         message: RatchetMessage,
+    },
+    Ack {
+        message_id: String,
     },
 }
 
@@ -4349,6 +5162,16 @@ mod discovery_tests {
         assert_eq!(display_name_or_anonymous("James"), "James");
         assert_eq!(display_name_or_anonymous("   "), "Anonymous");
         assert_eq!(display_name_or_anonymous("Anonymous"), "Anonymous");
+    }
+
+    #[test]
+    fn only_slash_commands_leave_active_chat_input() {
+        assert!(!is_chat_back_command("B"));
+        assert!(!is_chat_back_command("back"));
+        assert!(!is_chat_back_command("hello /back"));
+        assert!(is_chat_back_command("/back"));
+        assert!(is_chat_back_command("/back "));
+        assert!(is_chat_back_command("/exit"));
     }
 
     #[test]
