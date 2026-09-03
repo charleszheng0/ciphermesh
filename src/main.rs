@@ -32,6 +32,7 @@ use std::{
     io::{self, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
+    process,
     sync::{mpsc as std_mpsc, Arc, Mutex},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -49,12 +50,50 @@ const MAILBOX_MAX_ENVELOPES: usize = 64;
 const CHAT_PROMPT: &str = "> You: ";
 const INVITE_CODE_LEN: usize = 6;
 const INVITE_TTL_SECS: u64 = 5 * 60;
+const SAVED_CHAT_RECONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const INVITE_CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const DEFAULT_INVITE_DB: &str = "target/ciphermesh-invites.sqlite";
 const DEFAULT_INVITE_LISTEN_ADDR: &str = "127.0.0.1:5000";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Navigation {
+    Back,
+    Quit,
+}
+
+fn navigation_for_back_or_quit(input: &str) -> Option<Navigation> {
+    match input.trim() {
+        command if command.eq_ignore_ascii_case("b") => Some(Navigation::Back),
+        command if command.eq_ignore_ascii_case("q") => Some(Navigation::Quit),
+        _ => None,
+    }
+}
+
+fn chat_navigation_command(input: &str) -> Option<Navigation> {
+    navigation_for_back_or_quit(input)
+}
+
+fn prompt_back_or_quit(prompt: &str) -> AppResult<Result<String, Navigation>> {
+    let input = prompt_line(prompt)?;
+    Ok(match navigation_for_back_or_quit(&input) {
+        Some(navigation) => Err(navigation),
+        None => Ok(input),
+    })
+}
+
+fn install_ctrl_c_shutdown_handler() -> AppResult<()> {
+    ctrlc::set_handler(|| {
+        println!();
+        println!("Ctrl+C received; CipherMesh shutting down cleanly");
+        process::exit(0);
+    })
+    .map_err(|error| format!("failed to install Ctrl+C handler: {error}").into())
+}
+
 #[tokio::main]
 async fn main() -> AppResult<()> {
+    install_ctrl_c_shutdown_handler()?;
+
     let mut args = std::env::args().collect::<Vec<_>>();
     let verbose = take_verbose_flag(&mut args);
 
@@ -91,7 +130,7 @@ async fn main() -> AppResult<()> {
                 .get(3)
                 .map(PathBuf::from)
                 .unwrap_or_else(|| default_chat_db("bob"));
-            run_chat_bob(listen_addr, &db_path).await
+            run_chat_bob(listen_addr, &db_path).await.map(|_| ())
         }
         Some("chat-alice") => {
             let bob_addr = parse_addr(args.get(2), "127.0.0.1:5000")?;
@@ -99,7 +138,7 @@ async fn main() -> AppResult<()> {
                 .get(3)
                 .map(PathBuf::from)
                 .unwrap_or_else(|| default_chat_db("alice"));
-            run_chat_alice(bob_addr, &db_path).await
+            run_chat_alice(bob_addr, &db_path).await.map(|_| ())
         }
         Some("alice-relay") => {
             let bob_peer_id = parse_peer_id(args.get(2))?;
@@ -159,7 +198,9 @@ async fn main() -> AppResult<()> {
                 .get(4)
                 .map(PathBuf::from)
                 .unwrap_or_else(|| default_chat_db("invite-host"));
-            run_create_invite(listen_addr, &rendezvous_db, &profile_db).await
+            run_create_invite(listen_addr, &rendezvous_db, &profile_db)
+                .await
+                .map(|_| ())
         }
         Some("join-invite") => {
             let code = args.get(2).ok_or("missing invite code")?;
@@ -171,7 +212,9 @@ async fn main() -> AppResult<()> {
                 .get(4)
                 .map(PathBuf::from)
                 .unwrap_or_else(|| default_chat_db("invite-joiner"));
-            run_join_invite(code, &rendezvous_db, &profile_db).await
+            run_join_invite(code, &rendezvous_db, &profile_db)
+                .await
+                .map(|_| ())
         }
         Some("invite-demo") => {
             let db_path = args
@@ -888,29 +931,57 @@ async fn run_product_menu() -> AppResult<()> {
             "1" => {
                 let rendezvous_db = PathBuf::from(DEFAULT_INVITE_DB);
                 let listen_addr = DEFAULT_INVITE_LISTEN_ADDR.parse()?;
-                return run_create_invite(
+                match run_create_invite(
                     listen_addr,
                     &rendezvous_db,
                     &default_chat_db("invite-host"),
                 )
-                .await;
+                .await?
+                {
+                    Navigation::Back => {
+                        if run_open_chats_menu().await? == Navigation::Quit {
+                            return Ok(());
+                        }
+                    }
+                    Navigation::Quit => return Ok(()),
+                }
             }
             "2" => {
-                let code = prompt_line("Invite code: ")?;
+                let code = match prompt_back_or_quit("Invite code ([B] Back, [Q] Quit): ")? {
+                    Ok(code) => code,
+                    Err(Navigation::Back) => continue,
+                    Err(Navigation::Quit) => return Ok(()),
+                };
                 let rendezvous_db = PathBuf::from(DEFAULT_INVITE_DB);
-                return run_join_invite(
+                match run_join_invite(
                     code.trim(),
                     &rendezvous_db,
                     &default_chat_db("invite-joiner"),
                 )
-                .await;
+                .await?
+                {
+                    Navigation::Back => {
+                        if run_open_chats_menu().await? == Navigation::Quit {
+                            return Ok(());
+                        }
+                    }
+                    Navigation::Quit => return Ok(()),
+                }
             }
-            "3" => run_open_chats_menu().await?,
+            "3" => {
+                if run_open_chats_menu().await? == Navigation::Quit {
+                    return Ok(());
+                }
+            }
             selection if selection.eq_ignore_ascii_case("p") => {
-                run_profile_screen(&default_chat_db("profile"))?;
+                if run_profile_screen(&default_chat_db("profile"))? == Navigation::Quit {
+                    return Ok(());
+                }
             }
             selection if selection.eq_ignore_ascii_case("d") => {
-                run_debug_screen(&default_chat_db("profile"))?;
+                if run_debug_screen(&default_chat_db("profile"))? == Navigation::Quit {
+                    return Ok(());
+                }
             }
             selection if selection.eq_ignore_ascii_case("q") => return Ok(()),
             _ => {
@@ -921,7 +992,7 @@ async fn run_product_menu() -> AppResult<()> {
     }
 }
 
-async fn run_open_chats_menu() -> AppResult<()> {
+async fn run_open_chats_menu() -> AppResult<Navigation> {
     let profile_db = default_chat_db("invite-joiner");
     let storage = Storage::open(&profile_db)?;
     let chats = storage.chat_summaries()?;
@@ -934,9 +1005,10 @@ async fn run_open_chats_menu() -> AppResult<()> {
         println!("No saved chats yet.");
         println!();
         println!("[B] Back");
+        println!("[Q] Quit");
         println!();
-        let _ = prompt_line("Select: ")?;
-        return Ok(());
+        let selection = prompt_line("Select: ")?;
+        return Ok(navigation_for_back_or_quit(&selection).unwrap_or(Navigation::Back));
     }
 
     for (index, summary) in chats.iter().enumerate() {
@@ -960,11 +1032,12 @@ async fn run_open_chats_menu() -> AppResult<()> {
         println!();
     }
     println!("[B] Back");
+    println!("[Q] Quit");
     println!();
 
     let selection = prompt_line("Select: ")?;
-    if selection.eq_ignore_ascii_case("b") {
-        return Ok(());
+    if let Some(navigation) = navigation_for_back_or_quit(&selection) {
+        return Ok(navigation);
     }
 
     let selected = selection
@@ -979,30 +1052,73 @@ async fn run_open_chats_menu() -> AppResult<()> {
         &selected.contact.contact_id,
         &selected.contact.display_name,
     )
+    .await
 }
 
-fn open_saved_conversation(
+async fn open_saved_conversation(
     profile_db: &Path,
     conversation_id: &str,
     display_name: &str,
-) -> AppResult<()> {
+) -> AppResult<Navigation> {
     print_conversation_history(profile_db, conversation_id, display_name)?;
+    println!("Reconnecting...");
+    match time::timeout(
+        SAVED_CHAT_RECONNECT_TIMEOUT,
+        reconnect_saved_conversation(profile_db, conversation_id),
+    )
+    .await
+    {
+        Ok(Ok(navigation)) => return Ok(navigation),
+        Ok(Err(error)) => {
+            println!("Could not reconnect automatically: {error}");
+        }
+        Err(_) => {
+            println!("Could not reconnect automatically: peer appears offline");
+        }
+    }
+    println!();
+    println!("[O] Reconnect");
     println!("[C] Clear local history");
     println!("[B] Back");
+    println!("[Q] Quit");
     println!();
 
     let selection = prompt_line("Select: ")?;
-    if selection.eq_ignore_ascii_case("c") {
-        let storage = Storage::open(profile_db)?;
-        let removed = storage.clear_conversation_history(conversation_id)?;
-        println!(
-            "Cleared {removed} local message(s). This does not delete copies on other devices."
-        );
+    if selection.eq_ignore_ascii_case("o") {
+        return reconnect_saved_conversation(profile_db, conversation_id).await;
+    } else if selection.eq_ignore_ascii_case("c") {
+        clear_local_conversation_history(profile_db, conversation_id)?;
+    } else if let Some(navigation) = navigation_for_back_or_quit(&selection) {
+        return Ok(navigation);
+    } else {
+        println!("Invalid selection");
     }
+    Ok(Navigation::Back)
+}
+
+async fn reconnect_saved_conversation(
+    profile_db: &Path,
+    conversation_id: &str,
+) -> AppResult<Navigation> {
+    let storage = Storage::open(profile_db)?;
+    let contact = storage
+        .load_contact(conversation_id)?
+        .ok_or("saved contact missing")?;
+    let peer_addr = reconnect_addr_from_contact(&contact)?;
+
+    println!("Reconnecting to {}", contact.display_name);
+    emit_debug_event(profile_db, DebugEvent::PeerDiscovered)?;
+    run_chat_alice(peer_addr, profile_db).await
+}
+
+fn clear_local_conversation_history(profile_db: &Path, conversation_id: &str) -> AppResult<()> {
+    let storage = Storage::open(profile_db)?;
+    let removed = storage.clear_conversation_history(conversation_id)?;
+    println!("Cleared {removed} local message(s). This does not delete copies on other devices.");
     Ok(())
 }
 
-fn run_profile_screen(db_path: &Path) -> AppResult<()> {
+fn run_profile_screen(db_path: &Path) -> AppResult<Navigation> {
     let profile = load_or_create_profile(db_path)?;
 
     println!("{}", profile_summary_text(&profile));
@@ -1011,19 +1127,28 @@ fn run_profile_screen(db_path: &Path) -> AppResult<()> {
     println!("[R] Revoke device");
     println!("[V] View verification details");
     println!("[B] Back");
+    println!("[Q] Quit");
     println!();
 
     match prompt_line("Select: ")?.trim() {
         selection if selection.eq_ignore_ascii_case("c") => {
-            let display_name = prompt_line("Display name: ")?;
+            let display_name = match prompt_back_or_quit("Display name ([B] Back, [Q] Quit): ")? {
+                Ok(display_name) => display_name,
+                Err(navigation) => return Ok(navigation),
+            };
             Storage::open(db_path)?.save_display_name(&display_name_or_anonymous(&display_name))?;
             println!("Display name updated");
         }
         selection if selection.eq_ignore_ascii_case("r") => {
-            revoke_device_from_profile(db_path, &profile)?;
+            if revoke_device_from_profile(db_path, &profile)? == Navigation::Quit {
+                return Ok(Navigation::Quit);
+            }
         }
         selection if selection.eq_ignore_ascii_case("l") => {
-            let device_name = prompt_line("Device name: ")?;
+            let device_name = match prompt_back_or_quit("Device name ([B] Back, [Q] Quit): ")? {
+                Ok(device_name) => device_name,
+                Err(navigation) => return Ok(navigation),
+            };
             let linked = link_new_profile_device(db_path, &profile.account_id, &device_name)?;
             println!("Device linked: {}", linked.name);
             println!("Device authorized with a signed certificate.");
@@ -1031,14 +1156,15 @@ fn run_profile_screen(db_path: &Path) -> AppResult<()> {
         selection if selection.eq_ignore_ascii_case("v") => {
             print_verification_details(&profile);
         }
-        selection if selection.eq_ignore_ascii_case("b") => {}
-        _ => return Err("invalid selection".into()),
+        selection if selection.eq_ignore_ascii_case("b") => return Ok(Navigation::Back),
+        selection if selection.eq_ignore_ascii_case("q") => return Ok(Navigation::Quit),
+        _ => println!("Invalid selection"),
     }
 
-    Ok(())
+    Ok(Navigation::Back)
 }
 
-fn run_debug_screen(db_path: &Path) -> AppResult<()> {
+fn run_debug_screen(db_path: &Path) -> AppResult<Navigation> {
     let storage = Storage::open(db_path)?;
     let _ = debug_event_catalog_count();
     println!();
@@ -1052,6 +1178,7 @@ fn run_debug_screen(db_path: &Path) -> AppResult<()> {
     println!("[S] Sync / Devices");
     println!("[X] Clear logs");
     println!("[B] Back");
+    println!("[Q] Quit");
     println!();
 
     match prompt_line("Select: ")?.trim() {
@@ -1081,11 +1208,12 @@ fn run_debug_screen(db_path: &Path) -> AppResult<()> {
             let removed = storage.clear_debug_events()?;
             println!("Cleared {removed} debug event(s)");
         }
-        selection if selection.eq_ignore_ascii_case("b") => {}
-        _ => return Err("invalid selection".into()),
+        selection if selection.eq_ignore_ascii_case("b") => return Ok(Navigation::Back),
+        selection if selection.eq_ignore_ascii_case("q") => return Ok(Navigation::Quit),
+        _ => println!("Invalid selection"),
     }
 
-    Ok(())
+    Ok(Navigation::Back)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1514,7 +1642,7 @@ fn profile_devices_from_records(
         .collect()
 }
 
-fn revoke_device_from_profile(db_path: &Path, profile: &ProfileView) -> AppResult<()> {
+fn revoke_device_from_profile(db_path: &Path, profile: &ProfileView) -> AppResult<Navigation> {
     let candidates = profile
         .devices
         .iter()
@@ -1522,7 +1650,7 @@ fn revoke_device_from_profile(db_path: &Path, profile: &ProfileView) -> AppResul
         .collect::<Vec<_>>();
     if candidates.is_empty() {
         println!("No active non-current devices can be revoked.");
-        return Ok(());
+        return Ok(Navigation::Back);
     }
 
     println!();
@@ -1530,9 +1658,14 @@ fn revoke_device_from_profile(db_path: &Path, profile: &ProfileView) -> AppResul
     for (index, device) in candidates.iter().enumerate() {
         println!("[{}] {}", index + 1, device.name);
     }
+    println!("[B] Back");
+    println!("[Q] Quit");
     println!();
 
     let selection = prompt_line("Select device: ")?;
+    if let Some(navigation) = navigation_for_back_or_quit(&selection) {
+        return Ok(navigation);
+    }
     let selected = selection
         .trim()
         .parse::<usize>()
@@ -1543,7 +1676,7 @@ fn revoke_device_from_profile(db_path: &Path, profile: &ProfileView) -> AppResul
     revoke_profile_device_by_id(db_path, &profile.account_id, &selected.device_id)?;
 
     println!("Device revoked. This does not delete data already stored on that device.");
-    Ok(())
+    Ok(Navigation::Back)
 }
 
 fn revoke_profile_device_by_id(db_path: &Path, account_id: &str, device_id: &str) -> AppResult<()> {
@@ -1637,7 +1770,7 @@ async fn run_create_invite(
     listen_addr: SocketAddr,
     rendezvous_db: &Path,
     profile_db: &Path,
-) -> AppResult<()> {
+) -> AppResult<Navigation> {
     if let Some(parent) = rendezvous_db.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1661,7 +1794,11 @@ async fn run_create_invite(
     run_chat_bob(listen_addr, profile_db).await
 }
 
-async fn run_join_invite(code: &str, rendezvous_db: &Path, profile_db: &Path) -> AppResult<()> {
+async fn run_join_invite(
+    code: &str,
+    rendezvous_db: &Path,
+    profile_db: &Path,
+) -> AppResult<Navigation> {
     let normalized_code = normalize_invite_code(code)?;
     let invite = {
         let storage = Storage::open(rendezvous_db)?;
@@ -2673,6 +2810,7 @@ async fn run_bob_quic_once(
         db_path,
     )
     .await
+    .map(|_| ())
 }
 
 async fn run_alice_discovered(
@@ -2686,7 +2824,7 @@ async fn run_alice_discovered(
     println!("Discovered peer QUIC app address: {bob_addr}");
 
     let Some(message) = message else {
-        return run_chat_alice(bob_addr, db_path).await;
+        return run_chat_alice(bob_addr, db_path).await.map(|_| ());
     };
 
     match run_alice(bob_addr, message, db_path).await {
@@ -2723,7 +2861,7 @@ async fn run_alice(bob_addr: SocketAddr, message: &str, db_path: &Path) -> AppRe
         &conversation_id,
         &remote_display_name,
         &bundle.identity_public_key,
-        "direct QUIC",
+        &quic_discovery_hint(bob_addr),
     )?;
 
     let initial_message = alice.encrypt_initial_message(&bundle, message)?;
@@ -2780,9 +2918,10 @@ async fn run_alice(bob_addr: SocketAddr, message: &str, db_path: &Path) -> AppRe
         db_path.to_path_buf(),
     )
     .await
+    .map(|_| ())
 }
 
-async fn run_chat_bob(listen_addr: SocketAddr, db_path: &Path) -> AppResult<()> {
+async fn run_chat_bob(listen_addr: SocketAddr, db_path: &Path) -> AppResult<Navigation> {
     let local_display_name = load_or_prompt_display_name(db_path)?;
     let mut bob = Bob::local();
     let endpoint = Endpoint::server(server_config()?, listen_addr)?;
@@ -2858,7 +2997,7 @@ async fn run_chat_bob(listen_addr: SocketAddr, db_path: &Path) -> AppResult<()> 
     .await
 }
 
-async fn run_chat_alice(bob_addr: SocketAddr, db_path: &Path) -> AppResult<()> {
+async fn run_chat_alice(bob_addr: SocketAddr, db_path: &Path) -> AppResult<Navigation> {
     let local_display_name = load_or_prompt_display_name(db_path)?;
     let mut alice = Alice::local();
     let mut endpoint = Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?;
@@ -2877,7 +3016,7 @@ async fn run_chat_alice(bob_addr: SocketAddr, db_path: &Path) -> AppResult<()> {
         &conversation_id,
         &remote_display_name,
         &bundle.identity_public_key,
-        "direct QUIC",
+        &quic_discovery_hint(bob_addr),
     )?;
 
     let initial_message = alice.encrypt_initial_message(&bundle, "")?;
@@ -2915,7 +3054,7 @@ async fn chat_loop_alice(
     remote_display_name: String,
     conversation_id: String,
     db_path: PathBuf,
-) -> AppResult<()> {
+) -> AppResult<Navigation> {
     let alice = Arc::new(Mutex::new(alice));
     print_conversation_history(&db_path, &conversation_id, &remote_display_name)?;
     let mut terminal = spawn_line_editor()?;
@@ -2924,13 +3063,16 @@ async fn chat_loop_alice(
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 println!("Ctrl+C received; chat shutting down cleanly");
-                return Ok(());
+                return Ok(Navigation::Quit);
             }
             line = terminal.lines.recv() => {
                 let Some(line) = line else {
                     println!("Terminal input closed; chat shutting down cleanly");
-                    return Ok(());
+                    return Ok(Navigation::Quit);
                 };
+                if let Some(navigation) = chat_navigation_command(&line) {
+                    return Ok(navigation);
+                }
                 send_alice_chat_line(
                     &connection,
                     Arc::clone(&alice),
@@ -2991,7 +3133,7 @@ async fn chat_loop_bob(
     remote_display_name: String,
     conversation_id: String,
     db_path: PathBuf,
-) -> AppResult<()> {
+) -> AppResult<Navigation> {
     chat_loop_bob_shared(
         connection,
         Arc::new(Mutex::new(bob)),
@@ -3010,7 +3152,7 @@ async fn chat_loop_bob_shared(
     remote_display_name: String,
     conversation_id: String,
     db_path: PathBuf,
-) -> AppResult<()> {
+) -> AppResult<Navigation> {
     print_conversation_history(&db_path, &conversation_id, &remote_display_name)?;
     let mut terminal = spawn_line_editor()?;
 
@@ -3018,13 +3160,16 @@ async fn chat_loop_bob_shared(
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 println!("Ctrl+C received; chat shutting down cleanly");
-                return Ok(());
+                return Ok(Navigation::Quit);
             }
             line = terminal.lines.recv() => {
                 let Some(line) = line else {
                     println!("Terminal input closed; chat shutting down cleanly");
-                    return Ok(());
+                    return Ok(Navigation::Quit);
                 };
+                if let Some(navigation) = chat_navigation_command(&line) {
+                    return Ok(navigation);
+                }
                 send_bob_chat_line(
                     &connection,
                     Arc::clone(&bob),
@@ -3319,6 +3464,19 @@ fn save_contact_for_chat(
         saved_at_unix_secs: now_unix_secs(),
     })?;
     Ok(())
+}
+
+fn quic_discovery_hint(addr: SocketAddr) -> String {
+    format!("quic:{addr}")
+}
+
+fn reconnect_addr_from_contact(contact: &ContactRecord) -> AppResult<SocketAddr> {
+    contact
+        .discovery_hint
+        .strip_prefix("quic:")
+        .ok_or("saved contact does not have reconnect metadata yet")?
+        .parse::<SocketAddr>()
+        .map_err(|error| format!("saved reconnect address is invalid: {error}").into())
 }
 
 struct ChatHistoryEntry<'a> {
@@ -5272,6 +5430,31 @@ mod discovery_tests {
         assert_eq!(render_device_status(phone), "Authorized - Offline");
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn saved_contact_reconnect_hint_resolves_without_user_entering_address() {
+        let contact = ContactRecord {
+            contact_id: "contact-james".to_string(),
+            display_name: "James".to_string(),
+            identity_public_key: b"identity".to_vec(),
+            discovery_hint: quic_discovery_hint("127.0.0.1:5000".parse().unwrap()),
+            saved_at_unix_secs: now_unix_secs(),
+        };
+
+        assert_eq!(
+            reconnect_addr_from_contact(&contact).expect("reconnect address"),
+            "127.0.0.1:5000".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn back_and_quit_commands_are_navigation_not_chat_messages() {
+        assert_eq!(chat_navigation_command("b"), Some(Navigation::Back));
+        assert_eq!(chat_navigation_command("B"), Some(Navigation::Back));
+        assert_eq!(chat_navigation_command("q"), Some(Navigation::Quit));
+        assert_eq!(chat_navigation_command("Q"), Some(Navigation::Quit));
+        assert_eq!(chat_navigation_command("hello"), None);
     }
 
     #[test]
