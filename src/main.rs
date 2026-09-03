@@ -47,7 +47,7 @@ const MAILBOX_PROTOCOL: &str = "/ciphermesh/mailbox/3d/1.0.0";
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAILBOX_ENVELOPE_TTL_SECS: u64 = 5 * 60;
 const MAILBOX_MAX_ENVELOPES: usize = 64;
-const CHAT_PROMPT: &str = "> ";
+const CHAT_PROMPT: &str = "> You: ";
 const CHAT_INPUT_INSTRUCTION: &str = "Type a message, or /back to return to Chat History.";
 const INVITE_CODE_LEN: usize = 6;
 const INVITE_TTL_SECS: u64 = 5 * 60;
@@ -3389,7 +3389,7 @@ fn print_conversation(
         let body = message.plaintext.as_deref().unwrap_or("[encrypted]");
         match message.direction {
             MessageDirection::Sent => {
-                println!("You: {body}");
+                println!("> You: {body}");
                 let status = message_status_label(&message.status);
                 if status == "queued for delivery" {
                     println!("✓ Queued for delivery");
@@ -3398,7 +3398,7 @@ fn print_conversation(
                 }
             }
             MessageDirection::Received => {
-                println!("{}: {body}", display_name_or_anonymous(display_name));
+                println!("> {}: {body}", display_name_or_anonymous(display_name));
             }
         }
     }
