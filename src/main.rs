@@ -1151,8 +1151,8 @@ fn chat_preview_line(summary: &ChatSummary) -> String {
             if plaintext.is_empty() {
                 plaintext = "[empty message]".to_string();
             }
-            if matches!(message.direction, MessageDirection::Sent) {
-                plaintext = format!("you: {plaintext}");
+            if is_local_message(message) {
+                plaintext = format!("You: {plaintext}");
             }
             format!(
                 "Offline · last message: {} · {}",
@@ -2587,6 +2587,7 @@ async fn chat_loop_alice(
     let alice = Arc::new(Mutex::new(alice));
     print_conversation_history(&db_path, &conversation_id, &remote_display_name)?;
     let mut terminal = spawn_line_editor()?;
+    let mut online = true;
 
     loop {
         tokio::select! {
@@ -2603,19 +2604,47 @@ async fn chat_loop_alice(
                     println!("Returning to Chat History");
                     return Ok(());
                 }
-                send_alice_chat_line(
-                    &connection,
-                    Arc::clone(&alice),
-                    &local_display_name,
-                    &remote_display_name,
-                    &conversation_id,
-                    &db_path,
-                    line,
-                ).await?;
+                if online {
+                    match send_alice_chat_line(
+                        &connection,
+                        Arc::clone(&alice),
+                        &local_display_name,
+                        &remote_display_name,
+                        &conversation_id,
+                        &db_path,
+                        line.clone(),
+                    ).await {
+                        Ok(()) => {}
+                        Err(error) if is_peer_disconnect_app_error(error.as_ref()) => {
+                            online = false;
+                            handle_peer_disconnected(&remote_display_name);
+                            queue_message_after_peer_disconnect(&db_path, &conversation_id, &remote_display_name, &line)?;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    queue_message_after_peer_disconnect(&db_path, &conversation_id, &remote_display_name, &line)?;
+                }
             }
-            incoming = connection.accept_uni() => {
-                let mut recv = incoming?;
-                let frame_bytes = receive_bytes(&mut recv).await?;
+            incoming = connection.accept_uni(), if online => {
+                let mut recv = match incoming {
+                    Ok(recv) => recv,
+                    Err(error) if is_peer_disconnect_error(&error) => {
+                        online = false;
+                        handle_peer_disconnected(&remote_display_name);
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let frame_bytes = match receive_bytes(&mut recv).await {
+                    Ok(bytes) => bytes,
+                    Err(error) if is_peer_disconnect_app_error(error.as_ref()) => {
+                        online = false;
+                        handle_peer_disconnected(&remote_display_name);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 let frame: ChatFrame = bincode::deserialize(&frame_bytes)?;
                 match frame {
                     ChatFrame::Message { message_id, sender_display_name, message } => {
@@ -2639,9 +2668,19 @@ async fn chat_loop_alice(
                                 },
                             )?;
                             mark_incoming_chat_message_accepted(&db_path, &message_id)?;
-                            terminal.print_message(&sender_display_name, &plaintext)?;
+                            terminal.print_message(
+                                remote_sender_label(&sender_display_name, &remote_display_name),
+                                &plaintext,
+                            )?;
                         }
-                        send_chat_ack(&connection, &message_id).await?;
+                        if let Err(error) = send_chat_ack(&connection, &message_id).await {
+                            if is_peer_disconnect_app_error(error.as_ref()) {
+                                online = false;
+                                handle_peer_disconnected(&remote_display_name);
+                            } else {
+                                return Err(error);
+                            }
+                        }
                     }
                     ChatFrame::Ack { .. } => {}
                 }
@@ -2679,6 +2718,7 @@ async fn chat_loop_bob_shared(
 ) -> AppResult<()> {
     print_conversation_history(&db_path, &conversation_id, &remote_display_name)?;
     let mut terminal = spawn_line_editor()?;
+    let mut online = true;
 
     loop {
         tokio::select! {
@@ -2695,19 +2735,47 @@ async fn chat_loop_bob_shared(
                     println!("Returning to Chat History");
                     return Ok(());
                 }
-                send_bob_chat_line(
-                    &connection,
-                    Arc::clone(&bob),
-                    &local_display_name,
-                    &remote_display_name,
-                    &conversation_id,
-                    &db_path,
-                    line,
-                ).await?;
+                if online {
+                    match send_bob_chat_line(
+                        &connection,
+                        Arc::clone(&bob),
+                        &local_display_name,
+                        &remote_display_name,
+                        &conversation_id,
+                        &db_path,
+                        line.clone(),
+                    ).await {
+                        Ok(()) => {}
+                        Err(error) if is_peer_disconnect_app_error(error.as_ref()) => {
+                            online = false;
+                            handle_peer_disconnected(&remote_display_name);
+                            queue_message_after_peer_disconnect(&db_path, &conversation_id, &remote_display_name, &line)?;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    queue_message_after_peer_disconnect(&db_path, &conversation_id, &remote_display_name, &line)?;
+                }
             }
-            incoming = connection.accept_uni() => {
-                let mut recv = incoming?;
-                let frame_bytes = receive_bytes(&mut recv).await?;
+            incoming = connection.accept_uni(), if online => {
+                let mut recv = match incoming {
+                    Ok(recv) => recv,
+                    Err(error) if is_peer_disconnect_error(&error) => {
+                        online = false;
+                        handle_peer_disconnected(&remote_display_name);
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let frame_bytes = match receive_bytes(&mut recv).await {
+                    Ok(bytes) => bytes,
+                    Err(error) if is_peer_disconnect_app_error(error.as_ref()) => {
+                        online = false;
+                        handle_peer_disconnected(&remote_display_name);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 let frame: ChatFrame = bincode::deserialize(&frame_bytes)?;
                 match frame {
                     ChatFrame::Message { message_id, sender_display_name, message } => {
@@ -2731,9 +2799,19 @@ async fn chat_loop_bob_shared(
                                 },
                             )?;
                             mark_incoming_chat_message_accepted(&db_path, &message_id)?;
-                            terminal.print_message(&sender_display_name, &plaintext)?;
+                            terminal.print_message(
+                                remote_sender_label(&sender_display_name, &remote_display_name),
+                                &plaintext,
+                            )?;
                         }
-                        send_chat_ack(&connection, &message_id).await?;
+                        if let Err(error) = send_chat_ack(&connection, &message_id).await {
+                            if is_peer_disconnect_app_error(error.as_ref()) {
+                                online = false;
+                                handle_peer_disconnected(&remote_display_name);
+                            } else {
+                                return Err(error);
+                            }
+                        }
                     }
                     ChatFrame::Ack { .. } => {}
                 }
@@ -2917,6 +2995,81 @@ fn mark_incoming_chat_message_accepted(db_path: &Path, message_id: &str) -> AppR
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChatSessionEvent {
+    PeerDisconnected(String),
+}
+
+fn peer_disconnected_event(display_name: &str) -> ChatSessionEvent {
+    ChatSessionEvent::PeerDisconnected(display_name_or_anonymous(display_name))
+}
+
+fn handle_peer_disconnected(display_name: &str) {
+    let ChatSessionEvent::PeerDisconnected(peer) = peer_disconnected_event(display_name);
+    println!();
+    println!("{peer} disconnected.");
+    println!("Status: Offline");
+    println!("Messages you type now will be queued for delivery.");
+    println!("Use /back to return to Chat History.");
+    println!();
+}
+
+fn queue_message_after_peer_disconnect(
+    db_path: &Path,
+    conversation_id: &str,
+    remote_display_name: &str,
+    line: &str,
+) -> AppResult<()> {
+    let Some(peer) = load_known_peer_for_conversation(db_path, conversation_id)? else {
+        println!("Peer is offline, but this conversation is missing a saved peer profile.");
+        println!("Message was not sent.");
+        return Ok(());
+    };
+    queue_offline_peer_message(db_path, &peer, line)?;
+    println!("✓ Queued for delivery");
+    println!(
+        "{} is offline.",
+        display_name_or_anonymous(remote_display_name)
+    );
+    Ok(())
+}
+
+fn is_peer_disconnect_app_error(error: &(dyn Error + 'static)) -> bool {
+    if let Some(error) = error.downcast_ref::<quinn::ConnectionError>() {
+        return is_peer_disconnect_error(error);
+    }
+    if let Some(error) = error.downcast_ref::<quinn::ReadToEndError>() {
+        return matches!(
+            error,
+            quinn::ReadToEndError::Read(quinn::ReadError::ConnectionLost(error))
+                if is_peer_disconnect_error(error)
+        );
+    }
+    if let Some(error) = error.downcast_ref::<quinn::WriteError>() {
+        return matches!(
+            error,
+            quinn::WriteError::ConnectionLost(error) if is_peer_disconnect_error(error)
+        );
+    }
+
+    error
+        .source()
+        .is_some_and(|source| is_peer_disconnect_app_error(source))
+}
+
+fn is_peer_disconnect_error(error: &quinn::ConnectionError) -> bool {
+    match error {
+        quinn::ConnectionError::ApplicationClosed(close) => {
+            close.error_code.into_inner() == 0 || close.reason.is_empty()
+        }
+        quinn::ConnectionError::ConnectionClosed(close) => close.reason.is_empty(),
+        quinn::ConnectionError::Reset
+        | quinn::ConnectionError::TimedOut
+        | quinn::ConnectionError::LocallyClosed => true,
+        _ => false,
+    }
+}
+
 async fn flush_pending_messages_to_bob(
     connection: &quinn::Connection,
     alice: &mut Alice,
@@ -2941,7 +3094,13 @@ async fn flush_pending_messages_to_bob(
             sender_display_name: local_display_name.to_string(),
             message,
         };
-        send_chat_frame(connection, frame).await?;
+        if let Err(error) = send_chat_frame(connection, frame).await {
+            if is_peer_disconnect_app_error(error.as_ref()) {
+                println!("Peer disconnected before confirming pending delivery");
+                break;
+            }
+            return Err(error);
+        }
 
         if wait_for_chat_ack_as_alice(
             connection,
@@ -2989,7 +3148,13 @@ async fn flush_pending_messages_to_alice(
             sender_display_name: local_display_name.to_string(),
             message,
         };
-        send_chat_frame(connection, frame).await?;
+        if let Err(error) = send_chat_frame(connection, frame).await {
+            if is_peer_disconnect_app_error(error.as_ref()) {
+                println!("Peer disconnected before confirming pending delivery");
+                break;
+            }
+            return Err(error);
+        }
 
         if wait_for_chat_ack_as_bob(
             connection,
@@ -3026,11 +3191,17 @@ async fn wait_for_chat_ack_as_alice(
     loop {
         let incoming =
             match time::timeout(PENDING_DELIVERY_ACK_TIMEOUT, connection.accept_uni()).await {
-                Ok(result) => result?,
+                Ok(Ok(recv)) => recv,
+                Ok(Err(error)) if is_peer_disconnect_error(&error) => return Ok(false),
+                Ok(Err(error)) => return Err(error.into()),
                 Err(_) => return Ok(false),
             };
         let mut recv = incoming;
-        let frame_bytes = receive_bytes(&mut recv).await?;
+        let frame_bytes = match receive_bytes(&mut recv).await {
+            Ok(bytes) => bytes,
+            Err(error) if is_peer_disconnect_app_error(error.as_ref()) => return Ok(false),
+            Err(error) => return Err(error),
+        };
         let frame: ChatFrame = bincode::deserialize(&frame_bytes)?;
         match frame {
             ChatFrame::Ack { message_id } if message_id == expected_message_id => {
@@ -3066,11 +3237,17 @@ async fn wait_for_chat_ack_as_bob(
     loop {
         let incoming =
             match time::timeout(PENDING_DELIVERY_ACK_TIMEOUT, connection.accept_uni()).await {
-                Ok(result) => result?,
+                Ok(Ok(recv)) => recv,
+                Ok(Err(error)) if is_peer_disconnect_error(&error) => return Ok(false),
+                Ok(Err(error)) => return Err(error.into()),
                 Err(_) => return Ok(false),
             };
         let mut recv = incoming;
-        let frame_bytes = receive_bytes(&mut recv).await?;
+        let frame_bytes = match receive_bytes(&mut recv).await {
+            Ok(bytes) => bytes,
+            Err(error) if is_peer_disconnect_app_error(error.as_ref()) => return Ok(false),
+            Err(error) => return Err(error),
+        };
         let frame: ChatFrame = bincode::deserialize(&frame_bytes)?;
         match frame {
             ChatFrame::Ack { message_id } if message_id == expected_message_id => {
@@ -3128,7 +3305,12 @@ async fn handle_incoming_during_alice_flush(
                 )?;
                 mark_incoming_chat_message_accepted(db_path, &message_id)?;
             }
-            send_chat_ack(connection, &message_id).await?;
+            if let Err(error) = send_chat_ack(connection, &message_id).await {
+                if is_peer_disconnect_app_error(error.as_ref()) {
+                    return Ok(());
+                }
+                return Err(error);
+            }
         }
         ChatFrame::Ack { .. } => {}
     }
@@ -3170,7 +3352,12 @@ async fn handle_incoming_during_bob_flush(
                 )?;
                 mark_incoming_chat_message_accepted(db_path, &message_id)?;
             }
-            send_chat_ack(connection, &message_id).await?;
+            if let Err(error) = send_chat_ack(connection, &message_id).await {
+                if is_peer_disconnect_app_error(error.as_ref()) {
+                    return Ok(());
+                }
+                return Err(error);
+            }
         }
         ChatFrame::Ack { .. } => {}
     }
@@ -3387,19 +3574,19 @@ fn print_conversation(
     println!("--------------------------------");
     for message in messages {
         let body = message.plaintext.as_deref().unwrap_or("[encrypted]");
-        match message.direction {
-            MessageDirection::Sent => {
-                println!("> You: {body}");
-                let status = message_status_label(&message.status);
-                if status == "queued for delivery" {
-                    println!("✓ Queued for delivery");
-                } else {
-                    println!("    {status}");
-                }
+        if is_local_message(&message) {
+            println!("> {}: {body}", local_sender_label());
+            let status = message_status_label(&message.status);
+            if status == "queued for delivery" {
+                println!("✓ Queued for delivery");
+            } else {
+                println!("    {status}");
             }
-            MessageDirection::Received => {
-                println!("> {}: {body}", display_name_or_anonymous(display_name));
-            }
+        } else {
+            println!(
+                "> {}: {body}",
+                remote_message_sender_label(&message, display_name)
+            );
         }
     }
     println!("--------------------------------");
@@ -3409,7 +3596,7 @@ fn print_conversation(
 
 fn message_status_label(status: &MessageStatus) -> &'static str {
     match status {
-        MessageStatus::Stored => "sending...",
+        MessageStatus::Stored => "queued for delivery",
         MessageStatus::Sent => "sent",
         MessageStatus::Received => "delivered",
     }
@@ -3483,6 +3670,36 @@ fn display_name_or_anonymous(display_name: &str) -> String {
         "Anonymous".to_string()
     } else {
         display_name.chars().take(64).collect()
+    }
+}
+
+fn local_sender_label() -> &'static str {
+    "You"
+}
+
+fn is_local_message(message: &MessageRecord) -> bool {
+    matches!(message.direction, MessageDirection::Sent)
+        || message.sender_id.trim().eq_ignore_ascii_case("you")
+}
+
+fn remote_sender_label<'a>(
+    wire_sender_display_name: &'a str,
+    saved_display_name: &'a str,
+) -> &'a str {
+    if wire_sender_display_name.trim().is_empty() {
+        saved_display_name
+    } else {
+        wire_sender_display_name
+    }
+}
+
+fn remote_message_sender_label(message: &MessageRecord, saved_display_name: &str) -> String {
+    let saved_display_name = display_name_or_anonymous(saved_display_name);
+    let sender_id = message.sender_id.trim();
+    if sender_id.is_empty() || sender_id.eq_ignore_ascii_case("anonymous") {
+        saved_display_name
+    } else {
+        display_name_or_anonymous(sender_id)
     }
 }
 
@@ -5165,6 +5382,42 @@ mod discovery_tests {
     }
 
     #[test]
+    fn message_sender_labels_never_render_empty() {
+        let sent = MessageRecord {
+            message_id: "sent-1".to_string(),
+            conversation_id: "conversation-1".to_string(),
+            sender_id: String::new(),
+            recipient_id: "Charles".to_string(),
+            direction: MessageDirection::Sent,
+            status: MessageStatus::Sent,
+            protocol_counter: None,
+            ciphertext: Vec::new(),
+            plaintext: Some("hello".to_string()),
+            created_at_unix_secs: 1,
+        };
+        let received_blank = MessageRecord {
+            message_id: "received-1".to_string(),
+            conversation_id: "conversation-1".to_string(),
+            sender_id: String::new(),
+            recipient_id: "you".to_string(),
+            direction: MessageDirection::Received,
+            status: MessageStatus::Received,
+            protocol_counter: None,
+            ciphertext: Vec::new(),
+            plaintext: Some("hey".to_string()),
+            created_at_unix_secs: 2,
+        };
+
+        assert_eq!(local_sender_label(), "You");
+        assert!(is_local_message(&sent));
+        assert_eq!(
+            remote_message_sender_label(&received_blank, "Charles"),
+            "Charles"
+        );
+        assert_eq!(remote_sender_label("", "Charles"), "Charles");
+    }
+
+    #[test]
     fn only_slash_commands_leave_active_chat_input() {
         assert!(!is_chat_back_command("B"));
         assert!(!is_chat_back_command("back"));
@@ -5172,6 +5425,28 @@ mod discovery_tests {
         assert!(is_chat_back_command("/back"));
         assert!(is_chat_back_command("/back "));
         assert!(is_chat_back_command("/exit"));
+    }
+
+    #[test]
+    fn clean_quic_application_close_is_peer_disconnect() {
+        let clean_close = quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+            error_code: quinn::VarInt::from_u32(0),
+            reason: Vec::new().into(),
+        });
+        let non_empty_normal_code =
+            quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+                error_code: quinn::VarInt::from_u32(0),
+                reason: Vec::from("done").into(),
+            });
+        let empty_reason_nonzero_code =
+            quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+                error_code: quinn::VarInt::from_u32(1),
+                reason: Vec::new().into(),
+            });
+
+        assert!(is_peer_disconnect_error(&clean_close));
+        assert!(is_peer_disconnect_error(&non_empty_normal_code));
+        assert!(is_peer_disconnect_error(&empty_reason_nonzero_code));
     }
 
     #[test]
