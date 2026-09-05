@@ -50,6 +50,8 @@ const MAILBOX_MAX_ENVELOPES: usize = 64;
 const CHAT_PROMPT: &str = "> You: ";
 const CHAT_INPUT_INSTRUCTION: &str =
     "Type a message, /reconnect to reconnect, or /back to return to Messages.";
+const LOCAL_ALICE_IDENTITY_ID: &str = "alice";
+const LOCAL_BOB_IDENTITY_ID: &str = "bob";
 const INVITE_CODE_LEN: usize = 6;
 const INVITE_TTL_SECS: u64 = 5 * 60;
 const INVITE_CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -105,6 +107,14 @@ async fn main() -> AppResult<()> {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| default_chat_db("bob"));
             run_chat_bob(listen_addr, &db_path).await
+        }
+        Some("chat-listen") => {
+            let listen_addr = parse_addr(args.get(2), "127.0.0.1:5000")?;
+            let db_path = args
+                .get(3)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| default_chat_db("bob"));
+            run_chat_listener(listen_addr, &db_path).await
         }
         Some("chat-alice") => {
             let bob_addr = parse_addr(args.get(2), "127.0.0.1:5000")?;
@@ -321,6 +331,7 @@ fn print_usage() {
     println!("Interactive CLI chat:");
     println!("  Terminal 1: cargo run -- chat-bob 127.0.0.1:5000");
     println!("  Terminal 2: cargo run -- chat-alice 127.0.0.1:5000");
+    println!("  Durable listener: cargo run -- chat-listen 127.0.0.1:5000 target/ciphermesh-bob-profile.sqlite");
     println!();
     println!("Phase 3D mailbox demo:");
     println!("  Terminal 1: cargo run -- mailbox /ip4/0.0.0.0/tcp/7000 target/mailbox.db");
@@ -1313,11 +1324,7 @@ async fn reconnect_alice_chat_session(
     let peer_addr = reconnect_addr_from_contact(&contact)?;
 
     println!("Reconnecting to {}", contact.display_name);
-    let session = connect_alice_chat(peer_addr, profile_db).await?;
-    if session.conversation_id != conversation_id {
-        return Err("reconnect reached a different peer identity".into());
-    }
-    Ok(session)
+    connect_alice_chat(peer_addr, profile_db, Some(conversation_id)).await
 }
 
 fn load_known_peer_for_conversation(
@@ -2553,7 +2560,7 @@ async fn run_alice(bob_addr: SocketAddr, message: &str, db_path: &Path) -> AppRe
 
 async fn run_chat_bob(listen_addr: SocketAddr, db_path: &Path) -> AppResult<()> {
     let local_display_name = load_or_prompt_display_name(db_path)?;
-    let mut bob = Bob::local();
+    let mut bob = load_or_create_bob_identity(db_path)?;
     let endpoint = Endpoint::server(server_config()?, listen_addr)?;
     println!("Waiting for peer");
 
@@ -2561,7 +2568,9 @@ async fn run_chat_bob(listen_addr: SocketAddr, db_path: &Path) -> AppResult<()> 
     let connection = incoming.await?;
 
     let mut send = connection.open_uni().await?;
+    bob.replenish_one_time_prekey(now_unix_secs());
     let bundle = bob.prekey_bundle()?;
+    save_bob_identity(db_path, &bob)?;
     send_bytes(
         &mut send,
         &bincode::serialize(&ChatPreKeyBundle {
@@ -2576,6 +2585,7 @@ async fn run_chat_bob(listen_addr: SocketAddr, db_path: &Path) -> AppResult<()> 
     let initial_message = decode_chat_initial_message(&initial_bytes)?;
     let remote_display_name = initial_message.sender_display_name;
     let initial_plaintext = bob.decrypt_initial_message(&initial_message.message)?;
+    save_bob_identity(db_path, &bob)?;
     let conversation_id = initial_message
         .sender_identity_public_key
         .as_ref()
@@ -2631,8 +2641,68 @@ async fn run_chat_bob(listen_addr: SocketAddr, db_path: &Path) -> AppResult<()> 
     .await
 }
 
+async fn run_chat_listener(listen_addr: SocketAddr, db_path: &Path) -> AppResult<()> {
+    let local_display_name = load_or_prompt_display_name(db_path)?;
+    let endpoint = Endpoint::server(server_config()?, listen_addr)?;
+    println!("Listening for chats and reconnects on {listen_addr}");
+
+    loop {
+        let Some(incoming) = endpoint.accept().await else {
+            return Err("listener closed".into());
+        };
+        let connection = match incoming.await {
+            Ok(connection) => connection,
+            Err(error) => {
+                println!("Incoming connection failed: {error}");
+                continue;
+            }
+        };
+
+        let bob = Arc::new(Mutex::new(load_or_create_bob_identity(db_path)?));
+        match complete_bob_chat_handshake(
+            &connection,
+            Arc::clone(&bob),
+            &local_display_name,
+            db_path,
+        )
+        .await
+        {
+            Ok(session) => {
+                let mut bob_for_chat = Arc::try_unwrap(bob)
+                    .map_err(|_| "Bob state still shared after handshake")?
+                    .into_inner()
+                    .map_err(|_| "Bob state lock poisoned")?;
+                flush_pending_messages_to_alice(
+                    &connection,
+                    &mut bob_for_chat,
+                    &local_display_name,
+                    &session.remote_display_name,
+                    &session.conversation_id,
+                    db_path,
+                )
+                .await?;
+                save_bob_identity(db_path, &bob_for_chat)?;
+
+                println!("Connected securely");
+                chat_loop_bob_shared(
+                    connection,
+                    Some(endpoint.clone()),
+                    Arc::new(Mutex::new(bob_for_chat)),
+                    local_display_name.clone(),
+                    session.remote_display_name,
+                    session.conversation_id,
+                    db_path.to_path_buf(),
+                )
+                .await?;
+                println!("Listener still running");
+            }
+            Err(error) => println!("Handshake failed: {error}"),
+        }
+    }
+}
+
 async fn run_chat_alice(bob_addr: SocketAddr, db_path: &Path) -> AppResult<()> {
-    let session = connect_alice_chat(bob_addr, db_path).await?;
+    let session = connect_alice_chat(bob_addr, db_path, None).await?;
     chat_loop_alice(
         session.connection,
         session.alice,
@@ -2652,9 +2722,13 @@ struct AliceChatSession {
     conversation_id: String,
 }
 
-async fn connect_alice_chat(bob_addr: SocketAddr, db_path: &Path) -> AppResult<AliceChatSession> {
+async fn connect_alice_chat(
+    bob_addr: SocketAddr,
+    db_path: &Path,
+    expected_conversation_id: Option<&str>,
+) -> AppResult<AliceChatSession> {
     let local_display_name = load_or_prompt_display_name(db_path)?;
-    let mut alice = Alice::local();
+    let mut alice = load_or_create_alice_identity(db_path)?;
     let mut endpoint = Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?;
     endpoint.set_default_client_config(insecure_client_config()?);
 
@@ -2664,6 +2738,7 @@ async fn connect_alice_chat(bob_addr: SocketAddr, db_path: &Path) -> AppResult<A
     let bundle_bytes = receive_bytes(&mut recv).await?;
     let (remote_display_name, bundle) = decode_chat_prekey_bundle(&bundle_bytes)?;
     let conversation_id = contact_id_for_identity(&bundle.identity_public_key);
+    authenticate_reconnect_peer(db_path, expected_conversation_id, &conversation_id, &bundle)?;
     save_contact_for_chat(
         db_path,
         &conversation_id,
@@ -2673,6 +2748,7 @@ async fn connect_alice_chat(bob_addr: SocketAddr, db_path: &Path) -> AppResult<A
     )?;
 
     let initial_message = alice.encrypt_initial_message(&bundle, "")?;
+    save_alice_identity(db_path, &alice)?;
     let mut send = connection.open_uni().await?;
     send_bytes(
         &mut send,
@@ -2693,6 +2769,7 @@ async fn connect_alice_chat(bob_addr: SocketAddr, db_path: &Path) -> AppResult<A
         db_path,
     )
     .await?;
+    save_alice_identity(db_path, &alice)?;
 
     Ok(AliceChatSession {
         connection,
@@ -2745,6 +2822,10 @@ async fn complete_bob_chat_handshake(
             .map_err(|_| "Bob state lock poisoned")?
             .decrypt_initial_message(&initial_message.message)?
     };
+    {
+        let bob = bob.lock().map_err(|_| "Bob state lock poisoned")?;
+        save_bob_identity(db_path, &bob)?;
+    }
     let conversation_id = initial_message
         .sender_identity_public_key
         .as_ref()
@@ -2876,10 +2957,13 @@ async fn chat_loop_alice(
                 match frame {
                     ChatFrame::Message { message_id, sender_display_name, message } => {
                         if !chat_message_already_saved(&db_path, &message_id)? {
-                            let plaintext = alice
-                                .lock()
-                                .map_err(|_| "Alice state lock poisoned")?
-                                .decrypt_from_bob(&message)?;
+                            let plaintext = {
+                                let mut alice =
+                                    alice.lock().map_err(|_| "Alice state lock poisoned")?;
+                                let plaintext = alice.decrypt_from_bob(&message)?;
+                                save_alice_identity(&db_path, &alice)?;
+                                plaintext
+                            };
                             persist_chat_message(
                                 &db_path,
                                 ChatHistoryEntry {
@@ -3010,10 +3094,12 @@ async fn chat_loop_bob_shared(
                 match frame {
                     ChatFrame::Message { message_id, sender_display_name, message } => {
                         if !chat_message_already_saved(&db_path, &message_id)? {
-                            let plaintext = bob
-                                .lock()
-                                .map_err(|_| "Bob state lock poisoned")?
-                                .decrypt_from_alice(&message)?;
+                            let plaintext = {
+                                let mut bob = bob.lock().map_err(|_| "Bob state lock poisoned")?;
+                                let plaintext = bob.decrypt_from_alice(&message)?;
+                                save_bob_identity(&db_path, &bob)?;
+                                plaintext
+                            };
                             persist_chat_message(
                                 &db_path,
                                 ChatHistoryEntry {
@@ -3120,10 +3206,12 @@ async fn send_alice_chat_line_with_id(
     line: String,
     existing_message_id: Option<String>,
 ) -> AppResult<String> {
-    let message = alice
-        .lock()
-        .map_err(|_| "Alice state lock poisoned")?
-        .encrypt_for_bob(&line)?;
+    let message = {
+        let mut alice = alice.lock().map_err(|_| "Alice state lock poisoned")?;
+        let message = alice.encrypt_for_bob(&line)?;
+        save_alice_identity(db_path, &alice)?;
+        message
+    };
     let message_bytes = bincode::serialize(&message)?;
     let message_id = existing_message_id.unwrap_or_else(|| {
         chat_message_id(
@@ -3194,10 +3282,12 @@ async fn send_bob_chat_line_with_id(
     line: String,
     existing_message_id: Option<String>,
 ) -> AppResult<String> {
-    let message = bob
-        .lock()
-        .map_err(|_| "Bob state lock poisoned")?
-        .encrypt_for_alice(&line)?;
+    let message = {
+        let mut bob = bob.lock().map_err(|_| "Bob state lock poisoned")?;
+        let message = bob.encrypt_for_alice(&line)?;
+        save_bob_identity(db_path, &bob)?;
+        message
+    };
     let message_bytes = bincode::serialize(&message)?;
     let message_id = existing_message_id.unwrap_or_else(|| {
         chat_message_id(
@@ -3352,6 +3442,7 @@ async fn flush_pending_messages_to_bob(
         let storage = Storage::open(db_path)?;
         storage.record_pending_peer_message_attempt(&pending_message.message_id)?;
         let message = alice.encrypt_for_bob(&pending_message.plaintext)?;
+        save_alice_identity(db_path, alice)?;
         let frame = ChatFrame::Message {
             message_id: pending_message.message_id.clone(),
             sender_display_name: local_display_name.to_string(),
@@ -3406,6 +3497,7 @@ async fn flush_pending_messages_to_alice(
         let storage = Storage::open(db_path)?;
         storage.record_pending_peer_message_attempt(&pending_message.message_id)?;
         let message = bob.encrypt_for_alice(&pending_message.plaintext)?;
+        save_bob_identity(db_path, bob)?;
         let frame = ChatFrame::Message {
             message_id: pending_message.message_id.clone(),
             sender_display_name: local_display_name.to_string(),
@@ -3552,6 +3644,7 @@ async fn handle_incoming_during_alice_flush(
         } => {
             if !chat_message_already_saved(db_path, &message_id)? {
                 let plaintext = alice.decrypt_from_bob(&message)?;
+                save_alice_identity(db_path, alice)?;
                 persist_chat_message(
                     db_path,
                     ChatHistoryEntry {
@@ -3599,6 +3692,7 @@ async fn handle_incoming_during_bob_flush(
         } => {
             if !chat_message_already_saved(db_path, &message_id)? {
                 let plaintext = bob.decrypt_from_alice(&message)?;
+                save_bob_identity(db_path, bob)?;
                 persist_chat_message(
                     db_path,
                     ChatHistoryEntry {
@@ -3724,6 +3818,72 @@ fn load_or_prompt_display_name(db_path: &Path) -> AppResult<String> {
     storage.save_display_name(&display_name)?;
 
     Ok(display_name)
+}
+
+fn load_or_create_alice_identity(db_path: &Path) -> AppResult<Alice> {
+    let storage = Storage::open(db_path)?;
+    if let Some(state_bytes) = storage.load_local_identity(LOCAL_ALICE_IDENTITY_ID)? {
+        let mut state: AliceState = bincode::deserialize(&state_bytes)?;
+        state.session = None;
+        return Ok(Alice::from_state(state));
+    }
+
+    let alice = Alice::local();
+    save_alice_identity(db_path, &alice)?;
+    Ok(alice)
+}
+
+fn load_or_create_bob_identity(db_path: &Path) -> AppResult<Bob> {
+    let storage = Storage::open(db_path)?;
+    if let Some(state_bytes) = storage.load_local_identity(LOCAL_BOB_IDENTITY_ID)? {
+        let mut state: BobState = bincode::deserialize(&state_bytes)?;
+        state.session = None;
+        return Ok(Bob::from_state(state));
+    }
+
+    let bob = Bob::local();
+    save_bob_identity(db_path, &bob)?;
+    Ok(bob)
+}
+
+fn save_alice_identity(db_path: &Path, alice: &Alice) -> AppResult<()> {
+    Storage::open(db_path)?.save_local_identity(
+        LOCAL_ALICE_IDENTITY_ID,
+        "alice",
+        &bincode::serialize(&alice.export_state())?,
+    )?;
+    Ok(())
+}
+
+fn save_bob_identity(db_path: &Path, bob: &Bob) -> AppResult<()> {
+    Storage::open(db_path)?.save_local_identity(
+        LOCAL_BOB_IDENTITY_ID,
+        "bob",
+        &bincode::serialize(&bob.export_state())?,
+    )?;
+    Ok(())
+}
+
+fn authenticate_reconnect_peer(
+    db_path: &Path,
+    expected_conversation_id: Option<&str>,
+    actual_conversation_id: &str,
+    bundle: &PreKeyBundle,
+) -> AppResult<()> {
+    let Some(expected_conversation_id) = expected_conversation_id else {
+        return Ok(());
+    };
+    if actual_conversation_id != expected_conversation_id {
+        return Err("reconnect reached a different peer identity".into());
+    }
+
+    if let Some(contact) = Storage::open(db_path)?.load_contact(expected_conversation_id)? {
+        if contact.identity_public_key.as_slice() != bundle.identity_public_key {
+            return Err("saved peer identity does not match reconnect handshake".into());
+        }
+    }
+
+    Ok(())
 }
 
 fn save_contact_for_chat(
@@ -5555,6 +5715,12 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod discovery_tests {
     use super::*;
 
+    fn temp_profile_db(name: &str) -> PathBuf {
+        let mut random = [0u8; 8];
+        fill_random(&mut random).expect("random temp suffix");
+        std::env::temp_dir().join(format!("ciphermesh-{name}-{}.sqlite", hex_encode(&random)))
+    }
+
     #[test]
     fn unspecified_app_address_uses_discovered_peer_ip() {
         let peer_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
@@ -5575,6 +5741,52 @@ mod discovery_tests {
 
         assert!(key_text.contains(&libp2p_peer_id.to_string()));
         assert!(!key_text.contains(&format!("{ciphermesh_identity:?}")));
+    }
+
+    #[test]
+    fn chat_alice_identity_is_durable_across_profile_reopen() {
+        let path = temp_profile_db("alice-identity");
+        let first_identity = load_or_create_alice_identity(&path)
+            .expect("create alice")
+            .signed_key_exchange()
+            .identity_public_key;
+        let second_identity = load_or_create_alice_identity(&path)
+            .expect("reload alice")
+            .signed_key_exchange()
+            .identity_public_key;
+
+        assert_eq!(first_identity, second_identity);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reconnect_authentication_rejects_different_saved_peer_identity() {
+        let path = temp_profile_db("reconnect-auth");
+        let bob = Bob::local();
+        let saved_bundle = bob.prekey_bundle().expect("saved bundle");
+        let conversation_id = contact_id_for_identity(&saved_bundle.identity_public_key);
+        save_contact_for_chat(
+            &path,
+            &conversation_id,
+            "Bob",
+            &saved_bundle.identity_public_key,
+            "quic:127.0.0.1:5000",
+        )
+        .expect("save contact");
+
+        let impostor = Bob::local();
+        let impostor_bundle = impostor.prekey_bundle().expect("impostor bundle");
+        let impostor_conversation_id =
+            contact_id_for_identity(&impostor_bundle.identity_public_key);
+
+        assert!(authenticate_reconnect_peer(
+            &path,
+            Some(&conversation_id),
+            &impostor_conversation_id,
+            &impostor_bundle,
+        )
+        .is_err());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
