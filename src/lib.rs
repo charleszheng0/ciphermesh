@@ -1202,6 +1202,12 @@ impl Bob {
         })
     }
 
+    pub fn replenish_one_time_prekey(&mut self, id: u64) {
+        if self.one_time_prekey.is_none() {
+            self.one_time_prekey = Some(OneTimePreKey::generate(id));
+        }
+    }
+
     pub fn derive_session_key(
         &mut self,
         alice_exchange: &SignedKeyExchange,
@@ -1472,6 +1478,34 @@ mod tests {
             Err(CryptoError::PreKeyUnavailable)
         );
         assert_eq!(bob.prekey_bundle(), Err(CryptoError::PreKeyUnavailable));
+    }
+
+    #[test]
+    fn bob_can_replenish_one_time_prekey_without_changing_identity() {
+        let mut bob = Bob::local();
+        let first = bob.prekey_bundle().expect("first bundle");
+        let mut alice = Alice::local();
+        let initial = alice
+            .encrypt_initial_message(&first, "hello")
+            .expect("initial message");
+        bob.decrypt_initial_message(&initial)
+            .expect("consume first prekey");
+
+        assert_eq!(bob.prekey_bundle(), Err(CryptoError::PreKeyUnavailable));
+
+        bob.replenish_one_time_prekey(2);
+        let second = bob.prekey_bundle().expect("second bundle");
+
+        assert_eq!(second.identity_public_key, first.identity_public_key);
+        assert_eq!(
+            second.signed_prekey_public_key,
+            first.signed_prekey_public_key
+        );
+        assert_ne!(
+            second.one_time_prekey_public_key,
+            first.one_time_prekey_public_key
+        );
+        assert_eq!(second.one_time_prekey_id, 2);
     }
 
     #[test]
