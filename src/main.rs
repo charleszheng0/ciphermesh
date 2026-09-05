@@ -1443,7 +1443,11 @@ async fn run_create_invite(
     rendezvous_db: &Path,
     profile_db: &Path,
 ) -> AppResult<()> {
-    let advertised_addr = advertise_socket_addr(listen_addr)?;
+    let local_display_name = load_or_prompt_display_name(profile_db)?;
+    let bob = load_or_create_bob_identity(profile_db)?;
+    let endpoint = bind_quic_listener(listen_addr)?;
+    let bound_addr = endpoint.local_addr()?;
+    let advertised_addr = advertise_socket_addr(bound_addr)?;
     if let Some(parent) = rendezvous_db.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1464,8 +1468,9 @@ async fn run_create_invite(
     println!("Invite created");
     println!("Invite: {invite}");
     println!("Invite expires in 5 minutes");
+    println!("Listening on {bound_addr}");
     println!("Waiting for peer");
-    run_chat_bob(listen_addr, profile_db).await
+    run_chat_bob_with_endpoint(endpoint, local_display_name, bob, profile_db).await
 }
 
 async fn run_join_invite(code: &str, rendezvous_db: &Path, profile_db: &Path) -> AppResult<()> {
@@ -2666,8 +2671,23 @@ async fn run_alice(bob_addr: SocketAddr, message: &str, db_path: &Path) -> AppRe
 
 async fn run_chat_bob(listen_addr: SocketAddr, db_path: &Path) -> AppResult<()> {
     let local_display_name = load_or_prompt_display_name(db_path)?;
-    let mut bob = load_or_create_bob_identity(db_path)?;
-    let endpoint = Endpoint::server(server_config()?, listen_addr)?;
+    let bob = load_or_create_bob_identity(db_path)?;
+    let endpoint = bind_quic_listener(listen_addr)?;
+
+    run_chat_bob_with_endpoint(endpoint, local_display_name, bob, db_path).await
+}
+
+fn bind_quic_listener(listen_addr: SocketAddr) -> AppResult<Endpoint> {
+    Endpoint::server(server_config()?, listen_addr)
+        .map_err(|error| format!("could not start QUIC listener on {listen_addr}: {error}").into())
+}
+
+async fn run_chat_bob_with_endpoint(
+    endpoint: Endpoint,
+    local_display_name: String,
+    mut bob: Bob,
+    db_path: &Path,
+) -> AppResult<()> {
     println!("Waiting for peer");
 
     let incoming = endpoint.accept().await.ok_or("endpoint closed")?;
