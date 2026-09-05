@@ -48,8 +48,7 @@ const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAILBOX_ENVELOPE_TTL_SECS: u64 = 5 * 60;
 const MAILBOX_MAX_ENVELOPES: usize = 64;
 const CHAT_PROMPT: &str = "> You: ";
-const CHAT_INPUT_INSTRUCTION: &str =
-    "Type a message, /reconnect to reconnect, or /back to return to Messages.";
+const CHAT_INPUT_INSTRUCTION: &str = "Type a message, or /back to return to Messages.";
 const DISPLAY_NAME_MAX_CHARS: usize = 32;
 const LOCAL_ALICE_IDENTITY_ID: &str = "alice";
 const LOCAL_BOB_IDENTITY_ID: &str = "bob";
@@ -60,7 +59,7 @@ const DEFAULT_INVITE_DB: &str = "target/ciphermesh-invites.sqlite";
 const DEFAULT_INVITE_LISTEN_ADDR: &str = "0.0.0.0:5000";
 const RECENT_CHAT_LIMIT: usize = 3;
 const CHAT_HISTORY_PAGE_SIZE: usize = 6;
-const SAVED_CHAT_RECONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const CHAT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PENDING_DELIVERY_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const PAGE_BREAK: &str = "----";
 
@@ -1090,7 +1089,6 @@ async fn run_chat_history_menu(profile_db: &Path) -> AppResult<()> {
             print_recent_chat_summary(index + 1, summary);
         }
         println!("[A] View All Chats");
-        println!("[R] Reconnect");
         println!("[B] Back");
         println!();
 
@@ -1102,11 +1100,6 @@ async fn run_chat_history_menu(profile_db: &Path) -> AppResult<()> {
             run_all_chat_history_menu(profile_db).await?;
             continue;
         }
-        if selection.eq_ignore_ascii_case("r") {
-            reconnect_selected_chat(profile_db, &chats[..recent_count]).await?;
-            continue;
-        }
-
         match selection
             .trim()
             .parse::<usize>()
@@ -1160,9 +1153,6 @@ async fn run_all_chat_history_menu(profile_db: &Path) -> AppResult<()> {
         if page + 1 < total_pages {
             println!("[N] Next Page");
         }
-        if !page_chats.is_empty() {
-            println!("[R] Reconnect");
-        }
         println!("[B] Back");
         println!();
 
@@ -1188,11 +1178,6 @@ async fn run_all_chat_history_menu(profile_db: &Path) -> AppResult<()> {
             }
             continue;
         }
-        if selection.eq_ignore_ascii_case("r") {
-            reconnect_selected_chat(profile_db, &page_chats).await?;
-            continue;
-        }
-
         match selection
             .trim()
             .parse::<usize>()
@@ -1214,35 +1199,6 @@ async fn run_all_chat_history_menu(profile_db: &Path) -> AppResult<()> {
             }
         }
     }
-}
-
-async fn reconnect_selected_chat(profile_db: &Path, chats: &[ChatSummary]) -> AppResult<()> {
-    let selection = prompt_line("Reconnect chat number: ")?;
-    if is_back_selection(&selection) {
-        return Ok(());
-    }
-
-    match selection
-        .trim()
-        .parse::<usize>()
-        .ok()
-        .filter(|index| (1..=chats.len()).contains(index))
-        .and_then(|index| chats.get(index.saturating_sub(1)))
-    {
-        Some(selected) => {
-            match reconnect_saved_conversation(profile_db, &selected.contact.contact_id).await {
-                Ok(()) => {}
-                Err(error) => println!("Reconnect failed: {error}"),
-            }
-            println!();
-        }
-        None => {
-            println!("Invalid selection");
-            println!();
-        }
-    }
-
-    Ok(())
 }
 
 fn print_recent_chat_summary(index: usize, summary: &ChatSummary) {
@@ -1319,14 +1275,6 @@ async fn open_saved_conversation(
         if is_chat_back_command(&line) {
             return Ok(());
         }
-        if is_chat_reconnect_command(&line) {
-            match reconnect_saved_conversation(profile_db, conversation_id).await {
-                Ok(()) => return Ok(()),
-                Err(error) => println!("Reconnect failed: {error}"),
-            }
-            println!();
-            continue;
-        }
         if line.trim().eq_ignore_ascii_case("/clear") {
             let storage = Storage::open(profile_db)?;
             let removed = storage.clear_conversation_history(conversation_id)?;
@@ -1347,38 +1295,11 @@ async fn open_saved_conversation(
             }
             None => {
                 println!("This legacy conversation is missing a cryptographic peer profile.");
-                println!("Reconnect with this peer once before queueing offline messages.");
+                println!("Start a fresh chat with this peer before queueing offline messages.");
             }
         }
         println!();
     }
-}
-
-async fn reconnect_saved_conversation(profile_db: &Path, conversation_id: &str) -> AppResult<()> {
-    let session = reconnect_alice_chat_session(profile_db, conversation_id).await?;
-    chat_loop_alice(
-        session.connection,
-        session.alice,
-        session.local_display_name,
-        session.remote_display_name,
-        session.conversation_id,
-        profile_db.to_path_buf(),
-    )
-    .await
-}
-
-async fn reconnect_alice_chat_session(
-    profile_db: &Path,
-    conversation_id: &str,
-) -> AppResult<AliceChatSession> {
-    let storage = Storage::open(profile_db)?;
-    let contact = storage
-        .load_contact(conversation_id)?
-        .ok_or("saved contact missing")?;
-    let peer_addr = reconnect_addr_from_contact(&contact)?;
-
-    println!("Reconnecting to {}", contact.display_name);
-    connect_alice_chat(peer_addr, profile_db, Some(conversation_id)).await
 }
 
 fn load_known_peer_for_conversation(
@@ -1517,10 +1438,6 @@ fn is_quit_selection(selection: &str) -> bool {
 fn is_chat_back_command(line: &str) -> bool {
     let line = line.trim();
     line.eq_ignore_ascii_case("/back") || line.eq_ignore_ascii_case("/exit")
-}
-
-fn is_chat_reconnect_command(line: &str) -> bool {
-    line.trim().eq_ignore_ascii_case("/reconnect")
 }
 
 fn generate_invite_code() -> AppResult<String> {
@@ -1953,7 +1870,7 @@ fn run_device_fanout_demo() -> AppResult<()> {
     assert_eq!(restored_phone_envelope, phone_second);
     let phone_second_plaintext = phone_session.decrypt(&restored_phone_envelope)?;
     storage.mark_outbox_delivered(&pending_phone_delivery.message_id)?;
-    println!("Phone later reconnected and decrypted: {phone_second_plaintext}");
+    println!("Phone later came back online and decrypted: {phone_second_plaintext}");
     println!(
         "Pending outbox deliveries after Phone ACK: {}",
         storage.pending_outbox_items()?.len()
@@ -2592,7 +2509,7 @@ async fn run_alice(bob_addr: SocketAddr, message: &str, db_path: &Path) -> AppRe
     endpoint.set_default_client_config(insecure_client_config()?);
 
     let connecting = endpoint.connect(bob_addr, "localhost")?;
-    let connection = time::timeout(SAVED_CHAT_RECONNECT_TIMEOUT, connecting)
+    let connection = time::timeout(CHAT_CONNECT_TIMEOUT, connecting)
         .await
         .map_err(|_| format!("connection to {bob_addr} timed out; is the peer listening?"))??;
     println!("Connected to peer at {}", connection.remote_address());
@@ -2770,7 +2687,7 @@ async fn run_chat_bob_with_endpoint(
 async fn run_chat_listener(listen_addr: SocketAddr, db_path: &Path) -> AppResult<()> {
     let local_display_name = load_or_prompt_display_name(db_path)?;
     let endpoint = Endpoint::server(server_config()?, listen_addr)?;
-    println!("Listening for chats and reconnects on {listen_addr}");
+    println!("Listening for chats on {listen_addr}");
 
     loop {
         let Some(incoming) = endpoint.accept().await else {
@@ -2828,7 +2745,7 @@ async fn run_chat_listener(listen_addr: SocketAddr, db_path: &Path) -> AppResult
 }
 
 async fn run_chat_alice(bob_addr: SocketAddr, db_path: &Path) -> AppResult<()> {
-    let session = connect_alice_chat(bob_addr, db_path, None).await?;
+    let session = connect_alice_chat(bob_addr, db_path).await?;
     chat_loop_alice(
         session.connection,
         session.alice,
@@ -2848,18 +2765,14 @@ struct AliceChatSession {
     conversation_id: String,
 }
 
-async fn connect_alice_chat(
-    bob_addr: SocketAddr,
-    db_path: &Path,
-    expected_conversation_id: Option<&str>,
-) -> AppResult<AliceChatSession> {
+async fn connect_alice_chat(bob_addr: SocketAddr, db_path: &Path) -> AppResult<AliceChatSession> {
     let local_display_name = load_or_prompt_display_name(db_path)?;
     let mut alice = load_or_create_alice_identity(db_path)?;
     let mut endpoint = Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?;
     endpoint.set_default_client_config(insecure_client_config()?);
 
     let connecting = endpoint.connect(bob_addr, "localhost")?;
-    let connection = time::timeout(SAVED_CHAT_RECONNECT_TIMEOUT, connecting)
+    let connection = time::timeout(CHAT_CONNECT_TIMEOUT, connecting)
         .await
         .map_err(|_| format!("connection to {bob_addr} timed out; is the peer listening?"))??;
 
@@ -2867,7 +2780,6 @@ async fn connect_alice_chat(
     let bundle_bytes = receive_bytes(&mut recv).await?;
     let (remote_display_name, bundle) = decode_chat_prekey_bundle(&bundle_bytes)?;
     let conversation_id = contact_id_for_identity(&bundle.identity_public_key);
-    authenticate_reconnect_peer(db_path, expected_conversation_id, &conversation_id, &bundle)?;
     save_contact_for_chat(
         db_path,
         &conversation_id,
@@ -2909,14 +2821,7 @@ async fn connect_alice_chat(
     })
 }
 
-async fn accept_reconnect(endpoint: &Option<Endpoint>) -> Option<quinn::Incoming> {
-    match endpoint {
-        Some(endpoint) => endpoint.accept().await,
-        None => std::future::pending().await,
-    }
-}
-
-struct BobReconnectSession {
+struct BobChatSession {
     remote_display_name: String,
     conversation_id: String,
 }
@@ -2926,7 +2831,7 @@ async fn complete_bob_chat_handshake(
     bob: Arc<Mutex<Bob>>,
     local_display_name: &str,
     db_path: &Path,
-) -> AppResult<BobReconnectSession> {
+) -> AppResult<BobChatSession> {
     let bundle = {
         let mut bob = bob.lock().map_err(|_| "Bob state lock poisoned")?;
         bob.replenish_one_time_prekey(now_unix_secs());
@@ -2988,21 +2893,21 @@ async fn complete_bob_chat_handshake(
         )?;
     }
 
-    Ok(BobReconnectSession {
+    Ok(BobChatSession {
         remote_display_name,
         conversation_id,
     })
 }
 
 async fn chat_loop_alice(
-    mut connection: quinn::Connection,
+    connection: quinn::Connection,
     alice: Alice,
     local_display_name: String,
     remote_display_name: String,
     conversation_id: String,
     db_path: PathBuf,
 ) -> AppResult<()> {
-    let mut alice = Arc::new(Mutex::new(alice));
+    let alice = Arc::new(Mutex::new(alice));
     print_conversation_history(&db_path, &conversation_id, &remote_display_name)?;
     let mut terminal = spawn_line_editor()?;
     let mut online = true;
@@ -3021,25 +2926,6 @@ async fn chat_loop_alice(
                 if is_chat_back_command(&line) {
                     println!("Returning to Messages");
                     return Ok(());
-                }
-                if is_chat_reconnect_command(&line) {
-                    if online {
-                        println!("Already connected");
-                        continue;
-                    }
-                    match reconnect_alice_chat_session(&db_path, &conversation_id).await {
-                        Ok(session) => {
-                            connection = session.connection;
-                            alice = Arc::new(Mutex::new(session.alice));
-                            online = true;
-                            println!("Reconnected securely");
-                            print_conversation_history(&db_path, &conversation_id, &remote_display_name)?;
-                        }
-                        Err(error) => {
-                            println!("Reconnect failed: {error}");
-                        }
-                    }
-                    continue;
                 }
                 if online {
                     match send_alice_chat_line(
@@ -3131,7 +3017,7 @@ async fn chat_loop_alice(
 
 async fn chat_loop_bob(
     connection: quinn::Connection,
-    reconnect_endpoint: Option<Endpoint>,
+    listener_guard: Option<Endpoint>,
     bob: Bob,
     local_display_name: String,
     remote_display_name: String,
@@ -3140,7 +3026,7 @@ async fn chat_loop_bob(
 ) -> AppResult<()> {
     chat_loop_bob_shared(
         connection,
-        reconnect_endpoint,
+        listener_guard,
         Arc::new(Mutex::new(bob)),
         local_display_name,
         remote_display_name,
@@ -3151,12 +3037,12 @@ async fn chat_loop_bob(
 }
 
 async fn chat_loop_bob_shared(
-    mut connection: quinn::Connection,
-    reconnect_endpoint: Option<Endpoint>,
+    connection: quinn::Connection,
+    _listener_guard: Option<Endpoint>,
     bob: Arc<Mutex<Bob>>,
     local_display_name: String,
-    mut remote_display_name: String,
-    mut conversation_id: String,
+    remote_display_name: String,
+    conversation_id: String,
     db_path: PathBuf,
 ) -> AppResult<()> {
     print_conversation_history(&db_path, &conversation_id, &remote_display_name)?;
@@ -3259,39 +3145,6 @@ async fn chat_loop_bob_shared(
                         }
                     }
                     ChatFrame::Ack { .. } => {}
-                }
-            }
-            reconnect = accept_reconnect(&reconnect_endpoint), if !online && reconnect_endpoint.is_some() => {
-                let Some(incoming) = reconnect else {
-                    return Err("listener closed".into());
-                };
-                match incoming.await {
-                    Ok(new_connection) => {
-                        println!("Peer reconnecting...");
-                        match complete_bob_chat_handshake(
-                            &new_connection,
-                            Arc::clone(&bob),
-                            &local_display_name,
-                            &db_path,
-                        )
-                        .await
-                        {
-                            Ok(session) => {
-                                connection = new_connection;
-                                remote_display_name = session.remote_display_name;
-                                conversation_id = session.conversation_id;
-                                online = true;
-                                println!("Reconnected securely");
-                                print_conversation_history(&db_path, &conversation_id, &remote_display_name)?;
-                            }
-                            Err(error) => {
-                                println!("Reconnect failed: {error}");
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        println!("Reconnect failed: {error}");
-                    }
                 }
             }
         }
@@ -3492,7 +3345,7 @@ fn handle_peer_disconnected(display_name: &str) {
     println!("{peer} disconnected.");
     println!("Status: Offline");
     println!("Messages you type now will be queued for delivery.");
-    println!("Use /reconnect to reconnect, or /back to return to Messages.");
+    println!("Use /back to return to Messages.");
     println!();
 }
 
@@ -4038,28 +3891,6 @@ fn save_bob_identity(db_path: &Path, bob: &Bob) -> AppResult<()> {
     Ok(())
 }
 
-fn authenticate_reconnect_peer(
-    db_path: &Path,
-    expected_conversation_id: Option<&str>,
-    actual_conversation_id: &str,
-    bundle: &PreKeyBundle,
-) -> AppResult<()> {
-    let Some(expected_conversation_id) = expected_conversation_id else {
-        return Ok(());
-    };
-    if actual_conversation_id != expected_conversation_id {
-        return Err("reconnect reached a different peer identity".into());
-    }
-
-    if let Some(contact) = Storage::open(db_path)?.load_contact(expected_conversation_id)? {
-        if contact.identity_public_key.as_slice() != bundle.identity_public_key {
-            return Err("saved peer identity does not match reconnect handshake".into());
-        }
-    }
-
-    Ok(())
-}
-
 fn save_contact_for_chat(
     db_path: &Path,
     contact_id: &str,
@@ -4235,15 +4066,6 @@ fn pending_peer_message_id(peer_id: &str, plaintext: &str) -> AppResult<String> 
 
 fn quic_discovery_hint(addr: SocketAddr) -> String {
     format!("quic:{addr}")
-}
-
-fn reconnect_addr_from_contact(contact: &ContactRecord) -> AppResult<SocketAddr> {
-    contact
-        .discovery_hint
-        .strip_prefix("quic:")
-        .ok_or("This side cannot dial that peer yet; start chat-listen so the peer can reconnect.")?
-        .parse::<SocketAddr>()
-        .map_err(|error| format!("saved reconnect address is invalid: {error}").into())
 }
 
 fn contact_id_for_identity(identity_public_key: &[u8; 32]) -> String {
@@ -6021,52 +5843,6 @@ mod discovery_tests {
     }
 
     #[test]
-    fn reconnect_authentication_rejects_different_saved_peer_identity() {
-        let path = temp_profile_db("reconnect-auth");
-        let bob = Bob::local();
-        let saved_bundle = bob.prekey_bundle().expect("saved bundle");
-        let conversation_id = contact_id_for_identity(&saved_bundle.identity_public_key);
-        save_contact_for_chat(
-            &path,
-            &conversation_id,
-            "Bob",
-            &saved_bundle.identity_public_key,
-            "quic:127.0.0.1:5000",
-        )
-        .expect("save contact");
-
-        let impostor = Bob::local();
-        let impostor_bundle = impostor.prekey_bundle().expect("impostor bundle");
-        let impostor_conversation_id =
-            contact_id_for_identity(&impostor_bundle.identity_public_key);
-
-        assert!(authenticate_reconnect_peer(
-            &path,
-            Some(&conversation_id),
-            &impostor_conversation_id,
-            &impostor_bundle,
-        )
-        .is_err());
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn host_side_contact_without_quic_hint_fails_reconnect_fast() {
-        let contact = ContactRecord {
-            contact_id: "contact-alice".to_string(),
-            display_name: "Alice".to_string(),
-            identity_public_key: vec![1; 32],
-            discovery_hint: "direct QUIC".to_string(),
-            saved_at_unix_secs: now_unix_secs(),
-        };
-
-        let error = reconnect_addr_from_contact(&contact).expect_err("missing quic hint");
-        assert!(error
-            .to_string()
-            .contains("This side cannot dial that peer yet"));
-    }
-
-    #[test]
     fn relay_dial_address_targets_peer_through_circuit() {
         let relay_peer_id = PeerId::from(identity::Keypair::generate_ed25519().public());
         let target_peer_id = PeerId::from(identity::Keypair::generate_ed25519().public());
@@ -6185,17 +5961,13 @@ mod discovery_tests {
     }
 
     #[test]
-    fn only_slash_commands_leave_active_chat_input() {
+    fn only_back_slash_commands_leave_active_chat_input() {
         assert!(!is_chat_back_command("B"));
         assert!(!is_chat_back_command("back"));
         assert!(!is_chat_back_command("hello /back"));
         assert!(is_chat_back_command("/back"));
         assert!(is_chat_back_command("/back "));
         assert!(is_chat_back_command("/exit"));
-        assert!(!is_chat_reconnect_command("reconnect"));
-        assert!(!is_chat_reconnect_command("hello /reconnect"));
-        assert!(is_chat_reconnect_command("/reconnect"));
-        assert!(is_chat_reconnect_command("/reconnect "));
     }
 
     #[test]
