@@ -50,6 +50,7 @@ const MAILBOX_MAX_ENVELOPES: usize = 64;
 const CHAT_PROMPT: &str = "> You: ";
 const CHAT_INPUT_INSTRUCTION: &str =
     "Type a message, /reconnect to reconnect, or /back to return to Messages.";
+const DISPLAY_NAME_MAX_CHARS: usize = 32;
 const LOCAL_ALICE_IDENTITY_ID: &str = "alice";
 const LOCAL_BOB_IDENTITY_ID: &str = "bob";
 const INVITE_CODE_LEN: usize = 6;
@@ -59,6 +60,7 @@ const DEFAULT_INVITE_DB: &str = "target/ciphermesh-invites.sqlite";
 const DEFAULT_INVITE_LISTEN_ADDR: &str = "127.0.0.1:5000";
 const RECENT_CHAT_LIMIT: usize = 3;
 const CHAT_HISTORY_PAGE_SIZE: usize = 6;
+const SAVED_CHAT_RECONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PENDING_DELIVERY_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const PAGE_BREAK: &str = "----";
 
@@ -308,6 +310,7 @@ fn print_usage() {
     println!("Product menu:");
     println!("  cargo run");
     println!("  cargo run -- help");
+    println!("  On one computer, choose a different local profile in each terminal.");
     println!();
     println!("Phase 3B mDNS discovery test:");
     println!("  Terminal 1: cargo run -- bob 0.0.0.0:5000");
@@ -900,35 +903,68 @@ enum ScreenAction {
 }
 
 async fn run_product_menu() -> AppResult<()> {
+    let Some(current_profile_db) = select_product_profile()? else {
+        return Ok(());
+    };
+
     loop {
-        match run_main_menu_screen().await? {
+        match run_main_menu_screen(&current_profile_db).await? {
             ScreenAction::Stay | ScreenAction::Back => {}
             ScreenAction::Quit => return Ok(()),
         }
     }
 }
 
-async fn run_main_menu_screen() -> AppResult<ScreenAction> {
+fn select_product_profile() -> AppResult<Option<PathBuf>> {
+    loop {
+        print_page_break();
+        println!("Select Local Profile");
+        println!();
+        println!("[1] Profile 1");
+        println!("[2] Profile 2");
+        println!("[Q] Quit");
+        println!();
+
+        match prompt_line("Select: ")?.trim() {
+            "1" => return Ok(Some(local_profile_db("profile-1"))),
+            "2" => return Ok(Some(local_profile_db("profile-2"))),
+            selection if is_quit_selection(selection) => return Ok(None),
+            _ => {
+                println!("Invalid selection");
+                println!();
+            }
+        }
+    }
+}
+
+async fn run_main_menu_screen(current_profile_db: &Path) -> AppResult<ScreenAction> {
     print_page_break();
     println!("CipherMesh");
     println!();
     println!("[1] Create invite");
     println!("[2] Join invite");
-    println!("[3] Messages");
+    println!("[3] Chat History");
+    println!("[4] Profile");
     println!("[Q] Quit");
+    println!();
+    println!("Current profile: {}", profile_label(current_profile_db));
     println!();
 
     match prompt_line("Select: ")?.trim() {
         "1" => {
-            run_create_invite_menu().await?;
+            run_create_invite_menu(current_profile_db).await?;
             Ok(ScreenAction::Stay)
         }
         "2" => {
-            run_join_invite_menu().await?;
+            run_join_invite_menu(current_profile_db).await?;
             Ok(ScreenAction::Stay)
         }
         "3" => {
-            run_chat_history_menu().await?;
+            run_chat_history_menu(current_profile_db).await?;
+            Ok(ScreenAction::Stay)
+        }
+        "4" => {
+            run_profile_menu(current_profile_db)?;
             Ok(ScreenAction::Stay)
         }
         selection if is_quit_selection(selection) => Ok(ScreenAction::Quit),
@@ -941,7 +977,7 @@ async fn run_main_menu_screen() -> AppResult<ScreenAction> {
     }
 }
 
-async fn run_create_invite_menu() -> AppResult<()> {
+async fn run_create_invite_menu(profile_db: &Path) -> AppResult<()> {
     loop {
         print_page_break();
         println!("Create Invite");
@@ -954,8 +990,7 @@ async fn run_create_invite_menu() -> AppResult<()> {
             "1" => {
                 let rendezvous_db = PathBuf::from(DEFAULT_INVITE_DB);
                 let listen_addr = DEFAULT_INVITE_LISTEN_ADDR.parse()?;
-                run_create_invite(listen_addr, &rendezvous_db, &default_chat_db("invite-host"))
-                    .await?;
+                run_create_invite(listen_addr, &rendezvous_db, profile_db).await?;
                 return Ok(());
             }
             selection if is_back_selection(selection) => return Ok(()),
@@ -967,7 +1002,7 @@ async fn run_create_invite_menu() -> AppResult<()> {
     }
 }
 
-async fn run_join_invite_menu() -> AppResult<()> {
+async fn run_join_invite_menu(profile_db: &Path) -> AppResult<()> {
     loop {
         print_page_break();
         println!("Join Invite");
@@ -983,13 +1018,7 @@ async fn run_join_invite_menu() -> AppResult<()> {
                     return Ok(());
                 }
                 let rendezvous_db = PathBuf::from(DEFAULT_INVITE_DB);
-                match run_join_invite(
-                    code.trim(),
-                    &rendezvous_db,
-                    &default_chat_db("invite-joiner"),
-                )
-                .await
-                {
+                match run_join_invite(code.trim(), &rendezvous_db, profile_db).await {
                     Ok(()) => return Ok(()),
                     Err(error) => {
                         println!("Could not join invite: {error}");
@@ -1006,14 +1035,67 @@ async fn run_join_invite_menu() -> AppResult<()> {
     }
 }
 
-async fn run_chat_history_menu() -> AppResult<()> {
+fn run_profile_menu(profile_db: &Path) -> AppResult<()> {
     loop {
-        let profile_db = default_chat_db("invite-joiner");
-        let storage = Storage::open(&profile_db)?;
+        render_profile_menu(profile_db)?;
+
+        match prompt_line("Select: ")?.trim() {
+            "1" => match prompt_for_updated_display_name(profile_db)? {
+                Some(name) => {
+                    println!("✓ Name updated to {name}");
+                    println!();
+                }
+                None => {
+                    println!();
+                }
+            },
+            selection if is_back_selection(selection) => return Ok(()),
+            _ => {
+                println!("Invalid selection");
+                println!();
+            }
+        }
+    }
+}
+
+fn render_profile_menu(profile_db: &Path) -> AppResult<()> {
+    let profile = load_local_profile(profile_db)?;
+
+    print_page_break();
+    println!("Profile");
+    println!();
+    println!("Current name: {}", profile.display_name);
+    println!();
+    println!("[1] Change name");
+    println!("[B] Back");
+    println!();
+
+    Ok(())
+}
+
+fn prompt_for_updated_display_name(profile_db: &Path) -> AppResult<Option<String>> {
+    let input = prompt_line("Enter new display name: ")?;
+    if is_back_selection(&input) {
+        return Ok(None);
+    }
+
+    match update_local_display_name(profile_db, &input) {
+        Ok(name) => Ok(Some(name)),
+        Err(error) => {
+            println!("Could not update name: {error}");
+            Ok(None)
+        }
+    }
+}
+
+async fn run_chat_history_menu(profile_db: &Path) -> AppResult<()> {
+    loop {
+        let storage = Storage::open(profile_db)?;
         let chats = storage.recent_chat_summaries(RECENT_CHAT_LIMIT)?;
 
         print_page_break();
         println!("Messages");
+        println!("Profile: {}", profile_label(profile_db));
         println!();
 
         if chats.is_empty() {
@@ -1045,11 +1127,11 @@ async fn run_chat_history_menu() -> AppResult<()> {
             return Ok(());
         }
         if selection.eq_ignore_ascii_case("a") {
-            run_all_chat_history_menu(&profile_db).await?;
+            run_all_chat_history_menu(profile_db).await?;
             continue;
         }
         if selection.eq_ignore_ascii_case("r") {
-            reconnect_selected_chat(&profile_db, &chats[..recent_count]).await?;
+            reconnect_selected_chat(profile_db, &chats[..recent_count]).await?;
             continue;
         }
 
@@ -1062,7 +1144,7 @@ async fn run_chat_history_menu() -> AppResult<()> {
         {
             Some(selected) => {
                 open_saved_conversation(
-                    &profile_db,
+                    profile_db,
                     &selected.contact.contact_id,
                     &selected.contact.display_name,
                 )
@@ -2483,7 +2565,10 @@ async fn run_alice(bob_addr: SocketAddr, message: &str, db_path: &Path) -> AppRe
     let mut endpoint = Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?;
     endpoint.set_default_client_config(insecure_client_config()?);
 
-    let connection = endpoint.connect(bob_addr, "localhost")?.await?;
+    let connecting = endpoint.connect(bob_addr, "localhost")?;
+    let connection = time::timeout(SAVED_CHAT_RECONNECT_TIMEOUT, connecting)
+        .await
+        .map_err(|_| format!("connection to {bob_addr} timed out; is the peer listening?"))??;
     println!("Connected to peer at {}", connection.remote_address());
 
     let mut recv = connection.accept_uni().await?;
@@ -2732,7 +2817,10 @@ async fn connect_alice_chat(
     let mut endpoint = Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?;
     endpoint.set_default_client_config(insecure_client_config()?);
 
-    let connection = endpoint.connect(bob_addr, "localhost")?.await?;
+    let connecting = endpoint.connect(bob_addr, "localhost")?;
+    let connection = time::timeout(SAVED_CHAT_RECONNECT_TIMEOUT, connecting)
+        .await
+        .map_err(|_| format!("connection to {bob_addr} timed out; is the peer listening?"))??;
 
     let mut recv = connection.accept_uni().await?;
     let bundle_bytes = receive_bytes(&mut recv).await?;
@@ -3726,6 +3814,10 @@ struct ChatTerminal {
     print_tx: std_mpsc::Sender<String>,
 }
 
+struct LocalProfile {
+    display_name: String,
+}
+
 impl ChatTerminal {
     fn print_message(&mut self, sender_display_name: &str, plaintext: &str) -> AppResult<()> {
         self.print_tx
@@ -3805,19 +3897,60 @@ fn load_or_prompt_display_name(db_path: &Path) -> AppResult<String> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let storage = Storage::open(db_path)?;
-    if let Some(display_name) = storage.load_display_name()? {
-        return Ok(display_name_or_anonymous(&display_name));
+    let profile = load_local_profile(db_path)?;
+    if profile.display_name != "Anonymous" {
+        return Ok(profile.display_name);
     }
 
     print!("Enter display name (blank for Anonymous): ");
     io::stdout().flush()?;
     let mut display_name = String::new();
     io::stdin().read_line(&mut display_name)?;
-    let display_name = display_name_or_anonymous(display_name.trim());
-    storage.save_display_name(&display_name)?;
+    let display_name = normalize_optional_display_name(&display_name);
+    Storage::open(db_path)?.save_display_name(&display_name)?;
 
     Ok(display_name)
+}
+
+fn load_local_profile(db_path: &Path) -> AppResult<LocalProfile> {
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let display_name = Storage::open(db_path)?
+        .load_display_name()?
+        .map(|name| display_name_or_anonymous(&name))
+        .unwrap_or_else(|| "Anonymous".to_string());
+
+    Ok(LocalProfile { display_name })
+}
+
+fn update_local_display_name(db_path: &Path, display_name: &str) -> AppResult<String> {
+    let display_name = validate_display_name(display_name)?;
+    Storage::open(db_path)?.save_display_name(&display_name)?;
+    Ok(display_name)
+}
+
+fn validate_display_name(display_name: &str) -> AppResult<String> {
+    let display_name = display_name.trim();
+    if display_name.is_empty() {
+        return Err("display name cannot be empty".into());
+    }
+    if display_name.chars().count() > DISPLAY_NAME_MAX_CHARS {
+        return Err(
+            format!("display name must be {DISPLAY_NAME_MAX_CHARS} characters or fewer").into(),
+        );
+    }
+    Ok(display_name.to_string())
+}
+
+fn normalize_optional_display_name(display_name: &str) -> String {
+    let display_name = display_name.trim();
+    if display_name.is_empty() {
+        "Anonymous".to_string()
+    } else {
+        display_name.chars().take(DISPLAY_NAME_MAX_CHARS).collect()
+    }
 }
 
 fn load_or_create_alice_identity(db_path: &Path) -> AppResult<Alice> {
@@ -4067,7 +4200,7 @@ fn reconnect_addr_from_contact(contact: &ContactRecord) -> AppResult<SocketAddr>
     contact
         .discovery_hint
         .strip_prefix("quic:")
-        .ok_or("saved contact does not have a reconnect address yet")?
+        .ok_or("This side cannot dial that peer yet; start chat-listen so the peer can reconnect.")?
         .parse::<SocketAddr>()
         .map_err(|error| format!("saved reconnect address is invalid: {error}").into())
 }
@@ -4107,7 +4240,7 @@ fn display_name_or_anonymous(display_name: &str) -> String {
     if display_name.is_empty() {
         "Anonymous".to_string()
     } else {
-        display_name.chars().take(64).collect()
+        display_name.chars().take(DISPLAY_NAME_MAX_CHARS).collect()
     }
 }
 
@@ -4143,6 +4276,21 @@ fn remote_message_sender_label(message: &MessageRecord, saved_display_name: &str
 
 fn default_chat_db(role: &str) -> PathBuf {
     PathBuf::from(format!("target/ciphermesh-{role}-profile.sqlite"))
+}
+
+fn local_profile_db(profile_id: &str) -> PathBuf {
+    PathBuf::from(format!("target/ciphermesh-{profile_id}.sqlite"))
+}
+
+fn profile_label(profile_db: &Path) -> String {
+    profile_db
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("custom profile")
+        .trim_start_matches("ciphermesh-")
+        .trim_end_matches("-profile")
+        .trim_end_matches(".sqlite")
+        .to_string()
 }
 
 fn decode_chat_prekey_bundle(bytes: &[u8]) -> AppResult<(String, PreKeyBundle)> {
@@ -5760,6 +5908,44 @@ mod discovery_tests {
     }
 
     #[test]
+    fn local_profile_display_name_updates_without_rotating_identity() {
+        let path = temp_profile_db("profile-name");
+        let first_identity = load_or_create_alice_identity(&path)
+            .expect("create alice")
+            .signed_key_exchange()
+            .identity_public_key;
+
+        let updated = update_local_display_name(&path, "  Charles  ").expect("update name");
+        let profile = load_local_profile(&path).expect("load profile");
+        let second_identity = load_or_create_alice_identity(&path)
+            .expect("reload alice")
+            .signed_key_exchange()
+            .identity_public_key;
+
+        assert_eq!(updated, "Charles");
+        assert_eq!(profile.display_name, "Charles");
+        assert_eq!(first_identity, second_identity);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn local_profile_slots_use_distinct_databases() {
+        let first = local_profile_db("profile-1");
+        let second = local_profile_db("profile-2");
+
+        assert_ne!(first, second);
+        assert_eq!(profile_label(&first), "profile-1");
+        assert_eq!(profile_label(&second), "profile-2");
+    }
+
+    #[test]
+    fn profile_display_name_validation_rejects_empty_and_long_names() {
+        assert!(validate_display_name("   ").is_err());
+        assert!(validate_display_name(&"a".repeat(DISPLAY_NAME_MAX_CHARS + 1)).is_err());
+        assert_eq!(validate_display_name("  abc  ").expect("valid name"), "abc");
+    }
+
+    #[test]
     fn reconnect_authentication_rejects_different_saved_peer_identity() {
         let path = temp_profile_db("reconnect-auth");
         let bob = Bob::local();
@@ -5787,6 +5973,22 @@ mod discovery_tests {
         )
         .is_err());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn host_side_contact_without_quic_hint_fails_reconnect_fast() {
+        let contact = ContactRecord {
+            contact_id: "contact-alice".to_string(),
+            display_name: "Alice".to_string(),
+            identity_public_key: vec![1; 32],
+            discovery_hint: "direct QUIC".to_string(),
+            saved_at_unix_secs: now_unix_secs(),
+        };
+
+        let error = reconnect_addr_from_contact(&contact).expect_err("missing quic hint");
+        assert!(error
+            .to_string()
+            .contains("This side cannot dial that peer yet"));
     }
 
     #[test]
