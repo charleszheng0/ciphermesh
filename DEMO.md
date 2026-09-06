@@ -39,7 +39,7 @@ Host:
 cargo run
 ```
 
-Choose Create Invite and copy the full invite token.
+Choose Create Invite and copy either the full invite token or the six-character code-only LAN invite.
 
 Joiner:
 
@@ -47,7 +47,7 @@ Joiner:
 cargo run
 ```
 
-Choose Join Invite and paste the full token. The host should have a UDP listener on port 5000 while it waits.
+Choose Join Invite and paste the six-character code on the same LAN. CipherMesh discovers the host through mDNS and connects to the advertised QUIC listener. The host should have a UDP listener on port 5000 while it waits.
 
 ## 3. Show Encrypted Transport Briefly
 
@@ -115,11 +115,13 @@ Expected highlights:
 ```bash
 cargo test hardening -- --nocapture
 cargo run -- phase6-lan-smoke
+cargo run -- phase6-invite-discovery-smoke
 cargo run -- phase6-mailbox-smoke
 ```
 
 This exercises deterministic drop, delay, duplicate, replay, tamper, reorder, and partition behavior around encrypted payload delivery.
 The smoke command starts a real local QUIC listener, flushes a queued pending message over a fresh connection, and verifies ACK cleanup.
+The invite discovery smoke verifies code-only LAN discovery and chat handshake without manually entering an IP or PeerId.
 The mailbox smoke exercises encrypted offline deposit, recipient fetch, and retrieval ACK over libp2p request-response.
 
 ## 8. Phase 6 Loop

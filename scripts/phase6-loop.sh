@@ -46,6 +46,7 @@ while [[ "$iterations" == "0" || "$count" -lt "$iterations" ]]; do
   fi
 
   run_cmd cargo run -- phase6-lan-smoke
+  run_cmd cargo run -- phase6-invite-discovery-smoke
   run_cmd cargo run -- phase6-mailbox-smoke
 
   if [[ "$no_clippy" != "1" ]]; then

@@ -37,7 +37,7 @@ Use `Iterations = 0` / `ITERATIONS=0` for an infinite loop. Use `-NoClippy` or `
 - 6B: `hardening_tests::*outbox*`, `*ack*`, `*duplicate*`, `*mailbox*`; pending message storage/contact-list tests; `cargo run -- phase6-mailbox-smoke`
 - 6C: tamper/replay tests in `tests` and `hardening_tests`
 - 6D: `crdt::tests`, sync and own-device sync storage tests
-- 6E: `cargo run -- phase6-lan-smoke` proves real local QUIC listener/connect/ACK-cleared pending delivery; manual two-machine validation still required
+- 6E: `cargo run -- phase6-lan-smoke` proves real local QUIC listener/connect/ACK-cleared pending delivery; `cargo run -- phase6-invite-discovery-smoke` proves code-only mDNS invite discovery and chat handshake; manual two-machine validation still required
 - 6F: reconnect UI removed; LAN invite listener lifecycle fixed
 - 6G: `SECURITY.md` covers assets, attacker model, trust boundaries, and limitations
 - 6H: README/demo reproduction includes build, package, Phase 6 loop, and LAN smoke steps
@@ -52,6 +52,7 @@ Do not mark Phase 6 complete until these are true:
 - `cargo clippy --all-targets --all-features -- -D warnings` passes.
 - `.\scripts\phase6-loop.ps1 -Iterations 1 -Full` or `FULL=1 ./scripts/phase6-loop.sh` passes.
 - `cargo run -- phase6-lan-smoke` passes.
+- `cargo run -- phase6-invite-discovery-smoke` passes.
 - `cargo run -- phase6-mailbox-smoke` passes.
 - Same-LAN Mac/Windows transcript proves invite creation keeps UDP 5000 bound and chat works both directions.
 - Different-network transcript records direct, hole punch, or relay fallback behavior.
@@ -65,10 +66,11 @@ Host:
 cargo run
 ```
 
-Choose Create Invite, then record:
+Choose Create Invite. Paste the six-character code-only invite into the joiner first, then record:
 
 ```text
 Invite:
+Code-only LAN invite:
 Listening on:
 lsof -nP -iUDP:5000
 ```
@@ -88,7 +90,7 @@ Joiner:
 cargo run
 ```
 
-Choose Join Invite, paste the full invite token, then record:
+Choose Join Invite, paste the six-character code-only invite on the same LAN, then record:
 
 ```text
 Connected securely:

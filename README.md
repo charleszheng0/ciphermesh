@@ -131,6 +131,7 @@ cargo run -- fanout-demo
 cargo run -- own-device-sync-demo
 cargo run -- revocation-demo
 cargo run -- phase6-lan-smoke
+cargo run -- phase6-invite-discovery-smoke
 cargo run -- phase6-mailbox-smoke
 cargo run -- phase6-listener-doctor [0.0.0.0:5000] [hold-seconds]
 ```
@@ -149,6 +150,7 @@ Choose `Create invite`. CipherMesh should print an invite token like:
 
 ```text
 ABC2D3@192.168.1.25:5000
+Code-only LAN invite: ABC2D3
 Listening on 0.0.0.0:5000
 ```
 
@@ -165,6 +167,7 @@ cargo run
 ```
 
 Choose `Join invite` and paste the full invite token. Both sides should enter the encrypted chat. If the peer disconnects, CipherMesh shows `Status: Offline`; restart both instances and create a fresh invite to reconnect for now.
+On the same LAN, the joiner can paste only the six-character code; CipherMesh looks up the host through mDNS and then connects to the advertised QUIC listener.
 
 ## Local History Security
 
@@ -308,10 +311,12 @@ The Phase 6 loop also runs:
 
 ```bash
 cargo run -- phase6-lan-smoke
+cargo run -- phase6-invite-discovery-smoke
 cargo run -- phase6-mailbox-smoke
 ```
 
 That smoke starts a real local QUIC listener on `0.0.0.0:<ephemeral>`, queues a pending message before connect, establishes a fresh chat, waits for an ACK, and fails if the pending message is not delivered exactly once and cleared.
+The invite discovery smoke starts the mDNS invite sidecar, resolves a six-character code to the advertised QUIC address, and completes the chat handshake without manually entering an IP or PeerId.
 The mailbox smoke starts an in-process libp2p mailbox, deposits an encrypted offline envelope, fetches it as Bob, ACKs retrieval, and fails if the mailbox still has pending ciphertext afterward.
 
 For the Mac invite/listener check:

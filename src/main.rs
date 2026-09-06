@@ -205,6 +205,7 @@ async fn main() -> AppResult<()> {
             run_invite_demo(&db_path)
         }
         Some("phase6-lan-smoke") => run_phase6_lan_smoke().await,
+        Some("phase6-invite-discovery-smoke") => run_phase6_invite_discovery_smoke().await,
         Some("phase6-mailbox-smoke") => run_phase6_mailbox_smoke().await,
         Some("phase6-listener-doctor") => {
             let listen_addr = parse_addr(args.get(2), DEFAULT_INVITE_LISTEN_ADDR)?;
@@ -362,6 +363,7 @@ fn print_usage() {
     println!();
     println!("Phase 6 local QUIC pending-delivery smoke:");
     println!("  cargo run -- phase6-lan-smoke");
+    println!("  cargo run -- phase6-invite-discovery-smoke");
     println!("  cargo run -- phase6-mailbox-smoke");
     println!("  cargo run -- phase6-listener-doctor [0.0.0.0:5000] [hold-seconds]");
     println!();
@@ -553,6 +555,72 @@ async fn run_phase6_lan_smoke_with_dbs(alice_db: &Path, bob_db: &Path) -> AppRes
     }
 
     println!("Phase 6 LAN smoke passed");
+    Ok(())
+}
+
+async fn run_phase6_invite_discovery_smoke() -> AppResult<()> {
+    let alice_db = temp_runtime_db("phase6-invite-alice")?;
+    let bob_db = temp_runtime_db("phase6-invite-bob")?;
+    let result = run_phase6_invite_discovery_smoke_with_dbs(&alice_db, &bob_db).await;
+    let _ = std::fs::remove_file(&alice_db);
+    let _ = std::fs::remove_file(&bob_db);
+    result
+}
+
+async fn run_phase6_invite_discovery_smoke_with_dbs(
+    alice_db: &Path,
+    bob_db: &Path,
+) -> AppResult<()> {
+    Storage::open(alice_db)?.save_display_name("Alice")?;
+    Storage::open(bob_db)?.save_display_name("Bob")?;
+
+    let bob = load_or_create_bob_identity(bob_db)?;
+    let endpoint = bind_quic_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?;
+    let bound_addr = endpoint.local_addr()?;
+    let advertised_addr = advertise_socket_addr(bound_addr)?;
+    let code = generate_invite_code()?;
+    let code_hash = invite_code_hash(&code);
+    let invite_discovery = start_invite_discovery_advertiser(code_hash.clone(), advertised_addr)?;
+
+    let bob = Arc::new(Mutex::new(bob));
+    let bob_for_task = Arc::clone(&bob);
+    let bob_db_for_task = bob_db.to_path_buf();
+    let (release_server, hold_server) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let incoming = endpoint.accept().await.ok_or("endpoint closed")?;
+        let connection = incoming.await?;
+        let session =
+            complete_bob_chat_handshake(&connection, bob_for_task, "Bob", &bob_db_for_task).await?;
+        let _ = hold_server.await;
+        Ok::<_, Box<dyn Error + Send + Sync>>(session.conversation_id)
+    });
+
+    println!("Phase 6 invite discovery smoke code {code}");
+    let discovered_addr = discover_lan_invite_addr(&code_hash).await?;
+    println!("Phase 6 invite discovery resolved {discovered_addr}");
+    let session = connect_alice_chat(discovered_addr, alice_db).await?;
+    let alice_identity = load_or_create_alice_identity(alice_db)?
+        .signed_key_exchange()
+        .identity_public_key;
+    let bob_conversation_id = contact_id_for_identity(&alice_identity);
+    let _ = release_server.send(());
+    let server_conversation_id = server.await??;
+    invite_discovery.abort();
+
+    if discovered_addr != advertised_addr {
+        return Err(format!(
+            "invite discovery resolved {discovered_addr}, expected {advertised_addr}"
+        )
+        .into());
+    }
+    if server_conversation_id != bob_conversation_id {
+        return Err("Bob stored the wrong peer conversation after invite discovery".into());
+    }
+    if session.remote_display_name != "Bob" {
+        return Err("Alice did not receive Bob's display name after invite discovery".into());
+    }
+
+    println!("Phase 6 invite discovery smoke passed");
     Ok(())
 }
 
@@ -1587,25 +1655,30 @@ async fn run_create_invite(
         std::fs::create_dir_all(parent)?;
     }
     let code = generate_invite_code()?;
+    let code_hash = invite_code_hash(&code);
     let now = now_unix_secs();
     {
         let storage = Storage::open(rendezvous_db)?;
         storage.save_invite_record(&InviteRecord {
-            code_hash: invite_code_hash(&code),
+            code_hash: code_hash.clone(),
             rendezvous_payload: advertised_addr.to_string(),
             expires_at_unix_secs: now + INVITE_TTL_SECS,
             consumed_at_unix_secs: None,
             created_at_unix_secs: now,
         })?;
     }
+    let invite_discovery = start_invite_discovery_advertiser(code_hash, advertised_addr)?;
 
     let invite = encode_lan_invite(&code, advertised_addr);
     println!("Invite created");
     println!("Invite: {invite}");
+    println!("Code-only LAN invite: {code}");
     println!("Invite expires in 5 minutes");
     println!("Listening on {bound_addr}");
     println!("Waiting for peer");
-    run_chat_bob_with_endpoint(endpoint, local_display_name, bob, profile_db).await
+    let result = run_chat_bob_with_endpoint(endpoint, local_display_name, bob, profile_db).await;
+    invite_discovery.abort();
+    result
 }
 
 async fn run_join_invite(code: &str, rendezvous_db: &Path, profile_db: &Path) -> AppResult<()> {
@@ -1613,16 +1686,21 @@ async fn run_join_invite(code: &str, rendezvous_db: &Path, profile_db: &Path) ->
         Some(peer_addr) => peer_addr,
         None => {
             let normalized_code = normalize_invite_code(code)?;
+            let code_hash = invite_code_hash(&normalized_code);
             let invite = {
                 let storage = Storage::open(rendezvous_db)?;
-                storage
-                    .consume_invite_record(&invite_code_hash(&normalized_code), now_unix_secs())?
-                    .ok_or("invalid invite")?
+                storage.consume_invite_record(&code_hash, now_unix_secs())?
             };
-            invite
-                .rendezvous_payload
-                .parse()
-                .map_err(|error| format!("invite resolved to invalid peer address: {error}"))?
+            match invite {
+                Some(invite) => invite
+                    .rendezvous_payload
+                    .parse()
+                    .map_err(|error| format!("invite resolved to invalid peer address: {error}"))?,
+                None => {
+                    println!("Looking for invite on the local network...");
+                    discover_lan_invite_addr(&code_hash).await?
+                }
+            }
         }
     };
 
@@ -1726,6 +1804,156 @@ fn lan_ip_candidate() -> Option<IpAddr> {
         is_usable_remote_ip(ip).then_some(ip)
     })
     .next()
+}
+
+fn start_invite_discovery_advertiser(
+    code_hash: String,
+    advertised_addr: SocketAddr,
+) -> AppResult<tokio::task::JoinHandle<AppResult<()>>> {
+    let mut swarm = new_discovery_swarm()?;
+    let local_peer_id = *swarm.local_peer_id();
+    listen_and_bootstrap(&mut swarm, Vec::new())?;
+
+    println!("Invite discovery PeerId: {local_peer_id}");
+    Ok(tokio::spawn(async move {
+        run_invite_discovery_advertiser(swarm, local_peer_id, code_hash, advertised_addr).await
+    }))
+}
+
+async fn run_invite_discovery_advertiser(
+    mut swarm: Swarm<DiscoveryBehaviour>,
+    local_peer_id: PeerId,
+    code_hash: String,
+    advertised_addr: SocketAddr,
+) -> AppResult<()> {
+    loop {
+        match swarm.select_next_some().await {
+            SwarmEvent::NewListenAddr { address, .. } => {
+                println!(
+                    "Invite discovery listening on {}",
+                    address.with(Protocol::P2p(local_peer_id))
+                );
+            }
+            SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Mdns(mdns::Event::Discovered(
+                peers,
+            ))) => {
+                for (peer, address) in peers {
+                    swarm.behaviour_mut().kad.add_address(&peer, address);
+                }
+            }
+            SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
+                for (peer, address) in peers {
+                    swarm.behaviour_mut().kad.remove_address(&peer, &address);
+                }
+            }
+            SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Identify(
+                identify::Event::Received { peer_id, info, .. },
+            )) => {
+                for address in info.listen_addrs {
+                    swarm.behaviour_mut().kad.add_address(&peer_id, address);
+                }
+            }
+            SwarmEvent::Behaviour(DiscoveryBehaviourEvent::App(
+                request_response::Event::Message {
+                    peer,
+                    message:
+                        request_response::Message::Request {
+                            request, channel, ..
+                        },
+                    ..
+                },
+            )) => match request {
+                CipherMeshRequest::InviteLookup {
+                    code_hash: requested,
+                } => {
+                    let address = (requested == code_hash).then(|| advertised_addr.to_string());
+                    let _ = swarm
+                        .behaviour_mut()
+                        .app
+                        .send_response(channel, CipherMeshResponse::InviteAddress(address));
+                    println!("Answered LAN invite lookup from {peer}");
+                }
+                _ => {
+                    let _ = swarm.behaviour_mut().app.send_response(
+                        channel,
+                        CipherMeshResponse::Error("invite discovery only".to_string()),
+                    );
+                }
+            },
+            _ => {}
+        }
+    }
+}
+
+async fn discover_lan_invite_addr(code_hash: &str) -> AppResult<SocketAddr> {
+    let mut swarm = new_discovery_swarm()?;
+    let local_peer_id = *swarm.local_peer_id();
+    listen_and_bootstrap(&mut swarm, Vec::new())?;
+    println!("Invite lookup PeerId: {local_peer_id}");
+
+    let timeout = time::sleep(DISCOVERY_TIMEOUT);
+    tokio::pin!(timeout);
+
+    loop {
+        tokio::select! {
+            _ = &mut timeout => {
+                return Err("timed out discovering invite on local network".into());
+            }
+            event = swarm.select_next_some() => {
+                match event {
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        println!(
+                            "Invite lookup listening on {}",
+                            address.with(Protocol::P2p(local_peer_id))
+                        );
+                    }
+                    SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
+                        for (peer, address) in peers {
+                            swarm.behaviour_mut().kad.add_address(&peer, address);
+                            swarm.behaviour_mut().app.send_request(
+                                &peer,
+                                CipherMeshRequest::InviteLookup {
+                                    code_hash: code_hash.to_string(),
+                                },
+                            );
+                        }
+                    }
+                    SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
+                        for (peer, address) in peers {
+                            swarm.behaviour_mut().kad.remove_address(&peer, &address);
+                        }
+                    }
+                    SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Identify(identify::Event::Received {
+                        peer_id,
+                        info,
+                        ..
+                    })) => {
+                        for address in info.listen_addrs {
+                            swarm.behaviour_mut().kad.add_address(&peer_id, address);
+                        }
+                    }
+                    SwarmEvent::Behaviour(DiscoveryBehaviourEvent::App(request_response::Event::Message {
+                        message: request_response::Message::Response {
+                            response: CipherMeshResponse::InviteAddress(Some(address)),
+                            ..
+                        },
+                        ..
+                    })) => {
+                        return address
+                            .parse()
+                            .map_err(|error| format!("discovered invite address was invalid: {error}").into());
+                    }
+                    SwarmEvent::Behaviour(DiscoveryBehaviourEvent::App(request_response::Event::OutboundFailure {
+                        error,
+                        ..
+                    })) => {
+                        println!("Invite lookup request failed: {error}");
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 fn invite_code_hash(code: &str) -> String {
@@ -4544,12 +4772,14 @@ struct MailboxBehaviour {
 enum CipherMeshRequest {
     PreKeyBundle,
     InitialMessage(Vec<u8>),
+    InviteLookup { code_hash: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum CipherMeshResponse {
     PreKeyBundle(Vec<u8>),
     Ack(Vec<u8>),
+    InviteAddress(Option<String>),
     Error(String),
 }
 
@@ -5656,6 +5886,15 @@ fn handle_bob_app_event(
                     }
                 }
 
+                Ok(false)
+            }
+            CipherMeshRequest::InviteLookup { .. } => {
+                let _ = swarm.behaviour_mut().app.send_response(
+                    channel,
+                    CipherMeshResponse::Error(
+                        "invite lookup is not available in this chat path".to_string(),
+                    ),
+                );
                 Ok(false)
             }
         },
