@@ -206,6 +206,7 @@ async fn main() -> AppResult<()> {
         }
         Some("phase6-lan-smoke") => run_phase6_lan_smoke().await,
         Some("phase6-invite-discovery-smoke") => run_phase6_invite_discovery_smoke().await,
+        Some("phase6-relay-smoke") => run_phase6_relay_smoke().await,
         Some("phase6-mailbox-smoke") => run_phase6_mailbox_smoke().await,
         Some("phase6-listener-doctor") => {
             let listen_addr = parse_addr(args.get(2), DEFAULT_INVITE_LISTEN_ADDR)?;
@@ -364,6 +365,7 @@ fn print_usage() {
     println!("Phase 6 local QUIC pending-delivery smoke:");
     println!("  cargo run -- phase6-lan-smoke");
     println!("  cargo run -- phase6-invite-discovery-smoke");
+    println!("  cargo run -- phase6-relay-smoke");
     println!("  cargo run -- phase6-mailbox-smoke");
     println!("  cargo run -- phase6-listener-doctor [0.0.0.0:5000] [hold-seconds]");
     println!();
@@ -637,6 +639,157 @@ async fn run_phase6_listener_doctor(listen_addr: SocketAddr, hold: Duration) -> 
     drop(endpoint);
     println!("Phase 6 listener doctor finished");
     Ok(())
+}
+
+async fn run_phase6_relay_smoke() -> AppResult<()> {
+    let mut relay_swarm = new_relay_server_swarm()?;
+    let relay_peer_id = *relay_swarm.local_peer_id();
+    relay_swarm.listen_on("/ip4/127.0.0.1/tcp/0".parse()?)?;
+    let relay_listen_addr = next_relay_listen_addr(&mut relay_swarm).await?;
+    relay_swarm.add_external_address(relay_listen_addr.clone());
+    let relay_addr = relay_listen_addr.with(Protocol::P2p(relay_peer_id));
+    let relay_server =
+        tokio::spawn(async move { run_phase6_relay_server(relay_swarm, relay_peer_id).await });
+
+    let mut bob_swarm = new_discovery_swarm()?;
+    let bob_peer_id = *bob_swarm.local_peer_id();
+    reserve_on_relays(&mut bob_swarm, std::slice::from_ref(&relay_addr))?;
+    let bob = Arc::new(Mutex::new(Bob::local()));
+    let (bob_ready, bob_ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let bob_server =
+        tokio::spawn(
+            async move { run_phase6_relay_bob_until_ack(bob_swarm, bob, bob_ready).await },
+        );
+
+    println!("Phase 6 relay smoke relay {relay_addr}");
+    println!("Phase 6 relay smoke Bob PeerId {bob_peer_id}");
+    time::timeout(DISCOVERY_TIMEOUT, bob_ready_rx)
+        .await
+        .map_err(|_| "relay smoke timed out waiting for Bob relay reservation")?
+        .map_err(|_| "relay smoke Bob stopped before reservation was ready")?;
+    run_alice_relayed(
+        bob_peer_id,
+        "phase6 relay fallback delivery",
+        vec![relay_addr],
+    )
+    .await?;
+    bob_server.await??;
+    relay_server.abort();
+    println!("Phase 6 relay smoke passed");
+    Ok(())
+}
+
+async fn run_phase6_relay_server(
+    mut swarm: Swarm<RelayServerBehaviour>,
+    local_peer_id: PeerId,
+) -> AppResult<()> {
+    loop {
+        match swarm.select_next_some().await {
+            SwarmEvent::NewListenAddr { address, .. } => {
+                swarm.add_external_address(address.clone());
+                println!(
+                    "Phase 6 relay listening on {}",
+                    address.with(Protocol::P2p(local_peer_id))
+                );
+            }
+            SwarmEvent::ConnectionEstablished {
+                peer_id, endpoint, ..
+            } => {
+                if endpoint.is_relayed() {
+                    println!("Phase 6 relay observed relayed connection with {peer_id}");
+                } else {
+                    println!("Phase 6 relay control connection established with {peer_id}");
+                }
+            }
+            SwarmEvent::Behaviour(RelayServerBehaviourEvent::Relay(event)) => {
+                println!("Phase 6 relay event: {event:?}");
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn run_phase6_relay_bob_until_ack(
+    mut swarm: Swarm<DiscoveryBehaviour>,
+    bob: Arc<Mutex<Bob>>,
+    ready: tokio::sync::oneshot::Sender<()>,
+) -> AppResult<()> {
+    let local_peer_id = *swarm.local_peer_id();
+    let timeout = time::sleep(DISCOVERY_TIMEOUT);
+    tokio::pin!(timeout);
+    let mut final_relay_ack_pending = false;
+    let mut ready = Some(ready);
+
+    loop {
+        tokio::select! {
+            _ = &mut timeout => return Err("relay smoke Bob timed out waiting for Alice".into()),
+            event = swarm.select_next_some() => {
+                match event {
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        let is_relayed_listener = address
+                            .iter()
+                            .any(|protocol| matches!(protocol, Protocol::P2pCircuit));
+                        let displayed_address = if is_relayed_listener {
+                            address.clone()
+                        } else {
+                            address.clone().with(Protocol::P2p(local_peer_id))
+                        };
+                        println!(
+                            "Phase 6 Bob relay listener on {}",
+                            displayed_address
+                        );
+                        if is_relayed_listener {
+                            if let Some(ready) = ready.take() {
+                                let _ = ready.send(());
+                            }
+                        }
+                    }
+                    SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Identify(
+                        identify::Event::Received { peer_id, info, .. },
+                    )) => {
+                        for address in info.listen_addrs {
+                            swarm.behaviour_mut().kad.add_address(&peer_id, address);
+                        }
+                    }
+                    SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Relay(event)) => {
+                        if matches!(
+                            event,
+                            relay::client::Event::ReservationReqAccepted { .. }
+                        ) {
+                            if let Some(ready) = ready.take() {
+                                let _ = ready.send(());
+                            }
+                        }
+                        log_relay_event("Phase 6 Bob", event);
+                    }
+                    SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Dcutr(event)) => {
+                        log_dcutr_event("Phase 6 Bob", event);
+                    }
+                    SwarmEvent::Behaviour(DiscoveryBehaviourEvent::App(event)) => {
+                        if handle_bob_app_event(
+                            &mut swarm,
+                            Arc::clone(&bob),
+                            event,
+                            &mut final_relay_ack_pending,
+                        )? {
+                            return Ok(());
+                        }
+                    }
+                    SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                        if endpoint.is_relayed() {
+                            println!("Phase 6 Bob connected through relay to {peer_id}");
+                        } else {
+                            println!("Phase 6 Bob direct libp2p connection established with {peer_id}");
+                        }
+                    }
+                    SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                        println!("Phase 6 Bob libp2p dial failed for {peer_id:?}: {error}");
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 async fn run_phase6_mailbox_smoke() -> AppResult<()> {
@@ -4652,9 +4805,9 @@ async fn run_alice_relayed(
         );
     }
 
-    listen_and_bootstrap(&mut swarm, relay_peers.clone())?;
     for address in &relay_addresses {
         swarm.add_peer_address(bob_peer_id, address.clone());
+        swarm.dial(address.clone())?;
     }
 
     println!("Alice libp2p PeerId for relay fallback: {local_peer_id}");
@@ -5296,7 +5449,7 @@ async fn run_relay_server(listen_addr: Multiaddr) -> AppResult<()> {
             event = swarm.select_next_some() => {
                 match event {
                     SwarmEvent::NewListenAddr { address, .. } => {
-                        swarm.add_external_address(address.clone().with(Protocol::P2p(local_peer_id)));
+                        swarm.add_external_address(address.clone());
                         println!(
                             "Relay listening on {}",
                             address.with(Protocol::P2p(local_peer_id))
@@ -5326,9 +5479,9 @@ async fn run_relay_demo() -> AppResult<()> {
     let relay_peer_id = *relay_swarm.local_peer_id();
 
     relay_swarm.listen_on("/ip4/127.0.0.1/tcp/0".parse()?)?;
-    let relay_addr = next_relay_listen_addr(&mut relay_swarm)
-        .await?
-        .with(Protocol::P2p(relay_peer_id));
+    let relay_listen_addr = next_relay_listen_addr(&mut relay_swarm).await?;
+    relay_swarm.add_external_address(relay_listen_addr.clone());
+    let relay_addr = relay_listen_addr.with(Protocol::P2p(relay_peer_id));
 
     println!("Relay demo PeerId: {relay_peer_id}");
     println!("Relay demo address: {relay_addr}");
@@ -5345,7 +5498,7 @@ async fn run_relay_demo() -> AppResult<()> {
             event = relay_swarm.select_next_some() => {
                 match event {
                     SwarmEvent::NewListenAddr { address, .. } => {
-                        relay_swarm.add_external_address(address.clone().with(Protocol::P2p(relay_peer_id)));
+                        relay_swarm.add_external_address(address.clone());
                         println!("Relay listening on {}", address.with(Protocol::P2p(relay_peer_id)));
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {

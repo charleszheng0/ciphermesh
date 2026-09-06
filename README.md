@@ -132,6 +132,7 @@ cargo run -- own-device-sync-demo
 cargo run -- revocation-demo
 cargo run -- phase6-lan-smoke
 cargo run -- phase6-invite-discovery-smoke
+cargo run -- phase6-relay-smoke
 cargo run -- phase6-mailbox-smoke
 cargo run -- phase6-listener-doctor [0.0.0.0:5000] [hold-seconds]
 ```
@@ -312,6 +313,7 @@ The Phase 6 loop also runs:
 ```bash
 cargo run -- phase6-lan-smoke
 cargo run -- phase6-invite-discovery-smoke
+cargo run -- phase6-relay-smoke
 cargo run -- phase6-mailbox-smoke
 ```
 

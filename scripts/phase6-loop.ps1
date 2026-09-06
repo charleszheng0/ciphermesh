@@ -50,6 +50,7 @@ while ($Iterations -eq 0 -or $count -lt $Iterations) {
 
     Invoke-Phase6Command @("cargo", "run", "--", "phase6-lan-smoke")
     Invoke-Phase6Command @("cargo", "run", "--", "phase6-invite-discovery-smoke")
+    Invoke-Phase6Command @("cargo", "run", "--", "phase6-relay-smoke")
     Invoke-Phase6Command @("cargo", "run", "--", "phase6-mailbox-smoke")
 
     if (-not $NoClippy) {

@@ -116,6 +116,7 @@ Expected highlights:
 cargo test hardening -- --nocapture
 cargo run -- phase6-lan-smoke
 cargo run -- phase6-invite-discovery-smoke
+cargo run -- phase6-relay-smoke
 cargo run -- phase6-mailbox-smoke
 ```
 
