@@ -204,6 +204,7 @@ async fn main() -> AppResult<()> {
                 .unwrap_or_else(|| PathBuf::from("target/ciphermesh-invite-demo.sqlite"));
             run_invite_demo(&db_path)
         }
+        Some("phase6-lan-smoke") => run_phase6_lan_smoke().await,
         Some("restart-demo") => {
             let db_path = args
                 .get(2)
@@ -348,6 +349,9 @@ fn print_usage() {
     );
     println!("  cargo run -- invite-demo [target/ciphermesh-invite-demo.sqlite]");
     println!();
+    println!("Phase 6 local QUIC pending-delivery smoke:");
+    println!("  cargo run -- phase6-lan-smoke");
+    println!();
     println!("Phase 4A SQLite restart demo:");
     println!("  cargo run -- restart-demo [target/ciphermesh-4a-demo.sqlite]");
     println!();
@@ -440,6 +444,109 @@ fn run_local_demo(verbose: bool) -> AppResult<()> {
     println!("Offline Bob decrypted later: {plaintext}");
 
     Ok(())
+}
+
+async fn run_phase6_lan_smoke() -> AppResult<()> {
+    let alice_db = temp_runtime_db("phase6-alice")?;
+    let bob_db = temp_runtime_db("phase6-bob")?;
+    let result = run_phase6_lan_smoke_with_dbs(&alice_db, &bob_db).await;
+    let _ = std::fs::remove_file(&alice_db);
+    let _ = std::fs::remove_file(&bob_db);
+    result
+}
+
+async fn run_phase6_lan_smoke_with_dbs(alice_db: &Path, bob_db: &Path) -> AppResult<()> {
+    Storage::open(alice_db)?.save_display_name("Alice")?;
+    Storage::open(bob_db)?.save_display_name("Bob")?;
+
+    let bob = load_or_create_bob_identity(bob_db)?;
+    let bob_identity = bob.prekey_bundle()?.identity_public_key;
+    let alice_conversation_id = contact_id_for_identity(&bob_identity);
+    let endpoint = bind_quic_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?;
+    let bound_addr = endpoint.local_addr()?;
+    let dial_addr = if bound_addr.ip().is_unspecified() {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bound_addr.port())
+    } else {
+        bound_addr
+    };
+
+    save_contact_for_chat(
+        alice_db,
+        &alice_conversation_id,
+        "Bob",
+        &bob_identity,
+        &quic_discovery_hint(dial_addr),
+    )?;
+    let peer = load_known_peer_for_conversation(alice_db, &alice_conversation_id)?
+        .ok_or("missing saved peer after contact save")?;
+    queue_offline_peer_message(alice_db, &peer, "phase6 pending over fresh quic")?;
+
+    let bob = Arc::new(Mutex::new(bob));
+    let bob_for_task = Arc::clone(&bob);
+    let bob_db_for_task = bob_db.to_path_buf();
+    let (release_server, hold_server) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let incoming = endpoint.accept().await.ok_or("endpoint closed")?;
+        let connection = incoming.await?;
+        let session =
+            complete_bob_chat_handshake(&connection, bob_for_task, "Bob", &bob_db_for_task).await?;
+
+        let mut recv = time::timeout(CHAT_CONNECT_TIMEOUT, connection.accept_uni())
+            .await
+            .map_err(|_| "timed out waiting for pending message")??;
+        let frame_bytes = receive_bytes(&mut recv).await?;
+        let frame: ChatFrame = bincode::deserialize(&frame_bytes)?;
+        let ChatFrame::Message {
+            message_id,
+            message,
+            ..
+        } = frame
+        else {
+            return Err("expected pending message frame".into());
+        };
+        let plaintext = {
+            let mut bob = bob.lock().map_err(|_| "Bob state lock poisoned")?;
+            bob.decrypt_from_alice(&message)?
+        };
+        send_chat_ack(&connection, &message_id).await?;
+        let _ = hold_server.await;
+        Ok::<_, Box<dyn Error + Send + Sync>>((session.conversation_id, plaintext))
+    });
+
+    println!("Phase 6 LAN smoke listening on {bound_addr}");
+    println!("Phase 6 LAN smoke dialing {dial_addr}");
+    let session = connect_alice_chat(dial_addr, alice_db).await?;
+    let alice_identity = load_or_create_alice_identity(alice_db)?
+        .signed_key_exchange()
+        .identity_public_key;
+    let bob_conversation_id = contact_id_for_identity(&alice_identity);
+    let _ = release_server.send(());
+    let (server_conversation_id, plaintext) = server.await??;
+
+    if session.conversation_id != alice_conversation_id {
+        return Err("Alice stored the wrong peer conversation after smoke connect".into());
+    }
+    if server_conversation_id != bob_conversation_id {
+        return Err("Bob stored the wrong peer conversation after smoke connect".into());
+    }
+    if plaintext != "phase6 pending over fresh quic" {
+        return Err("pending message plaintext did not survive fresh QUIC delivery".into());
+    }
+    if !Storage::open(alice_db)?
+        .pending_peer_messages_for_peer(&alice_conversation_id)?
+        .is_empty()
+    {
+        return Err("pending message was not ACK-cleared after smoke delivery".into());
+    }
+
+    println!("Phase 6 LAN smoke passed");
+    Ok(())
+}
+
+fn temp_runtime_db(name: &str) -> AppResult<PathBuf> {
+    let mut random = [0u8; 8];
+    fill_random(&mut random)?;
+    Ok(std::env::temp_dir().join(format!("ciphermesh-{name}-{}.sqlite", hex_encode(&random))))
 }
 
 fn run_restart_demo(db_path: &Path) -> AppResult<()> {
@@ -5808,86 +5915,9 @@ mod discovery_tests {
     async fn fresh_connection_flushes_queued_pending_message() {
         let alice_db = temp_profile_db("alice-pending-flush");
         let bob_db = temp_profile_db("bob-pending-flush");
-        Storage::open(&alice_db)
-            .expect("alice storage")
-            .save_display_name("Alice")
-            .expect("alice display name");
-        Storage::open(&bob_db)
-            .expect("bob storage")
-            .save_display_name("Bob")
-            .expect("bob display name");
-
-        let bob = Bob::local();
-        let bob_identity = bob.prekey_bundle().expect("bob bundle").identity_public_key;
-        let conversation_id = contact_id_for_identity(&bob_identity);
-        let endpoint = bind_quic_listener("127.0.0.1:0".parse().unwrap()).expect("bind bob");
-        let bob_addr = endpoint.local_addr().expect("bob local addr");
-        save_contact_for_chat(
-            &alice_db,
-            &conversation_id,
-            "Bob",
-            &bob_identity,
-            &quic_discovery_hint(bob_addr),
-        )
-        .expect("save contact");
-        let peer = load_known_peer_for_conversation(&alice_db, &conversation_id)
-            .expect("load peer")
-            .expect("peer");
-        queue_offline_peer_message(&alice_db, &peer, "queued before fresh connect")
-            .expect("queue pending");
-
-        let bob = Arc::new(Mutex::new(bob));
-        let bob_for_task = Arc::clone(&bob);
-        let bob_db_for_task = bob_db.clone();
-        let (release_server, hold_server) = tokio::sync::oneshot::channel::<()>();
-        let server = tokio::spawn(async move {
-            let incoming = endpoint.accept().await.ok_or("endpoint closed")?;
-            let connection = incoming.await?;
-            let session =
-                complete_bob_chat_handshake(&connection, bob_for_task, "Bob", &bob_db_for_task)
-                    .await?;
-
-            let mut recv = time::timeout(CHAT_CONNECT_TIMEOUT, connection.accept_uni())
-                .await
-                .map_err(|_| "timed out waiting for pending message")??;
-            let frame_bytes = receive_bytes(&mut recv).await?;
-            let frame: ChatFrame = bincode::deserialize(&frame_bytes)?;
-            let ChatFrame::Message {
-                message_id,
-                message,
-                ..
-            } = frame
-            else {
-                return Err("expected pending message frame".into());
-            };
-            let plaintext = {
-                let mut bob = bob.lock().map_err(|_| "Bob state lock poisoned")?;
-                bob.decrypt_from_alice(&message)?
-            };
-            send_chat_ack(&connection, &message_id).await?;
-            let _ = hold_server.await;
-            Ok::<_, Box<dyn Error + Send + Sync>>((session.conversation_id, plaintext))
-        });
-
-        let session = connect_alice_chat(bob_addr, &alice_db)
+        run_phase6_lan_smoke_with_dbs(&alice_db, &bob_db)
             .await
-            .expect("alice connects");
-        let alice_identity = load_or_create_alice_identity(&alice_db)
-            .expect("reload alice")
-            .signed_key_exchange()
-            .identity_public_key;
-        let alice_conversation_id = contact_id_for_identity(&alice_identity);
-        let _ = release_server.send(());
-        let (bob_conversation_id, plaintext) = server.await.expect("server task").expect("server");
-
-        assert_eq!(session.conversation_id, conversation_id);
-        assert_eq!(bob_conversation_id, alice_conversation_id);
-        assert_eq!(plaintext, "queued before fresh connect");
-        assert!(Storage::open(&alice_db)
-            .expect("alice storage")
-            .pending_peer_messages_for_peer(&conversation_id)
-            .expect("pending")
-            .is_empty());
+            .expect("fresh QUIC connection flushes queued pending message");
 
         let _ = std::fs::remove_file(alice_db);
         let _ = std::fs::remove_file(bob_db);

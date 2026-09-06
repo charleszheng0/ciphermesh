@@ -45,6 +45,8 @@ while [[ "$iterations" == "0" || "$count" -lt "$iterations" ]]; do
     run_cmd cargo test
   fi
 
+  run_cmd cargo run -- phase6-lan-smoke
+
   if [[ "$no_clippy" != "1" ]]; then
     run_cmd cargo clippy --all-targets --all-features -- -D warnings
   fi
