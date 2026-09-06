@@ -115,10 +115,12 @@ Expected highlights:
 ```bash
 cargo test hardening -- --nocapture
 cargo run -- phase6-lan-smoke
+cargo run -- phase6-mailbox-smoke
 ```
 
 This exercises deterministic drop, delay, duplicate, replay, tamper, reorder, and partition behavior around encrypted payload delivery.
 The smoke command starts a real local QUIC listener, flushes a queued pending message over a fresh connection, and verifies ACK cleanup.
+The mailbox smoke exercises encrypted offline deposit, recipient fetch, and retrieval ACK over libp2p request-response.
 
 ## 8. Phase 6 Loop
 

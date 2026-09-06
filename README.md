@@ -131,6 +131,7 @@ cargo run -- fanout-demo
 cargo run -- own-device-sync-demo
 cargo run -- revocation-demo
 cargo run -- phase6-lan-smoke
+cargo run -- phase6-mailbox-smoke
 cargo run -- phase6-listener-doctor [0.0.0.0:5000] [hold-seconds]
 ```
 
@@ -307,9 +308,11 @@ The Phase 6 loop also runs:
 
 ```bash
 cargo run -- phase6-lan-smoke
+cargo run -- phase6-mailbox-smoke
 ```
 
 That smoke starts a real local QUIC listener on `0.0.0.0:<ephemeral>`, queues a pending message before connect, establishes a fresh chat, waits for an ACK, and fails if the pending message is not delivered exactly once and cleared.
+The mailbox smoke starts an in-process libp2p mailbox, deposits an encrypted offline envelope, fetches it as Bob, ACKs retrieval, and fails if the mailbox still has pending ciphertext afterward.
 
 For the Mac invite/listener check:
 

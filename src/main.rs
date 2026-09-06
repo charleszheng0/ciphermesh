@@ -205,6 +205,7 @@ async fn main() -> AppResult<()> {
             run_invite_demo(&db_path)
         }
         Some("phase6-lan-smoke") => run_phase6_lan_smoke().await,
+        Some("phase6-mailbox-smoke") => run_phase6_mailbox_smoke().await,
         Some("phase6-listener-doctor") => {
             let listen_addr = parse_addr(args.get(2), DEFAULT_INVITE_LISTEN_ADDR)?;
             let hold_seconds = args
@@ -361,6 +362,7 @@ fn print_usage() {
     println!();
     println!("Phase 6 local QUIC pending-delivery smoke:");
     println!("  cargo run -- phase6-lan-smoke");
+    println!("  cargo run -- phase6-mailbox-smoke");
     println!("  cargo run -- phase6-listener-doctor [0.0.0.0:5000] [hold-seconds]");
     println!();
     println!("Phase 4A SQLite restart demo:");
@@ -567,6 +569,85 @@ async fn run_phase6_listener_doctor(listen_addr: SocketAddr, hold: Duration) -> 
     drop(endpoint);
     println!("Phase 6 listener doctor finished");
     Ok(())
+}
+
+async fn run_phase6_mailbox_smoke() -> AppResult<()> {
+    let mailbox_db = temp_runtime_db("phase6-mailbox")?;
+    let alice_db = temp_runtime_db("phase6-mailbox-alice")?;
+    let bob_db = temp_runtime_db("phase6-mailbox-bob")?;
+    let result = run_phase6_mailbox_smoke_with_dbs(&mailbox_db, &alice_db, &bob_db).await;
+    let _ = std::fs::remove_file(&mailbox_db);
+    let _ = std::fs::remove_file(&alice_db);
+    let _ = std::fs::remove_file(&bob_db);
+    result
+}
+
+async fn run_phase6_mailbox_smoke_with_dbs(
+    mailbox_db: &Path,
+    alice_db: &Path,
+    bob_db: &Path,
+) -> AppResult<()> {
+    let mut swarm = new_mailbox_swarm()?;
+    let mailbox_peer_id = *swarm.local_peer_id();
+    let store = MailboxStorage::open(mailbox_db, MAILBOX_MAX_ENVELOPES)?;
+    swarm.listen_on("/ip4/127.0.0.1/tcp/0".parse()?)?;
+    let listen_addr = next_mailbox_listen_addr(&mut swarm).await?;
+    let mailbox_addr = listen_addr.with(Protocol::P2p(mailbox_peer_id));
+    let server =
+        tokio::spawn(async move { run_phase6_mailbox_server_until_ack(swarm, store).await });
+
+    println!("Phase 6 mailbox smoke using {mailbox_addr}");
+    run_alice_mailbox_deposit(
+        mailbox_addr.clone(),
+        "phase6 offline mailbox delivery",
+        alice_db,
+    )
+    .await?;
+    run_bob_mailbox_fetch(mailbox_addr, bob_db).await?;
+    server.await??;
+
+    let pending = MailboxStorage::open(mailbox_db, MAILBOX_MAX_ENVELOPES)?.pending_count()?;
+    if pending != 0 {
+        return Err(format!("mailbox still has {pending} pending envelope(s) after ACK").into());
+    }
+
+    println!("Phase 6 mailbox smoke passed");
+    Ok(())
+}
+
+async fn run_phase6_mailbox_server_until_ack(
+    mut swarm: Swarm<MailboxBehaviour>,
+    store: MailboxStorage,
+) -> AppResult<()> {
+    let timeout = time::sleep(DISCOVERY_TIMEOUT);
+    tokio::pin!(timeout);
+    let mut ack_response_pending = false;
+
+    loop {
+        tokio::select! {
+            _ = &mut timeout => return Err("mailbox smoke server timed out waiting for ACK".into()),
+            event = swarm.select_next_some() => {
+                match event {
+                    SwarmEvent::Behaviour(MailboxBehaviourEvent::Mailbox(
+                        request_response::Event::Message {
+                            message: request_response::Message::Request { request, channel, .. },
+                            ..
+                        },
+                    )) => {
+                        ack_response_pending = matches!(request, MailboxRequest::Acknowledge { .. });
+                        let response = handle_mailbox_request(&store, request);
+                        let _ = swarm.behaviour_mut().mailbox.send_response(channel, response);
+                    }
+                    SwarmEvent::Behaviour(MailboxBehaviourEvent::Mailbox(
+                        request_response::Event::ResponseSent { .. },
+                    )) if ack_response_pending => {
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 fn temp_runtime_db(name: &str) -> AppResult<PathBuf> {
@@ -5372,6 +5453,47 @@ async fn run_bob_mailbox_fetch(mailbox_addr: Multiaddr, db_path: &Path) -> AppRe
     }
 }
 
+fn handle_mailbox_request(store: &MailboxStorage, request: MailboxRequest) -> MailboxResponse {
+    match request {
+        MailboxRequest::Deposit(envelope) => {
+            let message_id = envelope.message_id.clone();
+            let record = MailboxEnvelopeRecord {
+                message_id: envelope.message_id,
+                recipient_token: envelope.recipient_token,
+                encrypted_payload: envelope.encrypted_payload,
+                created_at_unix_secs: mailbox_now_unix_secs(),
+                expires_at_unix_secs: envelope.expires_at_unix_secs,
+            };
+            match store.deposit(&record, mailbox_now_unix_secs()) {
+                Ok(_) => MailboxResponse::Deposited { message_id },
+                Err(error) => MailboxResponse::Error(error.to_string()),
+            }
+        }
+        MailboxRequest::Fetch { recipient_token } => {
+            match store.fetch_pending(&recipient_token, mailbox_now_unix_secs()) {
+                Ok(records) => MailboxResponse::Pending {
+                    envelopes: records
+                        .into_iter()
+                        .map(|record| OfflineEnvelope {
+                            recipient_token: record.recipient_token,
+                            message_id: record.message_id,
+                            encrypted_payload: record.encrypted_payload,
+                            expires_at_unix_secs: record.expires_at_unix_secs,
+                        })
+                        .collect(),
+                },
+                Err(error) => MailboxResponse::Error(error.to_string()),
+            }
+        }
+        MailboxRequest::Acknowledge { message_id } => {
+            match store.acknowledge_retrieval(&message_id, mailbox_now_unix_secs()) {
+                Ok(()) => MailboxResponse::Acknowledged { message_id },
+                Err(error) => MailboxResponse::Error(error.to_string()),
+            }
+        }
+    }
+}
+
 async fn mailbox_request(
     mailbox_addr: Multiaddr,
     mailbox_peer_id: PeerId,
@@ -5418,6 +5540,14 @@ async fn mailbox_request(
 }
 
 async fn next_relay_listen_addr(swarm: &mut Swarm<RelayServerBehaviour>) -> AppResult<Multiaddr> {
+    loop {
+        if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
+            return Ok(address);
+        }
+    }
+}
+
+async fn next_mailbox_listen_addr(swarm: &mut Swarm<MailboxBehaviour>) -> AppResult<Multiaddr> {
     loop {
         if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
             return Ok(address);
