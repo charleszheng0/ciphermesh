@@ -34,12 +34,26 @@ Use `Iterations = 0` / `ITERATIONS=0` for an infinite loop. Use `-NoClippy` or `
 ## Current Coverage Map
 
 - 6A: `hardening_tests::fault_injector_is_deterministic_and_disabled_by_default`
-- 6B: `hardening_tests::*outbox*`, `*ack*`, `*duplicate*`, `*mailbox*`
+- 6B: `hardening_tests::*outbox*`, `*ack*`, `*duplicate*`, `*mailbox*`; pending message storage/contact-list tests
 - 6C: tamper/replay tests in `tests` and `hardening_tests`
 - 6D: `crdt::tests`, sync and own-device sync storage tests
 - 6E: manual two-machine validation still required
 - 6F: reconnect UI removed; LAN invite listener lifecycle fixed
-- 6G-6I: docs and packaging still pending
+- 6G: `SECURITY.md` covers assets, attacker model, trust boundaries, and limitations
+- 6H: README/demo reproduction is in progress
+- 6I: release-binary packaging scripts exist; installer polish still pending
+
+## Ship Gate
+
+Do not mark Phase 6 complete until these are true:
+
+- `cargo fmt --check` passes.
+- `cargo test` passes.
+- `cargo clippy --all-targets --all-features -- -D warnings` passes.
+- `.\scripts\phase6-loop.ps1 -Iterations 1 -Full` or `FULL=1 ./scripts/phase6-loop.sh` passes.
+- Same-LAN Mac/Windows transcript proves invite creation keeps UDP 5000 bound and chat works both directions.
+- Different-network transcript records direct, hole punch, or relay fallback behavior.
+- Release binaries are built for the tester platforms.
 
 ## Manual Two-Machine Transcript Template
 

@@ -88,6 +88,24 @@ Main message shapes include:
 cargo build
 ```
 
+Release binary:
+
+```bash
+cargo build --release
+```
+
+Windows packaging helper:
+
+```powershell
+.\scripts\package-release.ps1
+```
+
+macOS/Linux packaging helper:
+
+```bash
+./scripts/package-release.sh
+```
+
 ## CLI
 
 ```bash
@@ -115,6 +133,35 @@ cargo run -- revocation-demo
 ```
 
 Verbose logging is enabled with `--verbose`, `-v`, or `CIPHERMESH_VERBOSE=1`.
+
+## Recommended Same-LAN Flow
+
+On the host computer:
+
+```bash
+cargo run
+```
+
+Choose `Create invite`. CipherMesh should print an invite token like:
+
+```text
+ABC2D3@192.168.1.25:5000
+Listening on 0.0.0.0:5000
+```
+
+On macOS, this should show the UDP listener while the invite is waiting:
+
+```bash
+lsof -nP -iUDP:5000
+```
+
+On the joining computer:
+
+```bash
+cargo run
+```
+
+Choose `Join invite` and paste the full invite token. Both sides should enter the encrypted chat. If the peer disconnects, CipherMesh shows `Status: Offline`; restart both instances and create a fresh invite to reconnect for now.
 
 ## Local History Security
 
@@ -242,6 +289,18 @@ Full suite:
 cargo test
 ```
 
+Phase 6 validation loop:
+
+```bash
+./scripts/phase6-loop.sh
+```
+
+Windows:
+
+```powershell
+.\scripts\phase6-loop.ps1
+```
+
 Hardening suite:
 
 ```bash
@@ -267,3 +326,4 @@ CipherMesh treats the network as untrusted. Discovery can find addresses, relays
 - No account recovery or backup.
 - No group chat.
 - No full production NAT traversal test harness in this repo.
+- Manual reconnect UX is intentionally disabled while the protocol is hardened; use a fresh invite after restart/disconnect.

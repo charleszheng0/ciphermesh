@@ -31,6 +31,24 @@ how are you
 
 Bob should print Alice's messages immediately. Bob can type a reply and Alice prints it immediately.
 
+## 2B. Same-LAN Invite Chat
+
+Host:
+
+```bash
+cargo run
+```
+
+Choose Create Invite and copy the full invite token.
+
+Joiner:
+
+```bash
+cargo run
+```
+
+Choose Join Invite and paste the full token. The host should have a UDP listener on port 5000 while it waits.
+
 ## 3. Show Encrypted Transport Briefly
 
 Run:
@@ -99,3 +117,17 @@ cargo test hardening -- --nocapture
 ```
 
 This exercises deterministic drop, delay, duplicate, replay, tamper, reorder, and partition behavior around encrypted payload delivery.
+
+## 8. Phase 6 Loop
+
+Windows:
+
+```powershell
+.\scripts\phase6-loop.ps1 -Iterations 1 -Full
+```
+
+macOS/Linux:
+
+```bash
+FULL=1 ./scripts/phase6-loop.sh
+```
