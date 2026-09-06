@@ -3387,9 +3387,7 @@ fn is_peer_disconnect_app_error(error: &(dyn Error + 'static)) -> bool {
         );
     }
 
-    error
-        .source()
-        .is_some_and(|source| is_peer_disconnect_app_error(source))
+    error.source().is_some_and(is_peer_disconnect_app_error)
 }
 
 fn is_peer_disconnect_error(error: &quinn::ConnectionError) -> bool {
@@ -4141,10 +4139,12 @@ fn default_chat_db(role: &str) -> PathBuf {
     PathBuf::from(format!("target/ciphermesh-{role}-profile.sqlite"))
 }
 
+#[cfg(test)]
 fn local_profile_db(profile_id: &str) -> PathBuf {
     PathBuf::from(format!("target/ciphermesh-{profile_id}.sqlite"))
 }
 
+#[cfg(test)]
 fn profile_label(profile_db: &Path) -> String {
     profile_db
         .file_stem()
