@@ -772,6 +772,7 @@ async fn run_phase6_relay_bob_until_ack(
                             event,
                             &mut final_relay_ack_pending,
                         )? {
+                            time::sleep(Duration::from_millis(250)).await;
                             return Ok(());
                         }
                     }
