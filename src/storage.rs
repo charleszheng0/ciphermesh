@@ -2663,6 +2663,98 @@ mod tests {
     }
 
     #[test]
+    fn contact_list_reports_pending_messages_for_offline_peer() {
+        let storage = Storage::open_in_memory().expect("open storage");
+        storage
+            .save_contact(&ContactRecord {
+                contact_id: "conversation-1".to_string(),
+                display_name: "Bob".to_string(),
+                identity_public_key: b"identity-1".to_vec(),
+                discovery_hint: "direct QUIC".to_string(),
+                saved_at_unix_secs: 100,
+            })
+            .expect("save contact");
+        storage
+            .save_known_peer(&KnownPeerRecord {
+                peer_id: "peer-1".to_string(),
+                identity_public_key: b"identity-1".to_vec(),
+                display_name: "Bob".to_string(),
+                conversation_id: "conversation-1".to_string(),
+                last_seen_at_unix_secs: 200,
+            })
+            .expect("save known peer");
+
+        for index in 1..=2 {
+            storage
+                .queue_pending_peer_message(&PendingPeerMessage {
+                    message_id: format!("pending-{index}"),
+                    peer_id: "peer-1".to_string(),
+                    conversation_id: "conversation-1".to_string(),
+                    plaintext: format!("offline {index}"),
+                    created_at_unix_secs: 300 + index,
+                    retry_count: 0,
+                    last_attempt_unix_secs: None,
+                })
+                .expect("queue pending");
+        }
+
+        let summary = storage
+            .recent_chat_summaries(10)
+            .expect("summaries")
+            .into_iter()
+            .next()
+            .expect("summary");
+
+        assert_eq!(summary.contact.display_name, "Bob");
+        assert_eq!(summary.pending_count, 2);
+        assert_eq!(summary.last_seen_at_unix_secs, Some(200));
+    }
+
+    #[test]
+    fn pending_peer_messages_remain_until_confirmed_and_preserve_order() {
+        let storage = Storage::open_in_memory().expect("open storage");
+        for (message_id, created_at) in [("late", 20), ("early", 10)] {
+            storage
+                .queue_pending_peer_message(&PendingPeerMessage {
+                    message_id: message_id.to_string(),
+                    peer_id: "peer-1".to_string(),
+                    conversation_id: "conversation-1".to_string(),
+                    plaintext: message_id.to_string(),
+                    created_at_unix_secs: created_at,
+                    retry_count: 0,
+                    last_attempt_unix_secs: None,
+                })
+                .expect("queue pending");
+        }
+
+        storage
+            .record_pending_peer_message_attempt("early")
+            .expect("record attempt");
+        let pending = storage
+            .pending_peer_messages_for_peer("peer-1")
+            .expect("pending after failed attempt");
+
+        assert_eq!(
+            pending
+                .iter()
+                .map(|message| message.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["early", "late"]
+        );
+        assert_eq!(pending[0].retry_count, 1);
+
+        storage
+            .remove_pending_peer_message("early")
+            .expect("confirmed delivery removes pending");
+        let remaining = storage
+            .pending_peer_messages_for_peer("peer-1")
+            .expect("remaining pending");
+
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].message_id, "late");
+    }
+
+    #[test]
     fn merging_legacy_contact_moves_history_and_pending_messages() {
         let storage = Storage::open_in_memory().expect("storage");
         storage
