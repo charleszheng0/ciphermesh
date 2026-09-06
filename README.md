@@ -130,6 +130,7 @@ cargo run -- device-demo
 cargo run -- fanout-demo
 cargo run -- own-device-sync-demo
 cargo run -- revocation-demo
+cargo run -- phase6-lan-smoke
 ```
 
 Verbose logging is enabled with `--verbose`, `-v`, or `CIPHERMESH_VERBOSE=1`.
@@ -300,6 +301,14 @@ Windows:
 ```powershell
 .\scripts\phase6-loop.ps1
 ```
+
+The Phase 6 loop also runs:
+
+```bash
+cargo run -- phase6-lan-smoke
+```
+
+That smoke starts a real local QUIC listener on `0.0.0.0:<ephemeral>`, queues a pending message before connect, establishes a fresh chat, waits for an ACK, and fails if the pending message is not delivered exactly once and cleared.
 
 Hardening suite:
 

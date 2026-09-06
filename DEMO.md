@@ -114,9 +114,11 @@ Expected highlights:
 
 ```bash
 cargo test hardening -- --nocapture
+cargo run -- phase6-lan-smoke
 ```
 
 This exercises deterministic drop, delay, duplicate, replay, tamper, reorder, and partition behavior around encrypted payload delivery.
+The smoke command starts a real local QUIC listener, flushes a queued pending message over a fresh connection, and verifies ACK cleanup.
 
 ## 8. Phase 6 Loop
 
