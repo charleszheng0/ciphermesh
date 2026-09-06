@@ -1089,7 +1089,7 @@ fn run_restart_demo(db_path: &Path) -> AppResult<()> {
 
     let messages = storage.messages_for_conversation(&conversation_id)?;
     println!("Stored conversation events read back from SQLite:");
-    for message in messages {
+    for message in &messages {
         println!(
             "  id={} direction={:?} counter={:?} ciphertext_bytes={} local_plaintext_present={}",
             message.message_id,
@@ -1257,7 +1257,7 @@ fn run_outbox_demo(db_path: &Path) -> AppResult<()> {
 
     let messages = storage.messages_for_conversation(&conversation_id)?;
     println!("Stored conversation events after retry demo:");
-    for message in messages {
+    for message in &messages {
         println!(
             "  id={} direction={:?} counter={:?} ciphertext_bytes={} local_plaintext_present={}",
             message.message_id,
@@ -4361,7 +4361,7 @@ impl ChatTerminal {
     fn print_message(&mut self, sender_display_name: &str, plaintext: &str) -> AppResult<()> {
         self.print_tx
             .send(format!(
-                "New messages:\n> {}: {}",
+                "New Messages:\n> {}: {}",
                 display_name_or_anonymous(sender_display_name),
                 plaintext
             ))
@@ -4639,10 +4639,6 @@ fn print_conversation(
 ) -> AppResult<()> {
     let storage = Storage::open(db_path)?;
     let messages = storage.messages_for_conversation(conversation_id)?;
-    let received_count = messages
-        .iter()
-        .filter(|message| message.direction == MessageDirection::Received)
-        .count();
 
     println!();
     match status {
@@ -4651,7 +4647,7 @@ fn print_conversation(
     }
     println!();
     println!("--------------------------------");
-    for message in messages {
+    for message in &messages {
         let body = message.plaintext.as_deref().unwrap_or("[encrypted]");
         if is_local_message(&message) {
             println!("> {}: {body}", local_sender_label());
@@ -4669,13 +4665,23 @@ fn print_conversation(
         }
     }
     println!("--------------------------------");
-    if received_count > 0 {
-        println!("New messages: {received_count}");
-    } else {
-        println!("New messages: none");
-    }
+    print_new_messages_section(&messages, display_name);
     println!();
     Ok(())
+}
+
+fn print_new_messages_section(messages: &[MessageRecord], display_name: &str) {
+    println!("New Messages:");
+    for message in messages
+        .iter()
+        .filter(|message| message.direction == MessageDirection::Received)
+    {
+        let body = message.plaintext.as_deref().unwrap_or("[encrypted]");
+        println!(
+            "> {}: {body}",
+            remote_message_sender_label(message, display_name)
+        );
+    }
 }
 
 fn message_status_label(status: &MessageStatus) -> &'static str {
