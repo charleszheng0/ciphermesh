@@ -319,6 +319,7 @@ cargo run -- phase6-mailbox-smoke
 
 That smoke starts a real local QUIC listener on `0.0.0.0:<ephemeral>`, queues a pending message before connect, establishes a fresh chat, waits for an ACK, and fails if the pending message is not delivered exactly once and cleared.
 The invite discovery smoke starts the mDNS invite sidecar, resolves a six-character code to the advertised QUIC address, and completes the chat handshake without manually entering an IP or PeerId.
+The relay smoke starts a local circuit relay, reserves Bob through it, dials Bob's relayed multiaddr from Alice, and verifies the secure message handshake plus ACK over the relay path.
 The mailbox smoke starts an in-process libp2p mailbox, deposits an encrypted offline envelope, fetches it as Bob, ACKs retrieval, and fails if the mailbox still has pending ciphertext afterward.
 
 For the Mac invite/listener check:
