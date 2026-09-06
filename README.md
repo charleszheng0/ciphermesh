@@ -98,12 +98,14 @@ Windows packaging helper:
 
 ```powershell
 .\scripts\package-release.ps1
+.\dist\ciphermesh-windows-x64-ciphermesh.exe
 ```
 
 macOS/Linux packaging helper:
 
 ```bash
 ./scripts/package-release.sh
+./dist/ciphermesh-<macos|linux>-<x64|arm64>-ciphermesh
 ```
 
 ## CLI
