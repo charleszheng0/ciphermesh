@@ -1617,6 +1617,39 @@ impl Storage {
         )
     }
 
+    pub fn delete_conversation(&self, conversation_id: &str) -> StorageResult<usize> {
+        let mut removed = 0usize;
+        removed += self.conn.execute(
+            "DELETE FROM messages WHERE conversation_id = ?1",
+            params![conversation_id],
+        )?;
+        removed += self.conn.execute(
+            "DELETE FROM pending_peer_messages WHERE conversation_id = ?1",
+            params![conversation_id],
+        )?;
+        removed += self.conn.execute(
+            "DELETE FROM event_history WHERE conversation_id = ?1",
+            params![conversation_id],
+        )?;
+        removed += self.conn.execute(
+            "DELETE FROM version_vectors WHERE conversation_id = ?1",
+            params![conversation_id],
+        )?;
+        removed += self.conn.execute(
+            "DELETE FROM sessions WHERE conversation_id = ?1",
+            params![conversation_id],
+        )?;
+        removed += self.conn.execute(
+            "DELETE FROM known_peers WHERE conversation_id = ?1",
+            params![conversation_id],
+        )?;
+        removed += self.conn.execute(
+            "DELETE FROM contacts WHERE contact_id = ?1",
+            params![conversation_id],
+        )?;
+        Ok(removed)
+    }
+
     fn outbox_items_with_status(&self, status: OutboxStatus) -> StorageResult<Vec<OutboxItem>> {
         let mut statement = self.conn.prepare(
             "
@@ -2862,6 +2895,68 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn delete_conversation_removes_chat_from_history() {
+        let storage = Storage::open_in_memory().expect("storage");
+        storage
+            .save_contact(&ContactRecord {
+                contact_id: "contact-james".to_string(),
+                display_name: "James".to_string(),
+                identity_public_key: b"james-identity".to_vec(),
+                discovery_hint: "direct QUIC".to_string(),
+                saved_at_unix_secs: 100,
+            })
+            .expect("save contact");
+        storage
+            .save_known_peer(&KnownPeerRecord {
+                peer_id: "peer-james".to_string(),
+                identity_public_key: b"james-identity".to_vec(),
+                display_name: "James".to_string(),
+                conversation_id: "contact-james".to_string(),
+                last_seen_at_unix_secs: 100,
+            })
+            .expect("save known peer");
+        storage
+            .insert_message(&message("msg-1", "contact-james", "hello"))
+            .expect("insert message");
+        storage
+            .queue_pending_peer_message(&PendingPeerMessage {
+                message_id: "pending-1".to_string(),
+                peer_id: "peer-james".to_string(),
+                conversation_id: "contact-james".to_string(),
+                plaintext: "queued".to_string(),
+                created_at_unix_secs: 101,
+                retry_count: 0,
+                last_attempt_unix_secs: None,
+            })
+            .expect("queue pending");
+
+        let removed = storage
+            .delete_conversation("contact-james")
+            .expect("delete chat");
+
+        assert!(removed >= 4);
+        assert!(storage
+            .load_contact("contact-james")
+            .expect("load deleted contact")
+            .is_none());
+        assert!(storage
+            .known_peer_for_conversation("contact-james")
+            .expect("load deleted peer")
+            .is_none());
+        assert!(storage
+            .messages_for_conversation("contact-james")
+            .expect("deleted messages")
+            .is_empty());
+        assert_eq!(
+            storage
+                .pending_peer_message_count("contact-james")
+                .expect("deleted pending"),
+            0
+        );
+        assert_eq!(storage.chat_summary_count().expect("summary count"), 0);
     }
 
     #[test]

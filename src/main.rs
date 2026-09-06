@@ -478,7 +478,11 @@ async fn run_phase6_lan_smoke_with_dbs(alice_db: &Path, bob_db: &Path) -> AppRes
 
     let bob = load_or_create_bob_identity(bob_db)?;
     let bob_identity = bob.prekey_bundle()?.identity_public_key;
+    let alice_identity = load_or_create_alice_identity(alice_db)?
+        .signed_key_exchange()
+        .identity_public_key;
     let alice_conversation_id = contact_id_for_identity(&bob_identity);
+    let bob_conversation_id = contact_id_for_identity(&alice_identity);
     let endpoint = bind_quic_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?;
     let bound_addr = endpoint.local_addr()?;
     let dial_addr = if bound_addr.ip().is_unspecified() {
@@ -496,7 +500,17 @@ async fn run_phase6_lan_smoke_with_dbs(alice_db: &Path, bob_db: &Path) -> AppRes
     )?;
     let peer = load_known_peer_for_conversation(alice_db, &alice_conversation_id)?
         .ok_or("missing saved peer after contact save")?;
-    queue_offline_peer_message(alice_db, &peer, "phase6 pending over fresh quic")?;
+    queue_offline_peer_message(alice_db, &peer, "phase6 pending from joiner")?;
+    save_contact_for_chat(
+        bob_db,
+        &bob_conversation_id,
+        "Alice",
+        &alice_identity,
+        &quic_discovery_hint(dial_addr),
+    )?;
+    let peer = load_known_peer_for_conversation(bob_db, &bob_conversation_id)?
+        .ok_or("missing saved peer after contact save")?;
+    queue_offline_peer_message(bob_db, &peer, "phase6 pending from invite creator")?;
 
     let bob = Arc::new(Mutex::new(bob));
     let bob_for_task = Arc::clone(&bob);
@@ -507,38 +521,40 @@ async fn run_phase6_lan_smoke_with_dbs(alice_db: &Path, bob_db: &Path) -> AppRes
         let connection = incoming.await?;
         let session =
             complete_bob_chat_handshake(&connection, bob_for_task, "Bob", &bob_db_for_task).await?;
+        let mut bob = Arc::try_unwrap(bob)
+            .map_err(|_| "Bob state still shared after handshake")?
+            .into_inner()
+            .map_err(|_| "Bob state lock poisoned")?;
+        flush_pending_messages_to_alice(
+            &connection,
+            &mut bob,
+            "Bob",
+            &session.remote_display_name,
+            &session.conversation_id,
+            &bob_db_for_task,
+        )
+        .await?;
+        save_bob_identity(&bob_db_for_task, &bob)?;
 
-        let mut recv = time::timeout(CHAT_CONNECT_TIMEOUT, connection.accept_uni())
-            .await
-            .map_err(|_| "timed out waiting for pending message")??;
-        let frame_bytes = receive_bytes(&mut recv).await?;
-        let frame: ChatFrame = bincode::deserialize(&frame_bytes)?;
-        let ChatFrame::Message {
-            message_id,
-            message,
-            ..
-        } = frame
-        else {
-            return Err("expected pending message frame".into());
-        };
-        let plaintext = {
-            let mut bob = bob.lock().map_err(|_| "Bob state lock poisoned")?;
-            bob.decrypt_from_alice(&message)?
-        };
-        send_chat_ack(&connection, &message_id).await?;
+        let received_joiner_message = Storage::open(&bob_db_for_task)?
+            .messages_for_conversation(&session.conversation_id)?
+            .into_iter()
+            .any(|message| {
+                message.direction == MessageDirection::Received
+                    && message.plaintext.as_deref() == Some("phase6 pending from joiner")
+            });
+        if !received_joiner_message {
+            return Err("invite creator did not receive joiner pending message".into());
+        }
         let _ = hold_server.await;
-        Ok::<_, Box<dyn Error + Send + Sync>>((session.conversation_id, plaintext))
+        Ok::<_, Box<dyn Error + Send + Sync>>(session.conversation_id)
     });
 
     println!("Phase 6 LAN smoke listening on {bound_addr}");
     println!("Phase 6 LAN smoke dialing {dial_addr}");
     let session = connect_alice_chat(dial_addr, alice_db).await?;
-    let alice_identity = load_or_create_alice_identity(alice_db)?
-        .signed_key_exchange()
-        .identity_public_key;
-    let bob_conversation_id = contact_id_for_identity(&alice_identity);
     let _ = release_server.send(());
-    let (server_conversation_id, plaintext) = server.await??;
+    let server_conversation_id = server.await??;
 
     if session.conversation_id != alice_conversation_id {
         return Err("Alice stored the wrong peer conversation after smoke connect".into());
@@ -546,14 +562,29 @@ async fn run_phase6_lan_smoke_with_dbs(alice_db: &Path, bob_db: &Path) -> AppRes
     if server_conversation_id != bob_conversation_id {
         return Err("Bob stored the wrong peer conversation after smoke connect".into());
     }
-    if plaintext != "phase6 pending over fresh quic" {
-        return Err("pending message plaintext did not survive fresh QUIC delivery".into());
-    }
     if !Storage::open(alice_db)?
         .pending_peer_messages_for_peer(&alice_conversation_id)?
         .is_empty()
     {
-        return Err("pending message was not ACK-cleared after smoke delivery".into());
+        return Err("joiner pending message was not ACK-cleared after smoke delivery".into());
+    }
+    if !Storage::open(bob_db)?
+        .pending_peer_messages_for_peer(&bob_conversation_id)?
+        .is_empty()
+    {
+        return Err(
+            "invite creator pending message was not ACK-cleared after smoke delivery".into(),
+        );
+    }
+    let alice_received_inviter_message = Storage::open(alice_db)?
+        .messages_for_conversation(&alice_conversation_id)?
+        .into_iter()
+        .any(|message| {
+            message.direction == MessageDirection::Received
+                && message.plaintext.as_deref() == Some("phase6 pending from invite creator")
+        });
+    if !alice_received_inviter_message {
+        return Err("joiner did not receive invite creator pending message".into());
     }
 
     println!("Phase 6 LAN smoke passed");
@@ -1705,6 +1736,7 @@ async fn open_saved_conversation(
         print_offline_conversation(profile_db, conversation_id, display_name)?;
         println!("{CHAT_INPUT_INSTRUCTION}");
         println!("Use /clear to clear local history.");
+        println!("Use /delete to permanently delete this chat.");
         println!();
 
         let line = prompt_line(CHAT_PROMPT)?;
@@ -1717,6 +1749,19 @@ async fn open_saved_conversation(
             println!(
                 "Cleared {removed} local message(s). This does not delete copies on other devices."
             );
+            println!();
+            continue;
+        }
+        if line.trim().eq_ignore_ascii_case("/delete") {
+            let confirmation = prompt_line("Type DELETE to permanently delete this chat: ")?;
+            if confirmation.trim() == "DELETE" {
+                let storage = Storage::open(profile_db)?;
+                let removed = storage.delete_conversation(conversation_id)?;
+                println!("Deleted chat and {removed} related local row(s).");
+                println!();
+                return Ok(());
+            }
+            println!("Delete cancelled.");
             println!();
             continue;
         }
@@ -3965,6 +4010,12 @@ fn queue_message_after_peer_disconnect(
     Ok(())
 }
 
+fn pending_peer_id_for_conversation(db_path: &Path, conversation_id: &str) -> AppResult<String> {
+    Ok(load_known_peer_for_conversation(db_path, conversation_id)?
+        .map(|peer| peer.peer_id)
+        .unwrap_or_else(|| conversation_id.to_string()))
+}
+
 fn is_peer_disconnect_app_error(error: &(dyn Error + 'static)) -> bool {
     if let Some(error) = error.downcast_ref::<quinn::ConnectionError>() {
         return is_peer_disconnect_error(error);
@@ -4007,8 +4058,8 @@ async fn flush_pending_messages_to_bob(
     conversation_id: &str,
     db_path: &Path,
 ) -> AppResult<()> {
-    let peer_id = conversation_id;
-    let pending = Storage::open(db_path)?.pending_peer_messages_for_peer(peer_id)?;
+    let peer_id = pending_peer_id_for_conversation(db_path, conversation_id)?;
+    let pending = Storage::open(db_path)?.pending_peer_messages_for_peer(&peer_id)?;
     if pending.is_empty() {
         return Ok(());
     }
@@ -4062,8 +4113,8 @@ async fn flush_pending_messages_to_alice(
     conversation_id: &str,
     db_path: &Path,
 ) -> AppResult<()> {
-    let peer_id = conversation_id;
-    let pending = Storage::open(db_path)?.pending_peer_messages_for_peer(peer_id)?;
+    let peer_id = pending_peer_id_for_conversation(db_path, conversation_id)?;
+    let pending = Storage::open(db_path)?.pending_peer_messages_for_peer(&peer_id)?;
     if pending.is_empty() {
         return Ok(());
     }
@@ -4310,7 +4361,7 @@ impl ChatTerminal {
     fn print_message(&mut self, sender_display_name: &str, plaintext: &str) -> AppResult<()> {
         self.print_tx
             .send(format!(
-                "> {}: {}",
+                "New messages:\n> {}: {}",
                 display_name_or_anonymous(sender_display_name),
                 plaintext
             ))
@@ -4588,6 +4639,10 @@ fn print_conversation(
 ) -> AppResult<()> {
     let storage = Storage::open(db_path)?;
     let messages = storage.messages_for_conversation(conversation_id)?;
+    let received_count = messages
+        .iter()
+        .filter(|message| message.direction == MessageDirection::Received)
+        .count();
 
     println!();
     match status {
@@ -4614,6 +4669,11 @@ fn print_conversation(
         }
     }
     println!("--------------------------------");
+    if received_count > 0 {
+        println!("New messages: {received_count}");
+    } else {
+        println!("New messages: none");
+    }
     println!();
     Ok(())
 }
