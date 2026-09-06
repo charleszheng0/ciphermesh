@@ -205,6 +205,16 @@ async fn main() -> AppResult<()> {
             run_invite_demo(&db_path)
         }
         Some("phase6-lan-smoke") => run_phase6_lan_smoke().await,
+        Some("phase6-listener-doctor") => {
+            let listen_addr = parse_addr(args.get(2), DEFAULT_INVITE_LISTEN_ADDR)?;
+            let hold_seconds = args
+                .get(3)
+                .map(|value| value.parse::<u64>())
+                .transpose()
+                .map_err(|error| format!("invalid hold seconds: {error}"))?
+                .unwrap_or(30);
+            run_phase6_listener_doctor(listen_addr, Duration::from_secs(hold_seconds)).await
+        }
         Some("restart-demo") => {
             let db_path = args
                 .get(2)
@@ -351,6 +361,7 @@ fn print_usage() {
     println!();
     println!("Phase 6 local QUIC pending-delivery smoke:");
     println!("  cargo run -- phase6-lan-smoke");
+    println!("  cargo run -- phase6-listener-doctor [0.0.0.0:5000] [hold-seconds]");
     println!();
     println!("Phase 4A SQLite restart demo:");
     println!("  cargo run -- restart-demo [target/ciphermesh-4a-demo.sqlite]");
@@ -540,6 +551,21 @@ async fn run_phase6_lan_smoke_with_dbs(alice_db: &Path, bob_db: &Path) -> AppRes
     }
 
     println!("Phase 6 LAN smoke passed");
+    Ok(())
+}
+
+async fn run_phase6_listener_doctor(listen_addr: SocketAddr, hold: Duration) -> AppResult<()> {
+    let endpoint = bind_quic_listener(listen_addr)?;
+    let bound_addr = endpoint.local_addr()?;
+    let advertised_addr = advertise_socket_addr(bound_addr)?;
+
+    println!("Phase 6 listener doctor started");
+    println!("Listening on {bound_addr}");
+    println!("Invite would advertise {advertised_addr}");
+    println!("Holding listener for {} second(s)", hold.as_secs());
+    time::sleep(hold).await;
+    drop(endpoint);
+    println!("Phase 6 listener doctor finished");
     Ok(())
 }
 

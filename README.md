@@ -131,6 +131,7 @@ cargo run -- fanout-demo
 cargo run -- own-device-sync-demo
 cargo run -- revocation-demo
 cargo run -- phase6-lan-smoke
+cargo run -- phase6-listener-doctor [0.0.0.0:5000] [hold-seconds]
 ```
 
 Verbose logging is enabled with `--verbose`, `-v`, or `CIPHERMESH_VERBOSE=1`.
@@ -309,6 +310,15 @@ cargo run -- phase6-lan-smoke
 ```
 
 That smoke starts a real local QUIC listener on `0.0.0.0:<ephemeral>`, queues a pending message before connect, establishes a fresh chat, waits for an ACK, and fails if the pending message is not delivered exactly once and cleared.
+
+For the Mac invite/listener check:
+
+```bash
+cargo run -- phase6-listener-doctor 0.0.0.0:5000 60
+lsof -nP -iUDP:5000
+```
+
+The doctor uses the same QUIC listener startup and advertised-address logic as Create Invite, then keeps the listener alive long enough to inspect it.
 
 Hardening suite:
 

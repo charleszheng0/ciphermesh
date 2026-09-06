@@ -72,6 +72,15 @@ Listening on:
 lsof -nP -iUDP:5000
 ```
 
+Listener-only doctor:
+
+```bash
+cargo run -- phase6-listener-doctor 0.0.0.0:5000 60
+lsof -nP -iUDP:5000
+```
+
+Expected: the doctor prints `Listening on 0.0.0.0:5000`, prints the LAN address an invite would advertise, and `lsof` shows the UDP listener while the command is holding.
+
 Joiner:
 
 ```bash
