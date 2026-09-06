@@ -5804,6 +5804,95 @@ mod discovery_tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[tokio::test]
+    async fn fresh_connection_flushes_queued_pending_message() {
+        let alice_db = temp_profile_db("alice-pending-flush");
+        let bob_db = temp_profile_db("bob-pending-flush");
+        Storage::open(&alice_db)
+            .expect("alice storage")
+            .save_display_name("Alice")
+            .expect("alice display name");
+        Storage::open(&bob_db)
+            .expect("bob storage")
+            .save_display_name("Bob")
+            .expect("bob display name");
+
+        let bob = Bob::local();
+        let bob_identity = bob.prekey_bundle().expect("bob bundle").identity_public_key;
+        let conversation_id = contact_id_for_identity(&bob_identity);
+        let endpoint = bind_quic_listener("127.0.0.1:0".parse().unwrap()).expect("bind bob");
+        let bob_addr = endpoint.local_addr().expect("bob local addr");
+        save_contact_for_chat(
+            &alice_db,
+            &conversation_id,
+            "Bob",
+            &bob_identity,
+            &quic_discovery_hint(bob_addr),
+        )
+        .expect("save contact");
+        let peer = load_known_peer_for_conversation(&alice_db, &conversation_id)
+            .expect("load peer")
+            .expect("peer");
+        queue_offline_peer_message(&alice_db, &peer, "queued before fresh connect")
+            .expect("queue pending");
+
+        let bob = Arc::new(Mutex::new(bob));
+        let bob_for_task = Arc::clone(&bob);
+        let bob_db_for_task = bob_db.clone();
+        let (release_server, hold_server) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let incoming = endpoint.accept().await.ok_or("endpoint closed")?;
+            let connection = incoming.await?;
+            let session =
+                complete_bob_chat_handshake(&connection, bob_for_task, "Bob", &bob_db_for_task)
+                    .await?;
+
+            let mut recv = time::timeout(CHAT_CONNECT_TIMEOUT, connection.accept_uni())
+                .await
+                .map_err(|_| "timed out waiting for pending message")??;
+            let frame_bytes = receive_bytes(&mut recv).await?;
+            let frame: ChatFrame = bincode::deserialize(&frame_bytes)?;
+            let ChatFrame::Message {
+                message_id,
+                message,
+                ..
+            } = frame
+            else {
+                return Err("expected pending message frame".into());
+            };
+            let plaintext = {
+                let mut bob = bob.lock().map_err(|_| "Bob state lock poisoned")?;
+                bob.decrypt_from_alice(&message)?
+            };
+            send_chat_ack(&connection, &message_id).await?;
+            let _ = hold_server.await;
+            Ok::<_, Box<dyn Error + Send + Sync>>((session.conversation_id, plaintext))
+        });
+
+        let session = connect_alice_chat(bob_addr, &alice_db)
+            .await
+            .expect("alice connects");
+        let alice_identity = load_or_create_alice_identity(&alice_db)
+            .expect("reload alice")
+            .signed_key_exchange()
+            .identity_public_key;
+        let alice_conversation_id = contact_id_for_identity(&alice_identity);
+        let _ = release_server.send(());
+        let (bob_conversation_id, plaintext) = server.await.expect("server task").expect("server");
+
+        assert_eq!(session.conversation_id, conversation_id);
+        assert_eq!(bob_conversation_id, alice_conversation_id);
+        assert_eq!(plaintext, "queued before fresh connect");
+        assert!(Storage::open(&alice_db)
+            .expect("alice storage")
+            .pending_peer_messages_for_peer(&conversation_id)
+            .expect("pending")
+            .is_empty());
+
+        let _ = std::fs::remove_file(alice_db);
+        let _ = std::fs::remove_file(bob_db);
+    }
+
     #[test]
     fn local_profile_display_name_updates_without_rotating_identity() {
         let path = temp_profile_db("profile-name");
