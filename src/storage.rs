@@ -241,6 +241,12 @@ impl Storage {
                 accepted_at_unix_secs INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS new_messages (
+                message_id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                marked_at_unix_secs INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS device_counters (
                 device_id TEXT PRIMARY KEY,
                 next_counter INTEGER NOT NULL
@@ -1239,6 +1245,57 @@ impl Storage {
         Ok(inserted == 1)
     }
 
+    pub fn mark_message_new(&self, conversation_id: &str, message_id: &str) -> StorageResult<()> {
+        self.conn.execute(
+            "
+            INSERT OR IGNORE INTO new_messages (
+                message_id,
+                conversation_id,
+                marked_at_unix_secs
+            )
+            VALUES (?1, ?2, ?3)
+            ",
+            params![message_id, conversation_id, now_unix_secs() as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn new_messages_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> StorageResult<Vec<MessageRecord>> {
+        let mut statement = self.conn.prepare(
+            "
+            SELECT
+                m.message_id,
+                m.conversation_id,
+                m.sender_id,
+                m.recipient_id,
+                m.direction,
+                m.status,
+                m.protocol_counter,
+                m.ciphertext,
+                m.plaintext,
+                m.created_at_unix_secs
+            FROM new_messages nm
+            JOIN messages m ON m.message_id = nm.message_id
+            WHERE nm.conversation_id = ?1
+              AND m.direction = 'received'
+            ORDER BY m.created_at_unix_secs, m.protocol_counter, m.message_id
+            ",
+        )?;
+
+        let rows = statement.query_map(params![conversation_id], message_from_row)?;
+        rows.collect()
+    }
+
+    pub fn mark_new_messages_read(&self, conversation_id: &str) -> StorageResult<usize> {
+        self.conn.execute(
+            "DELETE FROM new_messages WHERE conversation_id = ?1",
+            params![conversation_id],
+        )
+    }
+
     pub fn save_account_identity(
         &self,
         account_id: &str,
@@ -1611,16 +1668,25 @@ impl Storage {
     }
 
     pub fn clear_conversation_history(&self, conversation_id: &str) -> StorageResult<usize> {
-        self.conn.execute(
+        let removed = self.conn.execute(
             "DELETE FROM messages WHERE conversation_id = ?1",
             params![conversation_id],
-        )
+        )?;
+        self.conn.execute(
+            "DELETE FROM new_messages WHERE conversation_id = ?1",
+            params![conversation_id],
+        )?;
+        Ok(removed)
     }
 
     pub fn delete_conversation(&self, conversation_id: &str) -> StorageResult<usize> {
         let mut removed = 0usize;
         removed += self.conn.execute(
             "DELETE FROM messages WHERE conversation_id = ?1",
+            params![conversation_id],
+        )?;
+        removed += self.conn.execute(
+            "DELETE FROM new_messages WHERE conversation_id = ?1",
             params![conversation_id],
         )?;
         removed += self.conn.execute(
@@ -2898,6 +2964,42 @@ mod tests {
     }
 
     #[test]
+    fn new_messages_are_one_time_received_markers() {
+        let storage = Storage::open_in_memory().expect("storage");
+        let mut received = message("msg-received", "contact-james", "hello");
+        received.direction = MessageDirection::Received;
+        storage
+            .insert_message(&received)
+            .expect("insert received message");
+        storage
+            .insert_message(&message("msg-sent", "contact-james", "local"))
+            .expect("insert sent message");
+        storage
+            .mark_message_new("contact-james", "msg-received")
+            .expect("mark received new");
+        storage
+            .mark_message_new("contact-james", "msg-sent")
+            .expect("mark sent new");
+
+        let new_messages = storage
+            .new_messages_for_conversation("contact-james")
+            .expect("new messages");
+        assert_eq!(new_messages.len(), 1);
+        assert_eq!(new_messages[0].message_id, "msg-received");
+
+        assert_eq!(
+            storage
+                .mark_new_messages_read("contact-james")
+                .expect("mark read"),
+            2
+        );
+        assert!(storage
+            .new_messages_for_conversation("contact-james")
+            .expect("new messages after read")
+            .is_empty());
+    }
+
+    #[test]
     fn delete_conversation_removes_chat_from_history() {
         let storage = Storage::open_in_memory().expect("storage");
         storage
@@ -2921,6 +3023,9 @@ mod tests {
         storage
             .insert_message(&message("msg-1", "contact-james", "hello"))
             .expect("insert message");
+        storage
+            .mark_message_new("contact-james", "msg-1")
+            .expect("mark message new");
         storage
             .queue_pending_peer_message(&PendingPeerMessage {
                 message_id: "pending-1".to_string(),

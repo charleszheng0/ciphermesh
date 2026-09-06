@@ -4287,6 +4287,7 @@ async fn handle_incoming_during_alice_flush(
                     },
                 )?;
                 mark_incoming_chat_message_accepted(db_path, &message_id)?;
+                Storage::open(db_path)?.mark_message_new(conversation_id, &message_id)?;
             }
             if let Err(error) = send_chat_ack(connection, &message_id).await {
                 if is_peer_disconnect_app_error(error.as_ref()) {
@@ -4335,6 +4336,7 @@ async fn handle_incoming_during_bob_flush(
                     },
                 )?;
                 mark_incoming_chat_message_accepted(db_path, &message_id)?;
+                Storage::open(db_path)?.mark_message_new(conversation_id, &message_id)?;
             }
             if let Err(error) = send_chat_ack(connection, &message_id).await {
                 if is_peer_disconnect_app_error(error.as_ref()) {
@@ -4361,7 +4363,7 @@ impl ChatTerminal {
     fn print_message(&mut self, sender_display_name: &str, plaintext: &str) -> AppResult<()> {
         self.print_tx
             .send(format!(
-                "New Messages:\n> {}: {}",
+                "> {}: {}",
                 display_name_or_anonymous(sender_display_name),
                 plaintext
             ))
@@ -4639,6 +4641,7 @@ fn print_conversation(
 ) -> AppResult<()> {
     let storage = Storage::open(db_path)?;
     let messages = storage.messages_for_conversation(conversation_id)?;
+    let new_messages = storage.new_messages_for_conversation(conversation_id)?;
 
     println!();
     match status {
@@ -4665,12 +4668,19 @@ fn print_conversation(
         }
     }
     println!("--------------------------------");
-    print_new_messages_section(&messages, display_name);
+    print_new_messages_section(&new_messages, display_name);
+    if !new_messages.is_empty() {
+        storage.mark_new_messages_read(conversation_id)?;
+    }
     println!();
     Ok(())
 }
 
 fn print_new_messages_section(messages: &[MessageRecord], display_name: &str) {
+    if messages.is_empty() {
+        return;
+    }
+
     println!("New Messages:");
     for message in messages
         .iter()
