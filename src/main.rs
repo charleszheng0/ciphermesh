@@ -16,7 +16,9 @@ use ciphermesh::{
 use futures::StreamExt;
 use getrandom::fill as fill_random;
 use libp2p::{
-    autonat, dcutr, identify, identity, kad, mdns,
+    autonat,
+    core::transport::ListenerId,
+    dcutr, identify, identity, kad, mdns,
     multiaddr::Protocol,
     relay, request_response,
     swarm::{NetworkBehaviour, SwarmEvent},
@@ -28,7 +30,7 @@ use rustyline::{error::ReadlineError, DefaultEditor, ExternalPrinter};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     error::Error,
     io::{self, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
@@ -684,7 +686,7 @@ async fn run_phase6_relay_smoke() -> AppResult<()> {
 
     let mut bob_swarm = new_discovery_swarm()?;
     let bob_peer_id = *bob_swarm.local_peer_id();
-    reserve_on_relays(&mut bob_swarm, std::slice::from_ref(&relay_addr))?;
+    let _relay_reservations = reserve_on_relays(&mut bob_swarm, std::slice::from_ref(&relay_addr))?;
     let bob = Arc::new(Mutex::new(Bob::local()));
     let (bob_ready, bob_ready_rx) = tokio::sync::oneshot::channel::<()>();
     let bob_server =
@@ -769,11 +771,6 @@ async fn run_phase6_relay_bob_until_ack(
                             "Phase 6 Bob relay listener on {}",
                             displayed_address
                         );
-                        if is_relayed_listener {
-                            if let Some(ready) = ready.take() {
-                                let _ = ready.send(());
-                            }
-                        }
                     }
                     SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Identify(
                         identify::Event::Received { peer_id, info, .. },
@@ -791,7 +788,7 @@ async fn run_phase6_relay_bob_until_ack(
                                 let _ = ready.send(());
                             }
                         }
-                        log_relay_event("Phase 6 Bob", event);
+                        log_relay_event("Phase 6 Bob", &event);
                     }
                     SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Dcutr(event)) => {
                         log_dcutr_event("Phase 6 Bob", event);
@@ -4922,7 +4919,7 @@ async fn run_alice_relayed(
                     SwarmEvent::OutgoingConnectionError { peer_id, error, .. } if peer_id == Some(bob_peer_id) => {
                         println!("direct or relayed libp2p dial failed for Bob: {error}");
                     }
-                    SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Relay(event)) => log_relay_event("Alice", event),
+                    SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Relay(event)) => log_relay_event("Alice", &event),
                     SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Dcutr(event)) => log_dcutr_event("Alice", event),
                     SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Autonat(autonat::Event::StatusChanged { old, new })) => {
                         println!("reachability changed: {old:?} -> {new:?}");
@@ -5229,7 +5226,8 @@ async fn run_discovery_advertiser(
 ) -> AppResult<()> {
     let mut swarm = new_discovery_swarm()?;
     let local_peer_id = *swarm.local_peer_id();
-    let app_multiaddr = socket_to_app_multiaddr(app_addr);
+    let advertised_app_addr = advertise_socket_addr(app_addr)?;
+    let app_multiaddr = socket_to_app_multiaddr(advertised_app_addr);
     let record = kad::Record::new(
         record_key(local_peer_id),
         app_multiaddr.to_string().into_bytes(),
@@ -5239,8 +5237,15 @@ async fn run_discovery_advertiser(
         .behaviour_mut()
         .kad
         .put_record(record, kad::Quorum::One)?;
-    listen_and_bootstrap(&mut swarm, bootstrap_peers.clone())?;
-    reserve_on_relays(&mut swarm, &bootstrap_peers)?;
+    // A relay listener must own the dial which creates its control connection. Starting a
+    // normal or Kademlia dial first can cause libp2p to coalesce the two dials and strand the
+    // reservation request on the connection which was discarded.
+    listen_and_add_bootstrap_addresses(&mut swarm, &bootstrap_peers)?;
+    let mut relay_reservations = reserve_on_relays(&mut swarm, &bootstrap_peers)?;
+    let relay_peer_ids = relay_reservations
+        .values()
+        .map(|reservation| reservation.relay_peer_id)
+        .collect::<HashSet<_>>();
 
     println!("Bob libp2p PeerId: {local_peer_id}");
     println!("Bob advertised QUIC app address record: {app_multiaddr}");
@@ -5249,10 +5254,18 @@ async fn run_discovery_advertiser(
     loop {
         match swarm.select_next_some().await {
             SwarmEvent::NewListenAddr { address, .. } => {
-                println!(
-                    "Bob libp2p listening on {}",
-                    address.with(Protocol::P2p(local_peer_id))
-                );
+                if address
+                    .iter()
+                    .any(|protocol| matches!(protocol, Protocol::P2pCircuit))
+                {
+                    // Relay v2 supplies the complete address, including Bob's PeerId.
+                    println!("Bob relayed listening address: {address}");
+                } else {
+                    println!(
+                        "Bob libp2p listening on {}",
+                        address.with(Protocol::P2p(local_peer_id))
+                    );
+                }
             }
             SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Mdns(mdns::Event::Discovered(
                 peers,
@@ -5291,7 +5304,28 @@ async fn run_discovery_advertiser(
                 }
             }
             SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Relay(event)) => {
-                log_relay_event("Bob", event);
+                if let relay::client::Event::ReservationReqAccepted {
+                    relay_peer_id,
+                    renewal,
+                    ..
+                } = &event
+                {
+                    for reservation in relay_reservations
+                        .values_mut()
+                        .filter(|reservation| reservation.relay_peer_id == *relay_peer_id)
+                    {
+                        reservation.accepted = true;
+                    }
+
+                    if !renewal {
+                        // Bootstrap only after reservation acceptance so Kademlia cannot race the
+                        // relay transport's reservation dial.
+                        if let Err(error) = swarm.behaviour_mut().kad.bootstrap() {
+                            println!("Kademlia bootstrap deferred: {error}");
+                        }
+                    }
+                }
+                log_relay_event("Bob", &event);
             }
             SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Dcutr(event)) => {
                 log_dcutr_event("Bob", event);
@@ -5304,7 +5338,11 @@ async fn run_discovery_advertiser(
                         event,
                         &mut final_relay_ack_pending,
                     )? {
-                        return Ok(());
+                        // The application exchange is complete, but Bob remains online and keeps
+                        // the relay listener alive (libp2p renews the reservation automatically).
+                        println!(
+                            "Bob relay message exchange completed; reservation remains active"
+                        );
                     }
                 }
             }
@@ -5314,9 +5352,52 @@ async fn run_discovery_advertiser(
                 if endpoint.is_relayed() {
                     println!("connected through relay: Bob connected to {peer_id}");
                     println!("DCUtR hole punch coordination available over relayed connection");
+                } else if relay_peer_ids.contains(&peer_id) {
+                    println!("Relay connection established with {peer_id}");
                 } else {
                     println!("direct libp2p connection established: Bob connected to {peer_id}");
                 }
+            }
+            SwarmEvent::ExpiredListenAddr {
+                listener_id,
+                address,
+            } if relay_reservations.contains_key(&listener_id) => {
+                if let Some(reservation) = relay_reservations.get(&listener_id) {
+                    println!(
+                        "Relay reservation expired at {} (relay {})",
+                        address, reservation.relay_peer_id
+                    );
+                }
+            }
+            SwarmEvent::ListenerError { listener_id, error }
+                if relay_reservations.contains_key(&listener_id) =>
+            {
+                let reservation = &relay_reservations[&listener_id];
+                let status = if reservation.accepted {
+                    "expired"
+                } else {
+                    "rejected"
+                };
+                println!(
+                    "Relay reservation {status} by {}: {error}",
+                    reservation.relay_peer_id
+                );
+            }
+            SwarmEvent::ListenerClosed {
+                listener_id,
+                reason,
+                ..
+            } if relay_reservations.contains_key(&listener_id) => {
+                let reservation = &relay_reservations[&listener_id];
+                let status = if reservation.accepted {
+                    "expired"
+                } else {
+                    "rejected"
+                };
+                println!(
+                    "Relay reservation {status} by {} (listener closed: {reason:?})",
+                    reservation.relay_peer_id
+                );
             }
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                 println!("direct/libp2p dial failed for {peer_id:?}: {error}");
@@ -6145,16 +6226,24 @@ fn handle_bob_app_event(
     }
 }
 
-fn log_relay_event(name: &str, event: relay::client::Event) {
+fn log_relay_event(name: &str, event: &relay::client::Event) {
     match event {
-        relay::client::Event::ReservationReqAccepted { relay_peer_id, .. } => {
-            println!("{name} relay reservation accepted by {relay_peer_id}");
+        relay::client::Event::ReservationReqAccepted {
+            relay_peer_id,
+            renewal,
+            ..
+        } => {
+            if *renewal {
+                println!("Relay reservation renewed by {relay_peer_id}");
+            } else {
+                println!("Relay reservation accepted by {relay_peer_id}");
+            }
         }
         relay::client::Event::OutboundCircuitEstablished { relay_peer_id, .. } => {
             println!("{name} connected through relay {relay_peer_id}");
         }
         relay::client::Event::InboundCircuitEstablished { src_peer_id, .. } => {
-            println!("{name} accepted inbound relayed circuit from {src_peer_id}");
+            println!("Relayed inbound connection from {src_peer_id} accepted by {name}");
         }
     }
 }
@@ -6193,19 +6282,50 @@ fn listen_and_bootstrap(
     Ok(())
 }
 
-fn reserve_on_relays(
+fn listen_and_add_bootstrap_addresses(
     swarm: &mut Swarm<DiscoveryBehaviour>,
-    relay_peers: &[Multiaddr],
+    bootstrap_peers: &[Multiaddr],
 ) -> AppResult<()> {
-    for relay_peer in relay_peers {
-        if strip_p2p(relay_peer).1.is_some() {
-            let relay_listener = relay_peer.clone().with(Protocol::P2pCircuit);
-            println!("requesting relay reservation at {relay_listener}");
-            swarm.listen_on(relay_listener)?;
+    swarm.listen_on(DISCOVERY_LISTEN_ADDR.parse()?)?;
+
+    for bootstrap_peer in bootstrap_peers {
+        let (address, peer_id) = strip_p2p(bootstrap_peer);
+        if let Some(peer_id) = peer_id {
+            swarm.behaviour_mut().kad.add_address(&peer_id, address);
         }
     }
 
     Ok(())
+}
+
+#[derive(Debug)]
+struct RelayReservationState {
+    relay_peer_id: PeerId,
+    accepted: bool,
+}
+
+fn reserve_on_relays(
+    swarm: &mut Swarm<DiscoveryBehaviour>,
+    relay_peers: &[Multiaddr],
+) -> AppResult<HashMap<ListenerId, RelayReservationState>> {
+    let mut reservations = HashMap::new();
+
+    for relay_peer in relay_peers {
+        if let Some(relay_peer_id) = strip_p2p(relay_peer).1 {
+            let relay_listener = relay_peer.clone().with(Protocol::P2pCircuit);
+            let listener_id = swarm.listen_on(relay_listener.clone())?;
+            println!("Relay reservation request sent to {relay_peer_id} at {relay_listener}");
+            reservations.insert(
+                listener_id,
+                RelayReservationState {
+                    relay_peer_id,
+                    accepted: false,
+                },
+            );
+        }
+    }
+
+    Ok(reservations)
 }
 
 fn relay_dial_addresses(relay_peers: &[Multiaddr], target_peer_id: PeerId) -> Vec<Multiaddr> {
