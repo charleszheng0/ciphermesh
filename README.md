@@ -274,10 +274,14 @@ Terminal 2:
 cargo run -- bob 0.0.0.0:5000 <relay-multiaddr>
 ```
 
+Wait for Bob to print both `Relay reservation accepted by <relay-peer-id>` and the
+full `Bob relayed listening address: .../p2p-circuit/p2p/<bob-peer-id>` address.
+A direct control connection to the relay by itself is not a reservation.
+
 Terminal 3:
 
 ```bash
-cargo run -- alice <bob-libp2p-peer-id> "hello via relay" <relay-multiaddr>
+cargo run -- alice-relay <bob-libp2p-peer-id> "hello via relay" <relay-multiaddr>
 ```
 
 You can also run:
