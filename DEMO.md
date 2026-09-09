@@ -31,7 +31,10 @@ how are you
 
 Bob should print Alice's messages immediately. Bob can type a reply and Alice prints it immediately.
 
-## 2B. Same-LAN Invite Chat
+## 2B. Code-Only Invite Chat
+
+Configure `CIPHERMESH_RENDEZVOUS` on both installations as documented in
+README.md. The machines may be on the same LAN or unrelated networks.
 
 Host:
 
@@ -39,7 +42,7 @@ Host:
 cargo run
 ```
 
-Choose Create Invite and copy either the full invite token or the six-character code-only LAN invite.
+Choose Create Invite and copy the six-character code.
 
 Joiner:
 
@@ -47,7 +50,9 @@ Joiner:
 cargo run
 ```
 
-Choose Join Invite and paste the six-character code on the same LAN. CipherMesh discovers the host through mDNS and connects to the advertised QUIC listener. The host should have a UDP listener on port 5000 while it waits.
+Choose Join Invite and enter the code. CipherMesh tries direct connectivity and
+automatically falls back to the public relay. No address or PeerId is displayed
+in the product UI.
 
 ## 3. Show Encrypted Transport Briefly
 

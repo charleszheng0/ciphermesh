@@ -39,10 +39,13 @@ use std::{
 };
 use tokio::{sync::mpsc, time};
 
+mod pairing;
+
 type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 const DISCOVERY_LISTEN_ADDR: &str = "/ip4/0.0.0.0/tcp/0";
 const DISCOVERY_PROTOCOL: &str = "/ciphermesh/discovery/3c/1.0.0";
 const APP_RELAY_PROTOCOL: &str = "/ciphermesh/app-bytes/3c/1.0.0";
+const PAIRING_SERVICE_ENV: &str = "CIPHERMESH_RENDEZVOUS";
 const MAILBOX_PROTOCOL: &str = "/ciphermesh/mailbox/3d/1.0.0";
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAILBOX_ENVELOPE_TTL_SECS: u64 = 5 * 60;
@@ -55,7 +58,6 @@ const LOCAL_BOB_IDENTITY_ID: &str = "bob";
 const INVITE_CODE_LEN: usize = 6;
 const INVITE_TTL_SECS: u64 = 5 * 60;
 const INVITE_CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-const DEFAULT_INVITE_DB: &str = "target/ciphermesh-invites.sqlite";
 const DEFAULT_INVITE_LISTEN_ADDR: &str = "0.0.0.0:5000";
 const RECENT_CHAT_LIMIT: usize = 3;
 const CHAT_HISTORY_PAGE_SIZE: usize = 6;
@@ -132,13 +134,17 @@ async fn main() -> AppResult<()> {
             run_alice_relayed(bob_peer_id, message, relay_peers).await
         }
         Some("kad-demo") => run_kademlia_demo().await,
-        Some("relay") => {
+        Some("service") | Some("relay") => {
             let listen_addr = parse_multiaddr(
                 args.get(2),
                 "/ip4/0.0.0.0/tcp/4001",
-                "relay listen multiaddr",
+                "service listen multiaddr",
             )?;
-            run_relay_server(listen_addr).await
+            let identity_path = args
+                .get(3)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("target/ciphermesh-service.key"));
+            pairing::run_public_service(listen_addr, &identity_path).await
         }
         Some("relay-demo") => run_relay_demo().await,
         Some("mailbox") => {
@@ -174,28 +180,19 @@ async fn main() -> AppResult<()> {
             run_bob_mailbox_fetch(mailbox_addr, &db_path).await
         }
         Some("create-invite") => {
-            let rendezvous_db = args
+            let profile_db = args
                 .get(2)
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("target/ciphermesh-invites.sqlite"));
-            let listen_addr = parse_addr(args.get(3), DEFAULT_INVITE_LISTEN_ADDR)?;
-            let profile_db = args
-                .get(4)
-                .map(PathBuf::from)
                 .unwrap_or_else(|| default_chat_db("invite-host"));
-            run_create_invite(listen_addr, &rendezvous_db, &profile_db).await
+            pairing::run_create_invite(&profile_db).await
         }
         Some("join-invite") => {
-            let code = args.get(2).ok_or("missing invite token")?;
-            let rendezvous_db = args
+            let code = args.get(2).ok_or("missing invite code")?;
+            let profile_db = args
                 .get(3)
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("target/ciphermesh-invites.sqlite"));
-            let profile_db = args
-                .get(4)
-                .map(PathBuf::from)
                 .unwrap_or_else(|| default_chat_db("invite-joiner"));
-            run_join_invite(code, &rendezvous_db, &profile_db).await
+            pairing::run_join_invite(code, &profile_db).await
         }
         Some("invite-demo") => {
             let db_path = args
@@ -322,8 +319,14 @@ fn print_usage() {
     println!();
     println!("Product menu:");
     println!("  cargo run");
+    println!("  cargo run -- create-invite [profile.sqlite]");
+    println!("  cargo run -- join-invite <six-character-code> [profile.sqlite]");
     println!("  cargo run -- help");
     println!();
+    println!("Public service operator:");
+    println!("  cargo run -- service /ip4/0.0.0.0/tcp/4001 [service-identity.key]");
+    println!();
+    println!("Developer/debug commands (raw networking details):");
     println!("Phase 3B mDNS discovery test:");
     println!("  Terminal 1: cargo run -- bob 0.0.0.0:5000");
     println!("  Terminal 2: cargo run -- alice <bob-libp2p-peer-id>");
@@ -333,7 +336,7 @@ fn print_usage() {
     println!("  cargo run -- kad-demo");
     println!();
     println!("Optional relay fallback demo:");
-    println!("  Terminal 1: cargo run -- relay /ip4/0.0.0.0/tcp/4001");
+    println!("  Terminal 1: cargo run -- service /ip4/0.0.0.0/tcp/4001");
     println!("  Terminal 2: cargo run -- bob 0.0.0.0:5000 <relay-multiaddr>");
     println!("  Terminal 3: cargo run -- alice <bob-libp2p-peer-id> \"hello via relay\" <relay-multiaddr>");
     println!("  Force relay path: cargo run -- alice-relay <bob-libp2p-peer-id> \"hello via relay\" <relay-multiaddr>");
@@ -355,11 +358,7 @@ fn print_usage() {
     );
     println!("  Terminal 3: cargo run -- bob-mailbox <mailbox-multiaddr> target/bob-mailbox.db");
     println!();
-    println!("Short-lived invite-code pairing demo:");
-    println!("  Terminal 1: cargo run -- create-invite [target/ciphermesh-invites.sqlite] [0.0.0.0:5000]");
-    println!(
-        "  Terminal 2: cargo run -- join-invite <invite-token> [target/ciphermesh-invites.sqlite]"
-    );
+    println!("Local invite-record storage demo:");
     println!("  cargo run -- invite-demo [target/ciphermesh-invite-demo.sqlite]");
     println!();
     println!("Phase 6 local QUIC pending-delivery smoke:");
@@ -1427,9 +1426,10 @@ async fn run_create_invite_menu(profile_db: &Path) -> AppResult<()> {
 
         match prompt_line("Select: ")?.trim() {
             "1" => {
-                let rendezvous_db = PathBuf::from(DEFAULT_INVITE_DB);
-                let listen_addr = DEFAULT_INVITE_LISTEN_ADDR.parse()?;
-                run_create_invite(listen_addr, &rendezvous_db, profile_db).await?;
+                match pairing::run_create_invite(profile_db).await {
+                    Ok(()) => {}
+                    Err(error) => println!("Could not create invite: {error}"),
+                }
                 return Ok(());
             }
             selection if is_back_selection(selection) => return Ok(()),
@@ -1446,18 +1446,17 @@ async fn run_join_invite_menu(profile_db: &Path) -> AppResult<()> {
         print_page_break();
         println!("Join Invite");
         println!();
-        println!("[1] Enter invite token");
+        println!("[1] Enter invite code");
         println!("[B] Back");
         println!();
 
         match prompt_line("Select: ")?.trim() {
             "1" => {
-                let code = prompt_line("Invite token: ")?;
+                let code = prompt_line("Code: ")?;
                 if is_back_selection(&code) {
                     return Ok(());
                 }
-                let rendezvous_db = PathBuf::from(DEFAULT_INVITE_DB);
-                match run_join_invite(code.trim(), &rendezvous_db, profile_db).await {
+                match pairing::run_join_invite(code.trim(), profile_db).await {
                     Ok(()) => return Ok(()),
                     Err(error) => {
                         println!("Could not join invite: {error}");
@@ -1840,74 +1839,6 @@ fn queue_offline_peer_message(
     Ok(())
 }
 
-async fn run_create_invite(
-    listen_addr: SocketAddr,
-    rendezvous_db: &Path,
-    profile_db: &Path,
-) -> AppResult<()> {
-    let local_display_name = load_or_prompt_display_name(profile_db)?;
-    let bob = load_or_create_bob_identity(profile_db)?;
-    let endpoint = bind_quic_listener(listen_addr)?;
-    let bound_addr = endpoint.local_addr()?;
-    let advertised_addr = advertise_socket_addr(bound_addr)?;
-    if let Some(parent) = rendezvous_db.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let code = generate_invite_code()?;
-    let code_hash = invite_code_hash(&code);
-    let now = now_unix_secs();
-    {
-        let storage = Storage::open(rendezvous_db)?;
-        storage.save_invite_record(&InviteRecord {
-            code_hash: code_hash.clone(),
-            rendezvous_payload: advertised_addr.to_string(),
-            expires_at_unix_secs: now + INVITE_TTL_SECS,
-            consumed_at_unix_secs: None,
-            created_at_unix_secs: now,
-        })?;
-    }
-    let invite_discovery = start_invite_discovery_advertiser(code_hash, advertised_addr)?;
-
-    let invite = encode_lan_invite(&code, advertised_addr);
-    println!("Invite created");
-    println!("Invite: {invite}");
-    println!("Code-only LAN invite: {code}");
-    println!("Invite expires in 5 minutes");
-    println!("Listening on {bound_addr}");
-    println!("Waiting for peer");
-    let result = run_chat_bob_with_endpoint(endpoint, local_display_name, bob, profile_db).await;
-    invite_discovery.abort();
-    result
-}
-
-async fn run_join_invite(code: &str, rendezvous_db: &Path, profile_db: &Path) -> AppResult<()> {
-    let peer_addr = match decode_lan_invite(code)? {
-        Some(peer_addr) => peer_addr,
-        None => {
-            let normalized_code = normalize_invite_code(code)?;
-            let code_hash = invite_code_hash(&normalized_code);
-            let invite = {
-                let storage = Storage::open(rendezvous_db)?;
-                storage.consume_invite_record(&code_hash, now_unix_secs())?
-            };
-            match invite {
-                Some(invite) => invite
-                    .rendezvous_payload
-                    .parse()
-                    .map_err(|error| format!("invite resolved to invalid peer address: {error}"))?,
-                None => {
-                    println!("Looking for invite on the local network...");
-                    discover_lan_invite_addr(&code_hash).await?
-                }
-            }
-        }
-    };
-
-    println!("Pairing...");
-    println!("Identity established");
-    run_chat_alice(peer_addr, profile_db).await
-}
-
 fn prompt_line(prompt: &str) -> AppResult<String> {
     print!("{prompt}");
     io::stdout().flush()?;
@@ -1961,21 +1892,6 @@ fn normalize_invite_code(code: &str) -> AppResult<String> {
     }
 
     Ok(normalized)
-}
-
-fn encode_lan_invite(code: &str, peer_addr: SocketAddr) -> String {
-    format!("{code}@{peer_addr}")
-}
-
-fn decode_lan_invite(invite: &str) -> AppResult<Option<SocketAddr>> {
-    let Some((code, peer_addr)) = invite.trim().split_once('@') else {
-        return Ok(None);
-    };
-    normalize_invite_code(code)?;
-    peer_addr
-        .parse()
-        .map(Some)
-        .map_err(|error| format!("invite resolved to invalid peer address: {error}").into())
 }
 
 fn advertise_socket_addr(listen_addr: SocketAddr) -> AppResult<SocketAddr> {
@@ -4652,7 +4568,7 @@ fn print_conversation(
     println!("--------------------------------");
     for message in &messages {
         let body = message.plaintext.as_deref().unwrap_or("[encrypted]");
-        if is_local_message(&message) {
+        if is_local_message(message) {
             println!("> {}: {body}", local_sender_label());
             let status = message_status_label(&message.status);
             if status == "queued for delivery" {
@@ -4663,7 +4579,7 @@ fn print_conversation(
         } else {
             println!(
                 "> {}: {body}",
-                remote_message_sender_label(&message, display_name)
+                remote_message_sender_label(message, display_name)
             );
         }
     }
@@ -5505,47 +5421,6 @@ async fn run_kademlia_demo() -> AppResult<()> {
                     return Ok(());
                 }
                 handle_demo_event("alice", &mut alice, event);
-            }
-        }
-    }
-}
-
-async fn run_relay_server(listen_addr: Multiaddr) -> AppResult<()> {
-    let mut swarm = new_relay_server_swarm()?;
-    let local_peer_id = *swarm.local_peer_id();
-
-    swarm.listen_on(listen_addr)?;
-    println!("Relay PeerId: {local_peer_id}");
-
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                println!("Ctrl+C received; relay shutting down cleanly");
-                return Ok(());
-            }
-            event = swarm.select_next_some() => {
-                match event {
-                    SwarmEvent::NewListenAddr { address, .. } => {
-                        swarm.add_external_address(address.clone());
-                        println!(
-                            "Relay listening on {}",
-                            address.with(Protocol::P2p(local_peer_id))
-                        );
-                    }
-                    SwarmEvent::ConnectionEstablished {
-                        peer_id, endpoint, ..
-                    } => {
-                        if endpoint.is_relayed() {
-                            println!("Relay observed relayed connection with {peer_id}");
-                        } else {
-                            println!("Relay direct control connection established with {peer_id}");
-                        }
-                    }
-                    SwarmEvent::Behaviour(RelayServerBehaviourEvent::Relay(event)) => {
-                        println!("Relay server event: {event:?}");
-                    }
-                    _ => {}
-                }
             }
         }
     }
@@ -6497,15 +6372,6 @@ mod discovery_tests {
         let resolved = socket_from_app_multiaddr(&app_multiaddr, Some(peer_ip)).unwrap();
 
         assert_eq!(resolved, SocketAddr::new(peer_ip, 5000));
-    }
-
-    #[test]
-    fn lan_invite_token_carries_peer_address() {
-        let peer_addr: SocketAddr = "192.168.1.25:5000".parse().unwrap();
-        let invite = encode_lan_invite("ABC2D3", peer_addr);
-
-        assert_eq!(decode_lan_invite(&invite).unwrap(), Some(peer_addr));
-        assert_eq!(decode_lan_invite("ABC2D3").unwrap(), None);
     }
 
     #[test]

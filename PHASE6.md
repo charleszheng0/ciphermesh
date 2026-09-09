@@ -37,7 +37,7 @@ Use `Iterations = 0` / `ITERATIONS=0` for an infinite loop. Use `-NoClippy` or `
 - 6B: `hardening_tests::*outbox*`, `*ack*`, `*duplicate*`, `*mailbox*`; pending message storage/contact-list tests; `cargo run -- phase6-mailbox-smoke`
 - 6C: tamper/replay tests in `tests` and `hardening_tests`
 - 6D: `crdt::tests`, sync and own-device sync storage tests
-- 6E: `cargo run -- phase6-lan-smoke` proves real local QUIC listener/connect/ACK-cleared pending delivery; `cargo run -- phase6-invite-discovery-smoke` proves code-only mDNS invite discovery and chat handshake; `cargo run -- phase6-relay-smoke` proves a reserved relay circuit can carry the secure message handshake; manual two-machine validation still required
+- 6E: `cargo run -- phase6-lan-smoke` proves real local QUIC listener/connect/ACK-cleared pending delivery; `pairing::tests::public_service_registers_only_after_reservation_and_relays_one_time_invite` proves reservation-gated, one-time invite resolution and encrypted relay delivery; manual two-machine validation still required
 - 6F: reconnect UI removed; LAN invite listener lifecycle fixed
 - 6G: `SECURITY.md` covers assets, attacker model, trust boundaries, and limitations
 - 6H: README/demo reproduction includes build, package, Phase 6 loop, and LAN smoke steps
@@ -55,8 +55,8 @@ Do not mark Phase 6 complete until these are true:
 - `cargo run -- phase6-invite-discovery-smoke` passes.
 - `cargo run -- phase6-relay-smoke` passes.
 - `cargo run -- phase6-mailbox-smoke` passes.
-- Same-LAN Mac/Windows transcript proves invite creation keeps UDP 5000 bound and chat works both directions.
-- Different-network transcript records direct, hole punch, or relay fallback behavior.
+- Same-LAN Mac/Windows transcript proves code-only pairing and bidirectional chat.
+- Different-network transcript proves the public circuit-relay fallback works.
 - Release binaries are built for the tester platforms.
 
 ## Manual Two-Machine Transcript Template
@@ -67,16 +67,15 @@ Host:
 cargo run
 ```
 
-Choose Create Invite. Paste the six-character code-only invite into the joiner first, then record:
+Choose Create Invite. Enter the displayed six-character code on the joiner, then record:
 
 ```text
-Invite:
-Code-only LAN invite:
-Listening on:
-lsof -nP -iUDP:5000
+Invite code:
+Waiting for peer:
+Connected to:
 ```
 
-Listener-only doctor:
+The legacy listener-only doctor remains available for QUIC development:
 
 ```bash
 cargo run -- phase6-listener-doctor 0.0.0.0:5000 60
@@ -91,7 +90,7 @@ Joiner:
 cargo run
 ```
 
-Choose Join Invite, paste the six-character code-only invite on the same LAN, then record:
+Choose Join Invite, enter the six-character code, then record:
 
 ```text
 Connected securely:

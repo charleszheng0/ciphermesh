@@ -25,6 +25,19 @@ Encrypted protocol bytes
 SQLite local state / outbox / events / vectors
 ```
 
+## Cross-Network Pairing Context
+
+CipherMesh is being extended from same-LAN messaging to reliable cross-network
+messaging between devices on different Wi-Fi networks. A small public libp2p
+rendezvous/circuit-relay service gives peers a globally reachable meeting point
+when direct LAN discovery or NAT traversal is insufficient. Users still see
+only **Create Invite** with a short code and **Join Invite** with that code;
+CipherMesh resolves peer routing internally, attempts a direct connection where
+possible, and automatically falls back to the relay while preserving end-to-end
+encryption. The selected initial deployment target is an Oracle Cloud Always
+Free-eligible VM. See [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md) for the reusable
+project and resume summary.
+
 ## Crypto Stack
 
 - Ed25519 for identity signatures and device certificates.
@@ -38,9 +51,9 @@ SQLite local state / outbox / events / vectors
 
 - Tokio async runtime.
 - QUIC transport via `quinn`.
-- libp2p for PeerIds and discovery framework.
-- mDNS for same-LAN discovery.
-- Bootstrap peers as entry points.
+- libp2p for persistent installation PeerIds and encrypted peer transport.
+- A public CipherMesh rendezvous/circuit-relay service for six-character invites.
+- mDNS and sanitized LAN addresses for direct same-network connections.
 - Kademlia DHT for distributed peer/address lookup.
 - AutoNAT/DCUtR/Circuit Relay support through rust-libp2p features.
 - Persistent untrusted offline mailbox for store-and-forward.
@@ -113,12 +126,14 @@ macOS/Linux packaging helper:
 ```bash
 cargo run
 cargo run -- --verbose
+cargo run -- create-invite [profile.sqlite]
+cargo run -- join-invite <six-character-code> [profile.sqlite]
+cargo run -- service /ip4/0.0.0.0/tcp/4001 [service-identity.key]
 cargo run -- bob [listen-ip:port] [bootstrap-multiaddr...]
 cargo run -- alice <bob-libp2p-peer-id> [message] [bootstrap-multiaddr...]
 cargo run -- alice-direct [bob-ip:port] [message]
 cargo run -- chat-bob [listen-ip:port]
 cargo run -- chat-alice [bob-ip:port]
-cargo run -- relay [/ip4/0.0.0.0/tcp/4001]
 cargo run -- relay-demo
 cargo run -- kad-demo
 cargo run -- mailbox [/ip4/0.0.0.0/tcp/7000] [target/ciphermesh-mailbox.sqlite]
@@ -141,7 +156,31 @@ cargo run -- phase6-listener-doctor [0.0.0.0:5000] [hold-seconds]
 
 Verbose logging is enabled with `--verbose`, `-v`, or `CIPHERMESH_VERBOSE=1`.
 
-## Recommended Same-LAN Flow
+## Public Pairing Service
+
+Run one persistent service on a VPS with TCP port 4001 open. Keep the identity
+file on durable storage so the service PeerId does not change:
+
+```bash
+cargo run --release -- service /ip4/0.0.0.0/tcp/4001 /var/lib/ciphermesh/service.key
+```
+
+The service prints its listening address with its PeerId. Configure every
+CipherMesh installation once, using the VPS public IP or DNS name and that
+PeerId:
+
+```text
+CIPHERMESH_RENDEZVOUS=/ip4/PUBLIC_IP/tcp/4001/p2p/SERVICE_PEER_ID
+```
+
+Run the service command under the host's normal process supervisor (for
+example, systemd) with the same identity-file path. The service keeps only
+hashed, five-minute invite codes, the inviter's PeerId, and sanitized routing
+addresses in memory. It will not register an invite until the inviter has an
+active relay reservation, removes registrations when reservations end, and
+consumes a code on its first successful resolution.
+
+## Pairing On Any Network
 
 On the host computer:
 
@@ -149,18 +188,12 @@ On the host computer:
 cargo run
 ```
 
-Choose `Create invite`. CipherMesh should print an invite token like:
+Choose `Create invite`. CipherMesh prints only:
 
 ```text
-ABC2D3@192.168.1.25:5000
-Code-only LAN invite: ABC2D3
-Listening on 0.0.0.0:5000
-```
-
-On macOS, this should show the UDP listener while the invite is waiting:
-
-```bash
-lsof -nP -iUDP:5000
+Connecting...
+Invite code: ABC2D3
+Waiting for peer
 ```
 
 On the joining computer:
@@ -169,8 +202,10 @@ On the joining computer:
 cargo run
 ```
 
-Choose `Join invite` and paste the full invite token. Both sides should enter the encrypted chat. If the peer disconnects, CipherMesh shows `Status: Offline`; restart both instances and create a fresh invite to reconnect for now.
-On the same LAN, the joiner can paste only the six-character code; CipherMesh looks up the host through mDNS and then connects to the advertised QUIC listener.
+Choose `Join invite` and enter `ABC2D3`. CipherMesh tries a valid direct LAN
+address first, lets DCUtR attempt a direct upgrade when available, and falls
+back to the public circuit relay automatically. IP addresses, ports, PeerIds,
+and multiaddrs are never part of the normal pairing UI.
 
 ## Local History Security
 
@@ -186,7 +221,12 @@ Database encryption at rest is a future hardening item; CipherMesh should use a
 well-reviewed local key wrapping/database encryption design rather than a custom
 scheme.
 
-## Same-Machine Interactive Chat
+## Developer Networking Demos
+
+The commands below are retained for protocol development. They expose raw
+network addresses and are not part of the product pairing flow.
+
+### Same-Machine Interactive Chat
 
 Terminal 1:
 
@@ -220,12 +260,12 @@ cargo run -- alice <bob-libp2p-peer-id>
 
 Alice discovers Bob through mDNS/Kademlia and then starts interactive chat.
 
-## Relay Test
+### Legacy Relay Test
 
 Terminal 1:
 
 ```bash
-cargo run -- relay /ip4/0.0.0.0/tcp/4001
+cargo run -- service /ip4/0.0.0.0/tcp/4001 target/dev-service.key
 ```
 
 Terminal 2:
@@ -320,7 +360,11 @@ cargo run -- phase6-mailbox-smoke
 ```
 
 That smoke starts a real local QUIC listener on `0.0.0.0:<ephemeral>`, queues a pending message before connect, establishes a fresh chat, waits for an ACK, and fails if the pending message is not delivered exactly once and cleared.
-The invite discovery smoke starts the mDNS invite sidecar, resolves a six-character code to the advertised QUIC address, and completes the chat handshake without manually entering an IP or PeerId.
+The invite discovery smoke covers the legacy mDNS developer path. The pairing
+test suite also starts the new combined public service locally, waits for a
+confirmed reservation before registering, strips wildcard and loopback
+addresses, consumes the invite once, forces circuit-relay delivery, and
+verifies an encrypted ratchet message and ACK.
 The relay smoke starts a local circuit relay, reserves Bob through it, dials Bob's relayed multiaddr from Alice, and verifies the secure message handshake plus ACK over the relay path.
 The mailbox smoke starts an in-process libp2p mailbox, deposits an encrypted offline envelope, fetches it as Bob, ACKs retrieval, and fails if the mailbox still has pending ciphertext afterward.
 
@@ -357,5 +401,5 @@ CipherMesh treats the network as untrusted. Discovery can find addresses, relays
 - No encrypted database-at-rest.
 - No account recovery or backup.
 - No group chat.
-- No full production NAT traversal test harness in this repo.
+- Internet reachability still depends on operating the public pairing service described above.
 - Manual reconnect UX is intentionally disabled while the protocol is hardened; use a fresh invite after restart/disconnect.
