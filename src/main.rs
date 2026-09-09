@@ -35,7 +35,10 @@ use std::{
     io::{self, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
-    sync::{mpsc as std_mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc as std_mpsc, Arc, Mutex,
+    },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -48,6 +51,9 @@ const DISCOVERY_LISTEN_ADDR: &str = "/ip4/0.0.0.0/tcp/0";
 const DISCOVERY_PROTOCOL: &str = "/ciphermesh/discovery/3c/1.0.0";
 const APP_RELAY_PROTOCOL: &str = "/ciphermesh/app-bytes/3c/1.0.0";
 const PAIRING_SERVICE_ENV: &str = "CIPHERMESH_RENDEZVOUS";
+const SERVICE_IDENTITY_ENV: &str = "CIPHERMESH_SERVICE_IDENTITY";
+const DEFAULT_PAIRING_SERVICE_ADDR: &str =
+    "/ip4/150.136.135.150/tcp/4001/p2p/12D3KooWA7sad9DmGvthSqGTenmsKAB7DNreT6iCL5j11PyY5Dvt";
 const MAILBOX_PROTOCOL: &str = "/ciphermesh/mailbox/3d/1.0.0";
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAILBOX_ENVELOPE_TTL_SECS: u64 = 5 * 60;
@@ -66,6 +72,7 @@ const CHAT_HISTORY_PAGE_SIZE: usize = 6;
 const CHAT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PENDING_DELIVERY_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const PAGE_BREAK: &str = "----";
+static VERBOSE_LOGGING: AtomicBool = AtomicBool::new(false);
 
 fn print_page_break() {
     println!();
@@ -145,7 +152,7 @@ async fn main() -> AppResult<()> {
             let identity_path = args
                 .get(3)
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("target/ciphermesh-service.key"));
+                .unwrap_or_else(default_service_identity_path);
             pairing::run_public_service(listen_addr, &identity_path).await
         }
         Some("relay-demo") => run_relay_demo().await,
@@ -246,11 +253,6 @@ async fn main() -> AppResult<()> {
             print_usage();
             Ok(())
         }
-        None if verbose => {
-            run_local_demo(true)?;
-            print_usage();
-            Ok(())
-        }
         None => run_product_menu().await,
         Some(command) => {
             Err(format!("invalid command '{command}'; run without arguments to see usage").into())
@@ -273,7 +275,15 @@ fn take_verbose_flag(args: &mut Vec<String>) -> bool {
         }
     });
 
-    env_verbose || cli_verbose
+    let enabled = env_verbose || cli_verbose;
+    VERBOSE_LOGGING.store(enabled, Ordering::Relaxed);
+    enabled
+}
+
+fn default_service_identity_path() -> PathBuf {
+    std::env::var_os(SERVICE_IDENTITY_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("ciphermesh-service.key"))
 }
 
 fn parse_addr(addr: Option<&String>, default: &str) -> AppResult<SocketAddr> {
@@ -6446,9 +6456,10 @@ fn log_boundary(label: &str, bytes: &[u8]) {
 }
 
 fn env_verbose_enabled() -> bool {
-    std::env::var("CIPHERMESH_VERBOSE")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
+    VERBOSE_LOGGING.load(Ordering::Relaxed)
+        || std::env::var("CIPHERMESH_VERBOSE")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false)
 }
 
 fn hex_preview(bytes: &[u8]) -> String {

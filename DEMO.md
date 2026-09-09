@@ -33,8 +33,8 @@ Bob should print Alice's messages immediately. Bob can type a reply and Alice pr
 
 ## 2B. Code-Only Invite Chat
 
-Configure `CIPHERMESH_RENDEZVOUS` on both installations as documented in
-README.md. The machines may be on the same LAN or unrelated networks.
+The Oracle rendezvous/relay endpoint is built in; no networking configuration is
+required. The machines may be on the same LAN or unrelated networks.
 
 Host:
 

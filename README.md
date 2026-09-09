@@ -155,23 +155,38 @@ cargo run -- phase6-listener-doctor [0.0.0.0:5000] [hold-seconds]
 ```
 
 Verbose logging is enabled with `--verbose`, `-v`, or `CIPHERMESH_VERBOSE=1`.
+Both `cargo run` and `cargo run -- --verbose` open the normal product UI.
 
 ## Public Pairing Service
 
-Run one persistent service on a VPS with TCP port 4001 open. Keep the identity
-file on durable storage so the service PeerId does not change:
+Run one persistent service on the Oracle VM with TCP port 4001 open. Keep the
+identity file on durable storage so the service PeerId does not change:
 
 ```bash
 cargo run --release -- service /ip4/0.0.0.0/tcp/4001 /var/lib/ciphermesh/service.key
 ```
 
-The service prints its listening address with its PeerId. Configure every
-CipherMesh installation once, using the VPS public IP or DNS name and that
-PeerId:
+The service loads `/var/lib/ciphermesh/service.key` on every restart and refuses
+to silently replace it when it cannot be read. Back up this private key. The
+deployed key must print the expected service PeerId
+`12D3KooWA7sad9DmGvthSqGTenmsKAB7DNreT6iCL5j11PyY5Dvt`.
+
+The public endpoint is built into CipherMesh:
 
 ```text
-CIPHERMESH_RENDEZVOUS=/ip4/PUBLIC_IP/tcp/4001/p2p/SERVICE_PEER_ID
+/ip4/150.136.135.150/tcp/4001/p2p/12D3KooWA7sad9DmGvthSqGTenmsKAB7DNreT6iCL5j11PyY5Dvt
 ```
+
+No client configuration is required. Developers can override it with:
+
+```text
+CIPHERMESH_RENDEZVOUS=/ip4/OTHER_PUBLIC_IP/tcp/4001/p2p/OTHER_SERVICE_PEER_ID
+```
+
+When the service identity argument is omitted, the service uses
+`./ciphermesh-service.key`; `CIPHERMESH_SERVICE_IDENTITY` can override that
+operator-side default. Production should always use the explicit durable path
+shown above.
 
 Run the service command under the host's normal process supervisor (for
 example, systemd) with the same identity-file path. The service keeps only

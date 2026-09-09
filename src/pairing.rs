@@ -193,6 +193,7 @@ async fn run_create_invite_at(profile_db: &Path, service_addr: Multiaddr) -> App
     let mut swarm = new_pairing_swarm(local_key)?;
     let direct_listener_pending = listen_for_direct_connections(&mut swarm)?;
     let mut relay_listener = swarm.listen_on(service_addr.clone().with(Protocol::P2pCircuit))?;
+    debug_log("relay reservation request sent".to_string());
 
     let code = generate_invite_code()?;
     let code_hash = invite_code_hash(&code);
@@ -252,6 +253,7 @@ async fn run_create_invite_at(profile_db: &Path, service_addr: Multiaddr) -> App
                 }
                 relay_listener =
                     swarm.listen_on(service_addr.clone().with(Protocol::P2pCircuit))?;
+                debug_log("relay reservation request sent".to_string());
             }
             SwarmEvent::Behaviour(PairingBehaviourEvent::Relay(
                 relay::client::Event::ReservationReqAccepted {
@@ -260,7 +262,11 @@ async fn run_create_invite_at(profile_db: &Path, service_addr: Multiaddr) -> App
                     ..
                 },
             )) if relay_peer_id == service_peer_id => {
-                debug_log(format!("relay reservation confirmed; renewal={renewal}"));
+                debug_log(if renewal {
+                    "relay reservation renewed".to_string()
+                } else {
+                    "relay reservation accepted".to_string()
+                });
                 reservation_confirmed = true;
                 if !registered && !registration_sent && !renewal && direct_listener_ready {
                     send_invite_registration(
@@ -283,8 +289,9 @@ async fn run_create_invite_at(profile_db: &Path, service_addr: Multiaddr) -> App
                 PairingResponse::Registered => {
                     if !registered {
                         registered = true;
+                        debug_log("invite registered".to_string());
                         println!("Invite code: {code}");
-                        println!("Waiting for peer");
+                        println!("Waiting for your friend...");
                     }
                 }
                 PairingResponse::Error(error) => return Err(human_service_error(&error).into()),
@@ -387,6 +394,26 @@ async fn run_create_invite_at(profile_db: &Path, service_addr: Multiaddr) -> App
                 info,
                 ..
             })) => add_sanitized_peer_addresses(&mut swarm, peer_id, info.listen_addrs),
+            SwarmEvent::ConnectionEstablished {
+                peer_id, endpoint, ..
+            } if peer_id == service_peer_id => {
+                debug_log("service connected".to_string());
+                debug_log(if endpoint.is_relayed() {
+                    "transport used: relay".to_string()
+                } else {
+                    "service control transport used: direct".to_string()
+                });
+            }
+            SwarmEvent::ConnectionEstablished { endpoint, .. } => {
+                debug_log(if endpoint.is_relayed() {
+                    "transport used: relay".to_string()
+                } else {
+                    "transport used: direct".to_string()
+                });
+            }
+            SwarmEvent::Behaviour(PairingBehaviourEvent::Dcutr(event)) => {
+                debug_log(format!("DCUtR attempt: {event:?}"));
+            }
             SwarmEvent::Behaviour(PairingBehaviourEvent::Relay(event)) => {
                 debug_log(format!("relay client event: {event:?}"));
             }
@@ -440,6 +467,7 @@ async fn run_join_invite_at(
                 }
             }, if !relay_started => {
                 if let Some(target) = target_peer_id {
+                    debug_log("relay fallback selected".to_string());
                     dial_target_through_relay(&mut swarm, &service_addr, target)?;
                     relay_started = true;
                     fallback_at = None;
@@ -449,6 +477,7 @@ async fn run_join_invite_at(
                 SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. }
                     if peer_id == service_peer_id && !endpoint.is_relayed() && !lookup_sent =>
                 {
+                    debug_log("service connected".to_string());
                     swarm.behaviour_mut().app.send_request(
                         &service_peer_id,
                         PairingRequest::ResolveInvite { code_hash: code_hash.clone() },
@@ -463,6 +492,7 @@ async fn run_join_invite_at(
                     },
                 )) if peer == service_peer_id => match response {
                     PairingResponse::Resolved { peer_id, direct_addresses } => {
+                        debug_log("invite resolved".to_string());
                         let target: PeerId = peer_id
                             .parse()
                             .map_err(|error| format!("service returned an invalid peer: {error}"))?;
@@ -476,9 +506,11 @@ async fn run_join_invite_at(
                             }
                         }
                         if has_direct {
+                            debug_log("direct connection attempt".to_string());
                             swarm.dial(DialOpts::peer_id(target).build())?;
                             fallback_at = Some(time::Instant::now() + DIRECT_DIAL_GRACE);
                         } else {
+                            debug_log("relay fallback selected".to_string());
                             dial_target_through_relay(&mut swarm, &service_addr, target)?;
                             relay_started = true;
                         }
@@ -490,10 +522,13 @@ async fn run_join_invite_at(
                     if Some(peer_id) == target_peer_id =>
                 {
                     debug_log(if endpoint.is_relayed() {
-                        "connected using circuit relay".to_string()
+                        "transport used: relay".to_string()
                     } else {
-                        "connected directly".to_string()
+                        "transport used: direct".to_string()
                     });
+                    if endpoint.is_relayed() {
+                        debug_log("DCUtR attempt started".to_string());
+                    }
                     if !requested_bundle {
                         swarm
                             .behaviour_mut()
@@ -564,6 +599,7 @@ async fn run_join_invite_at(
                     debug_log(format!("direct dial failed: {error}"));
                     if !relay_started {
                         if let Some(target) = target_peer_id {
+                            debug_log("relay fallback selected".to_string());
                             dial_target_through_relay(&mut swarm, &service_addr, target)?;
                             relay_started = true;
                             fallback_at = None;
@@ -571,7 +607,7 @@ async fn run_join_invite_at(
                     }
                 }
                 SwarmEvent::Behaviour(PairingBehaviourEvent::Dcutr(event)) => {
-                    debug_log(format!("hole punch event: {event:?}"));
+                    debug_log(format!("DCUtR attempt: {event:?}"));
                 }
                 SwarmEvent::Behaviour(PairingBehaviourEvent::Relay(event)) => {
                     debug_log(format!("relay client event: {event:?}"));
@@ -1124,8 +1160,16 @@ fn load_or_create_libp2p_identity(db_path: &Path) -> AppResult<identity::Keypair
 }
 
 fn load_or_create_service_identity(path: &Path) -> AppResult<identity::Keypair> {
-    if let Ok(bytes) = std::fs::read(path) {
-        return Ok(identity::Keypair::from_protobuf_encoding(&bytes)?);
+    match std::fs::read(path) {
+        Ok(bytes) => return Ok(identity::Keypair::from_protobuf_encoding(&bytes)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "could not read service identity {}: {error}",
+                path.display()
+            )
+            .into())
+        }
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1136,9 +1180,8 @@ fn load_or_create_service_identity(path: &Path) -> AppResult<identity::Keypair> 
 }
 
 fn configured_service_addr() -> AppResult<Multiaddr> {
-    let value = std::env::var(PAIRING_SERVICE_ENV).map_err(|_| {
-        "CipherMesh pairing service is not configured. Set CIPHERMESH_RENDEZVOUS during installation."
-    })?;
+    let value = std::env::var(PAIRING_SERVICE_ENV)
+        .unwrap_or_else(|_| DEFAULT_PAIRING_SERVICE_ADDR.to_string());
     let address: Multiaddr = value
         .parse()
         .map_err(|error| format!("CipherMesh pairing service configuration is invalid: {error}"))?;
@@ -1352,6 +1395,28 @@ mod tests {
     }
 
     #[test]
+    fn persistent_service_identity_keeps_peer_id() {
+        let path = std::env::temp_dir().join(format!(
+            "ciphermesh-service-identity-{}.key",
+            PeerId::random()
+        ));
+        let first = PeerId::from(load_or_create_service_identity(&path).unwrap().public());
+        let second = PeerId::from(load_or_create_service_identity(&path).unwrap().public());
+        assert_eq!(first, second);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn built_in_service_endpoint_is_the_public_oracle_service() {
+        let address: Multiaddr = DEFAULT_PAIRING_SERVICE_ADDR.parse().unwrap();
+        assert!(service_address_is_public(&address));
+        assert_eq!(
+            peer_id_from_service_addr(&address).unwrap().to_string(),
+            "12D3KooWA7sad9DmGvthSqGTenmsKAB7DNreT6iCL5j11PyY5Dvt"
+        );
+    }
+
+    #[test]
     fn wildcard_and_loopback_addresses_are_never_dialable() {
         for address in [
             "/ip4/0.0.0.0/tcp/5000",
@@ -1458,10 +1523,12 @@ mod tests {
             }
         }
 
-        let (plaintext_tx, plaintext_rx) = tokio::sync::oneshot::channel::<String>();
+        let host_db = pairing_temp_db("relay-chat-history");
+        let host_db_for_task = host_db.clone();
+        let (plaintext_tx, plaintext_rx) = tokio::sync::oneshot::channel::<Vec<String>>();
         let host_task = tokio::spawn(async move {
             let mut bob = Bob::local();
-            let mut delivered_plaintext = None::<String>;
+            let mut delivered_plaintexts = Vec::<String>::new();
             let mut plaintext_tx = Some(plaintext_tx);
             loop {
                 match host.select_next_some().await {
@@ -1495,8 +1562,8 @@ mod tests {
                         PairingRequest::ChatFrame(payload) => {
                             let ChatFrame::Message {
                                 message_id,
+                                sender_display_name,
                                 message,
-                                ..
                             } = bincode::deserialize(&payload)?
                             else {
                                 return Err::<(), Box<dyn Error + Send + Sync>>(
@@ -1504,19 +1571,33 @@ mod tests {
                                 );
                             };
                             let plaintext = bob.decrypt_from_alice(&message)?;
+                            persist_chat_message(
+                                &host_db_for_task,
+                                ChatHistoryEntry {
+                                    message_id: Some(message_id.clone()),
+                                    conversation_id: "relay-smoke",
+                                    sender_display_name: &sender_display_name,
+                                    peer_display_name: "Mac",
+                                    direction: MessageDirection::Received,
+                                    status: MessageStatus::Received,
+                                    protocol_counter: Some(message.number),
+                                    ciphertext: &payload,
+                                    plaintext: &plaintext,
+                                },
+                            )?;
                             let _ = host
                                 .behaviour_mut()
                                 .app
                                 .send_response(channel, PairingResponse::Ack(message_id));
-                            delivered_plaintext = Some(plaintext);
+                            delivered_plaintexts.push(plaintext);
                         }
                         _ => {}
                     },
                     SwarmEvent::Behaviour(PairingBehaviourEvent::App(
                         request_response::Event::ResponseSent { .. },
-                    )) if delivered_plaintext.is_some() => {
+                    )) if delivered_plaintexts.len() == 2 => {
                         if let Some(tx) = plaintext_tx.take() {
-                            let _ = tx.send(delivered_plaintext.take().unwrap());
+                            let _ = tx.send(delivered_plaintexts.clone());
                         }
                     }
                     _ => {}
@@ -1532,8 +1613,10 @@ mod tests {
         let mut alice = Alice::local();
         let mut lookup_sent = false;
         let mut second_lookup_rejected = false;
-        let mut chat_sent = false;
-        let expected_message_id = "relay-smoke-message".to_string();
+        let chat_messages = ["hello across networks", "another message"];
+        let expected_message_ids = ["relay-smoke-message-1", "relay-smoke-message-2"];
+        let mut chat_messages_sent = 0usize;
+        let mut chat_acks = 0usize;
 
         loop {
             match join.select_next_some().await {
@@ -1618,22 +1701,22 @@ mod tests {
                         peer,
                         message:
                             request_response::Message::Response {
-                                response: PairingResponse::Ack(_),
+                                response: PairingResponse::Ack(message_id),
                                 ..
                             },
                         ..
                     },
-                )) if peer == host_peer && !chat_sent => {
-                    let message = alice.encrypt_for_bob("hello across networks")?;
+                )) if peer == host_peer && message_id == "paired" && chat_messages_sent == 0 => {
+                    let message = alice.encrypt_for_bob(chat_messages[0])?;
                     let payload = bincode::serialize(&ChatFrame::Message {
-                        message_id: expected_message_id.clone(),
+                        message_id: expected_message_ids[0].to_string(),
                         sender_display_name: "Windows".to_string(),
                         message,
                     })?;
                     join.behaviour_mut()
                         .app
                         .send_request(&host_peer, PairingRequest::ChatFrame(payload));
-                    chat_sent = true;
+                    chat_messages_sent = 1;
                 }
                 SwarmEvent::Behaviour(PairingBehaviourEvent::App(
                     request_response::Event::Message {
@@ -1645,8 +1728,23 @@ mod tests {
                             },
                         ..
                     },
-                )) if peer == host_peer && chat_sent && message_id == expected_message_id => {
-                    if second_lookup_rejected {
+                )) if peer == host_peer
+                    && chat_messages_sent > 0
+                    && message_id == expected_message_ids[chat_acks] =>
+                {
+                    chat_acks += 1;
+                    if chat_acks < chat_messages.len() {
+                        let message = alice.encrypt_for_bob(chat_messages[chat_acks])?;
+                        let payload = bincode::serialize(&ChatFrame::Message {
+                            message_id: expected_message_ids[chat_acks].to_string(),
+                            sender_display_name: "Windows".to_string(),
+                            message,
+                        })?;
+                        join.behaviour_mut()
+                            .app
+                            .send_request(&host_peer, PairingRequest::ChatFrame(payload));
+                        chat_messages_sent += 1;
+                    } else if second_lookup_rejected {
                         break;
                     }
                 }
@@ -1654,9 +1752,14 @@ mod tests {
             }
         }
 
-        assert_eq!(plaintext_rx.await?, "hello across networks");
+        assert_eq!(plaintext_rx.await?, chat_messages);
+        let history = Storage::open(&host_db)?.messages_for_conversation("relay-smoke")?;
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].plaintext.as_deref(), Some(chat_messages[0]));
+        assert_eq!(history[1].plaintext.as_deref(), Some(chat_messages[1]));
         host_task.abort();
         service_task.abort();
+        let _ = std::fs::remove_file(host_db);
         Ok(())
     }
 }
