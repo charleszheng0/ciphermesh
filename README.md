@@ -128,7 +128,8 @@ cargo run
 cargo run -- --verbose
 cargo run -- create-invite [profile.sqlite]
 cargo run -- join-invite <six-character-code> [profile.sqlite]
-cargo run -- service /ip4/0.0.0.0/tcp/4001 [service-identity.key]
+cargo run -- service /ip4/0.0.0.0/tcp/4001
+cargo run -- service-dev /ip4/127.0.0.1/tcp/4001 [dev-service.key]
 cargo run -- bob [listen-ip:port] [bootstrap-multiaddr...]
 cargo run -- alice <bob-libp2p-peer-id> [message] [bootstrap-multiaddr...]
 cargo run -- alice-direct [bob-ip:port] [message]
@@ -163,18 +164,19 @@ Run one persistent service on the Oracle VM with TCP port 4001 open. Keep the
 identity file on durable storage so the service PeerId does not change:
 
 ```bash
-cargo run --release -- service /ip4/0.0.0.0/tcp/4001 /var/lib/ciphermesh/service.key
+cargo run --release -- service /ip4/0.0.0.0/tcp/4001
 ```
 
-The service loads `/var/lib/ciphermesh/service.key` on every restart and refuses
-to silently replace it when it cannot be read. Back up this private key. The
+The service loads `/var/lib/ciphermesh/service.key` on every production restart.
+It refuses to generate a replacement when that canonical file is missing,
+unreadable, invalid, or produces the wrong PeerId. Back up this private key. The
 deployed key must print the expected service PeerId
-`12D3KooWA7sad9DmGvthSqGTenmsKAB7DNreT6iCL5j11PyY5Dvt`.
+`12D3KooWRkaMJMXVTTgsBSmjvZ6L26mbb39h7NXrKPMvMgL5drpj`.
 
 The public endpoint is built into CipherMesh:
 
 ```text
-/ip4/150.136.135.150/tcp/4001/p2p/12D3KooWA7sad9DmGvthSqGTenmsKAB7DNreT6iCL5j11PyY5Dvt
+/ip4/150.136.135.150/tcp/4001/p2p/12D3KooWRkaMJMXVTTgsBSmjvZ6L26mbb39h7NXrKPMvMgL5drpj
 ```
 
 No client configuration is required. Developers can override it with:
@@ -183,17 +185,46 @@ No client configuration is required. Developers can override it with:
 CIPHERMESH_RENDEZVOUS=/ip4/OTHER_PUBLIC_IP/tcp/4001/p2p/OTHER_SERVICE_PEER_ID
 ```
 
-When the service identity argument is omitted, the service uses
-`./ciphermesh-service.key`; `CIPHERMESH_SERVICE_IDENTITY` can override that
-operator-side default. Production should always use the explicit durable path
-shown above.
+Both production commands, `service` and `relay`, always use
+`/var/lib/ciphermesh/service.key`, independent of the working directory. They do
+not accept an alternate identity path. For local development, use `service-dev`
+with an explicit test key or set `CIPHERMESH_SERVICE_IDENTITY`.
 
-Run the service command under the host's normal process supervisor (for
-example, systemd) with the same identity-file path. The service keeps only
-hashed, five-minute invite codes, the inviter's PeerId, and sanitized routing
-addresses in memory. It will not register an invite until the inviter has an
-active relay reservation, removes registrations when reservations end, and
-consumes a code on its first successful resolution.
+Promote the existing permanent identity once on Oracle (this copies the key; it
+does not generate one):
+
+```bash
+sudo install -d -o opc -g opc -m 700 /var/lib/ciphermesh
+sudo install -o opc -g opc -m 600 \
+  /home/opc/ciphermesh/ciphermesh-service.key \
+  /var/lib/ciphermesh/service.key
+sha256sum \
+  /home/opc/ciphermesh/ciphermesh-service.key \
+  /var/lib/ciphermesh/service.key
+```
+
+Both checksums must be
+`62015426bea5afd3f6c030a292c9dc59c525a1e2a18f92d03b6ba296378e8fcd`.
+After building the deployed revision, verify two separate launches:
+
+```bash
+cd /home/opc/ciphermesh
+cargo build --release
+timeout 5s ./target/release/ciphermesh service /ip4/127.0.0.1/tcp/0 || test $? -eq 124
+timeout 5s ./target/release/ciphermesh service /ip4/127.0.0.1/tcp/0 || test $? -eq 124
+```
+
+Each launch must print the same expected `Service PeerId`. Run the production
+service under the host's normal process supervisor (for example, systemd) as:
+
+```bash
+/home/opc/ciphermesh/target/release/ciphermesh service /ip4/0.0.0.0/tcp/4001
+```
+
+The service keeps only hashed, five-minute invite codes, the inviter's PeerId,
+and sanitized routing addresses in memory. It will not register an invite until
+the inviter has an active relay reservation, removes registrations when
+reservations end, and consumes a code on its first successful resolution.
 
 ## Pairing On Any Network
 
@@ -280,7 +311,7 @@ Alice discovers Bob through mDNS/Kademlia and then starts interactive chat.
 Terminal 1:
 
 ```bash
-cargo run -- service /ip4/0.0.0.0/tcp/4001 target/dev-service.key
+cargo run -- service-dev /ip4/127.0.0.1/tcp/4001 target/dev-service.key
 ```
 
 Terminal 2:

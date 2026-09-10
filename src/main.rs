@@ -52,8 +52,11 @@ const DISCOVERY_PROTOCOL: &str = "/ciphermesh/discovery/3c/1.0.0";
 const APP_RELAY_PROTOCOL: &str = "/ciphermesh/app-bytes/3c/1.0.0";
 const PAIRING_SERVICE_ENV: &str = "CIPHERMESH_RENDEZVOUS";
 const SERVICE_IDENTITY_ENV: &str = "CIPHERMESH_SERVICE_IDENTITY";
+const DEFAULT_SERVICE_IDENTITY_PATH: &str = "/var/lib/ciphermesh/service.key";
+const DEFAULT_PAIRING_SERVICE_PEER_ID: &str =
+    "12D3KooWRkaMJMXVTTgsBSmjvZ6L26mbb39h7NXrKPMvMgL5drpj";
 const DEFAULT_PAIRING_SERVICE_ADDR: &str =
-    "/ip4/150.136.135.150/tcp/4001/p2p/12D3KooWA7sad9DmGvthSqGTenmsKAB7DNreT6iCL5j11PyY5Dvt";
+    "/ip4/150.136.135.150/tcp/4001/p2p/12D3KooWRkaMJMXVTTgsBSmjvZ6L26mbb39h7NXrKPMvMgL5drpj";
 const MAILBOX_PROTOCOL: &str = "/ciphermesh/mailbox/3d/1.0.0";
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAILBOX_ENVELOPE_TTL_SECS: u64 = 5 * 60;
@@ -144,15 +147,29 @@ async fn main() -> AppResult<()> {
         }
         Some("kad-demo") => run_kademlia_demo().await,
         Some("service") | Some("relay") => {
+            if args.get(3).is_some() {
+                return Err(format!(
+                    "the production service identity is fixed at {DEFAULT_SERVICE_IDENTITY_PATH}; use service-dev for an alternate key"
+                )
+                .into());
+            }
             let listen_addr = parse_multiaddr(
                 args.get(2),
                 "/ip4/0.0.0.0/tcp/4001",
                 "service listen multiaddr",
             )?;
+            pairing::run_public_service(listen_addr, Path::new(DEFAULT_SERVICE_IDENTITY_PATH)).await
+        }
+        Some("service-dev") => {
+            let listen_addr = parse_multiaddr(
+                args.get(2),
+                "/ip4/127.0.0.1/tcp/4001",
+                "development service listen multiaddr",
+            )?;
             let identity_path = args
                 .get(3)
                 .map(PathBuf::from)
-                .unwrap_or_else(default_service_identity_path);
+                .unwrap_or_else(development_service_identity_path);
             pairing::run_public_service(listen_addr, &identity_path).await
         }
         Some("relay-demo") => run_relay_demo().await,
@@ -280,10 +297,10 @@ fn take_verbose_flag(args: &mut Vec<String>) -> bool {
     enabled
 }
 
-fn default_service_identity_path() -> PathBuf {
+fn development_service_identity_path() -> PathBuf {
     std::env::var_os(SERVICE_IDENTITY_ENV)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("ciphermesh-service.key"))
+        .unwrap_or_else(|| PathBuf::from("target/dev-service.key"))
 }
 
 fn parse_addr(addr: Option<&String>, default: &str) -> AppResult<SocketAddr> {
@@ -336,7 +353,10 @@ fn print_usage() {
     println!("  cargo run -- help");
     println!();
     println!("Public service operator:");
-    println!("  cargo run -- service /ip4/0.0.0.0/tcp/4001 [service-identity.key]");
+    println!("  cargo run -- service /ip4/0.0.0.0/tcp/4001");
+    println!(
+        "  Development only: cargo run -- service-dev /ip4/127.0.0.1/tcp/4001 [dev-service.key]"
+    );
     println!();
     println!("Developer/debug commands (raw networking details):");
     println!("Phase 3B mDNS discovery test:");

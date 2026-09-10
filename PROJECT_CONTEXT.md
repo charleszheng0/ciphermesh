@@ -23,7 +23,7 @@ command alias. The service identity file must remain on persistent storage so
 its PeerId stays stable:
 
 ```bash
-cargo run --release -- service /ip4/0.0.0.0/tcp/4001 /var/lib/ciphermesh/service.key
+cargo run --release -- service /ip4/0.0.0.0/tcp/4001
 ```
 
 Client releases should eventually embed the resulting public service address

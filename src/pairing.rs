@@ -68,6 +68,16 @@ pub(super) async fn run_public_service(
 ) -> AppResult<()> {
     let key = load_or_create_service_identity(identity_path)?;
     let local_peer_id = PeerId::from(key.public());
+    if identity_path == Path::new(DEFAULT_SERVICE_IDENTITY_PATH)
+        && local_peer_id.to_string() != DEFAULT_PAIRING_SERVICE_PEER_ID
+    {
+        return Err(format!(
+            "canonical service identity {} produced unexpected PeerId {local_peer_id}; expected {}",
+            identity_path.display(),
+            DEFAULT_PAIRING_SERVICE_PEER_ID
+        )
+        .into());
+    }
     let mut swarm = new_public_service_swarm(key)?;
     swarm.listen_on(listen_addr)?;
 
@@ -1162,6 +1172,16 @@ fn load_or_create_libp2p_identity(db_path: &Path) -> AppResult<identity::Keypair
 fn load_or_create_service_identity(path: &Path) -> AppResult<identity::Keypair> {
     match std::fs::read(path) {
         Ok(bytes) => return Ok(identity::Keypair::from_protobuf_encoding(&bytes)?),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && path == Path::new(DEFAULT_SERVICE_IDENTITY_PATH) =>
+        {
+            return Err(format!(
+                "canonical service identity is missing at {}; restore the permanent key instead of generating a new identity",
+                path.display()
+            )
+            .into())
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(format!(
@@ -1412,8 +1432,17 @@ mod tests {
         assert!(service_address_is_public(&address));
         assert_eq!(
             peer_id_from_service_addr(&address).unwrap().to_string(),
-            "12D3KooWA7sad9DmGvthSqGTenmsKAB7DNreT6iCL5j11PyY5Dvt"
+            DEFAULT_PAIRING_SERVICE_PEER_ID
         );
+    }
+
+    #[test]
+    fn production_service_identity_path_is_absolute_and_canonical() {
+        assert_eq!(
+            DEFAULT_SERVICE_IDENTITY_PATH,
+            "/var/lib/ciphermesh/service.key"
+        );
+        assert!(DEFAULT_SERVICE_IDENTITY_PATH.starts_with('/'));
     }
 
     #[test]
