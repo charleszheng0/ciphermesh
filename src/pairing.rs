@@ -191,8 +191,14 @@ async fn run_public_service_swarm(
 }
 
 pub(super) async fn run_create_invite(profile_db: &Path) -> AppResult<()> {
-    let service_addr = configured_service_addr()?;
-    run_create_invite_at(profile_db, service_addr).await
+    let profile_db = profile_db.to_path_buf();
+    // Keep the composed libp2p state machine out of the inline #[tokio::main]
+    // future. Its first poll can exhaust the smaller Windows main-thread stack.
+    tokio::spawn(async move {
+        let service_addr = configured_service_addr()?;
+        run_create_invite_at(&profile_db, service_addr).await
+    })
+    .await?
 }
 
 async fn run_create_invite_at(profile_db: &Path, service_addr: Multiaddr) -> AppResult<()> {
@@ -437,8 +443,14 @@ async fn run_create_invite_at(profile_db: &Path, service_addr: Multiaddr) -> App
 
 pub(super) async fn run_join_invite(code: &str, profile_db: &Path) -> AppResult<()> {
     let normalized = normalize_invite_code(code)?;
-    let service_addr = configured_service_addr()?;
-    run_join_invite_at(&normalized, profile_db, service_addr).await
+    let profile_db = profile_db.to_path_buf();
+    // Join uses the same libp2p behaviour, so keep it behind the same task
+    // boundary even though Create Invite was the first path to expose the bug.
+    tokio::spawn(async move {
+        let service_addr = configured_service_addr()?;
+        run_join_invite_at(&normalized, &profile_db, service_addr).await
+    })
+    .await?
 }
 
 async fn run_join_invite_at(
@@ -1398,6 +1410,16 @@ fn debug_log(message: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normal_create_invite_startup_future_is_stack_bounded() {
+        let path = Path::new("future-size.sqlite");
+        let future = run_create_invite(path);
+        assert!(
+            std::mem::size_of_val(&future) <= 1024,
+            "normal Create Invite must keep its network state machine behind a task boundary"
+        );
+    }
 
     fn pairing_temp_db(name: &str) -> PathBuf {
         let mut random = [0u8; 8];
