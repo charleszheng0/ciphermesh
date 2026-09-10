@@ -40,7 +40,7 @@ use std::{
         mpsc as std_mpsc, Arc, Mutex,
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{sync::mpsc, time};
 
@@ -255,6 +255,19 @@ async fn main() -> AppResult<()> {
                 .unwrap_or_else(|| PathBuf::from("target/ciphermesh-4b-outbox-demo.sqlite"));
             run_outbox_demo(&db_path)
         }
+        Some("storage-bench") => {
+            let message_count = args
+                .get(2)
+                .map(|value| value.parse::<usize>())
+                .transpose()
+                .map_err(|error| format!("invalid storage benchmark message count: {error}"))?
+                .unwrap_or(10_000);
+            let db_path = args
+                .get(3)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("target/ciphermesh-storage-benchmark.sqlite"));
+            run_storage_benchmark(&db_path, message_count)
+        }
         Some("sync-demo") => run_sync_demo(),
         Some("crdt-demo") => run_crdt_demo(),
         Some("device-demo") => run_device_identity_demo(),
@@ -405,6 +418,7 @@ fn print_usage() {
     println!();
     println!("Phase 4B durable outbox demo:");
     println!("  cargo run -- outbox-demo [target/ciphermesh-4b-outbox-demo.sqlite]");
+    println!("  cargo run --release -- storage-bench [messages] [database]");
     println!();
     println!("Phase 4D version-vector sync demo:");
     println!("  cargo run -- sync-demo");
@@ -583,6 +597,7 @@ async fn run_phase6_lan_smoke_with_dbs(alice_db: &Path, bob_db: &Path) -> AppRes
 
     println!("Phase 6 LAN smoke listening on {bound_addr}");
     println!("Phase 6 LAN smoke dialing {dial_addr}");
+    let delivery_started = Instant::now();
     let session = connect_alice_chat(dial_addr, alice_db).await?;
     let _ = release_server.send(());
     let server_conversation_id = server.await??;
@@ -618,6 +633,10 @@ async fn run_phase6_lan_smoke_with_dbs(alice_db: &Path, bob_db: &Path) -> AppRes
         return Err("joiner did not receive invite creator pending message".into());
     }
 
+    println!(
+        "BENCH metric=lan_delivery value_ms={:.3}",
+        delivery_started.elapsed().as_secs_f64() * 1_000.0
+    );
     println!("Phase 6 LAN smoke passed");
     Ok(())
 }
@@ -660,6 +679,7 @@ async fn run_phase6_invite_discovery_smoke_with_dbs(
     });
 
     println!("Phase 6 invite discovery smoke code {code}");
+    let invite_started = Instant::now();
     let discovered_addr = discover_lan_invite_addr(&code_hash).await?;
     println!("Phase 6 invite discovery resolved {discovered_addr}");
     let session = connect_alice_chat(discovered_addr, alice_db).await?;
@@ -684,6 +704,10 @@ async fn run_phase6_invite_discovery_smoke_with_dbs(
         return Err("Alice did not receive Bob's display name after invite discovery".into());
     }
 
+    println!(
+        "BENCH metric=invite_to_connected value_ms={:.3}",
+        invite_started.elapsed().as_secs_f64() * 1_000.0
+    );
     println!("Phase 6 invite discovery smoke passed");
     Ok(())
 }
@@ -729,14 +753,20 @@ async fn run_phase6_relay_smoke() -> AppResult<()> {
         .await
         .map_err(|_| "relay smoke timed out waiting for Bob relay reservation")?
         .map_err(|_| "relay smoke Bob stopped before reservation was ready")?;
+    let delivery_started = Instant::now();
     run_alice_relayed(
         bob_peer_id,
         "phase6 relay fallback delivery",
         vec![relay_addr],
     )
     .await?;
+    let delivery_elapsed = delivery_started.elapsed();
     bob_server.await??;
     relay_server.abort();
+    println!(
+        "BENCH metric=relay_delivery value_ms={:.3}",
+        delivery_elapsed.as_secs_f64() * 1_000.0
+    );
     println!("Phase 6 relay smoke passed");
     Ok(())
 }
@@ -876,6 +906,7 @@ async fn run_phase6_mailbox_smoke_with_dbs(
         tokio::spawn(async move { run_phase6_mailbox_server_until_ack(swarm, store).await });
 
     println!("Phase 6 mailbox smoke using {mailbox_addr}");
+    let delivery_started = Instant::now();
     run_alice_mailbox_deposit(
         mailbox_addr.clone(),
         "phase6 offline mailbox delivery",
@@ -890,6 +921,10 @@ async fn run_phase6_mailbox_smoke_with_dbs(
         return Err(format!("mailbox still has {pending} pending envelope(s) after ACK").into());
     }
 
+    println!(
+        "BENCH metric=mailbox_delivery value_ms={:.3}",
+        delivery_started.elapsed().as_secs_f64() * 1_000.0
+    );
     println!("Phase 6 mailbox smoke passed");
     Ok(())
 }
@@ -1294,6 +1329,132 @@ fn run_outbox_demo(db_path: &Path) -> AppResult<()> {
         );
     }
 
+    Ok(())
+}
+
+fn run_storage_benchmark(db_path: &Path, message_count: usize) -> AppResult<()> {
+    if message_count == 0 {
+        return Err("storage benchmark message count must be greater than zero".into());
+    }
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if db_path.exists() {
+        std::fs::remove_file(db_path)?;
+    }
+
+    let conversation_id = "storage-benchmark";
+    let mut storage = Storage::open(db_path)?;
+    let mut alice = Alice::local();
+    let mut bob = Bob::local();
+    let alice_exchange = alice.signed_key_exchange();
+    let bob_exchange = bob.signed_key_exchange();
+    alice.derive_session_key(&bob_exchange)?;
+    bob.derive_session_key(&alice_exchange)?;
+
+    let started = Instant::now();
+    for index in 0..message_count {
+        let plaintext = format!("CipherMesh storage benchmark message {index}");
+        let message = alice.encrypt_for_bob(&plaintext)?;
+        let message_id = format!("storage-benchmark-{index}");
+        let payload = bincode::serialize(&DurableAppEnvelope {
+            message_id: message_id.clone(),
+            message: message.clone(),
+        })?;
+        let outbox = OutboxItem {
+            message_id: message_id.clone(),
+            recipient_id: "bob".to_string(),
+            payload: payload.clone(),
+            status: OutboxStatus::Pending,
+            retry_count: 0,
+            created_at_unix_secs: now_unix_secs(),
+            last_attempt_unix_secs: None,
+        };
+        storage.save_state_session_message_and_outbox(
+            "alice",
+            "alice",
+            &bincode::serialize(&alice.export_state())?,
+            conversation_id,
+            "bob",
+            "alice",
+            &bincode::serialize(
+                &alice
+                    .session_state()
+                    .ok_or("Alice session missing during storage benchmark")?,
+            )?,
+            &MessageRecord {
+                message_id: message_id.clone(),
+                conversation_id: conversation_id.to_string(),
+                sender_id: "alice".to_string(),
+                recipient_id: "bob".to_string(),
+                direction: MessageDirection::Sent,
+                status: MessageStatus::Stored,
+                protocol_counter: Some(message.number),
+                ciphertext: payload.clone(),
+                plaintext: Some(plaintext.clone()),
+                created_at_unix_secs: now_unix_secs(),
+            },
+            &outbox,
+        )?;
+
+        storage.record_outbox_attempt(&message_id)?;
+        if !storage.accept_message_once(&message_id)? {
+            return Err(
+                format!("storage benchmark rejected first delivery for {message_id}").into(),
+            );
+        }
+        let decrypted = bob.decrypt_from_alice(&message)?;
+        if decrypted != plaintext {
+            return Err(format!("storage benchmark plaintext mismatch for {message_id}").into());
+        }
+        persist_actor_message(
+            &mut storage,
+            "bob",
+            "bob",
+            &bincode::serialize(&bob.export_state())?,
+            conversation_id,
+            "alice",
+            "bob",
+            &bincode::serialize(
+                &bob.session_state()
+                    .ok_or("Bob session missing during storage benchmark")?,
+            )?,
+            &MessageRecord {
+                message_id: format!("bob-{message_id}"),
+                conversation_id: conversation_id.to_string(),
+                sender_id: "alice".to_string(),
+                recipient_id: "bob".to_string(),
+                direction: MessageDirection::Received,
+                status: MessageStatus::Received,
+                protocol_counter: Some(message.number),
+                ciphertext: payload,
+                plaintext: Some(decrypted),
+                created_at_unix_secs: now_unix_secs(),
+            },
+        )?;
+        storage.mark_outbox_delivered(&message_id)?;
+    }
+    let elapsed = started.elapsed();
+
+    if !storage.pending_outbox_items()?.is_empty() {
+        return Err("storage benchmark left pending outbox rows".into());
+    }
+    let stored_records = storage.messages_for_conversation(conversation_id)?.len();
+    let expected_records = message_count * 2;
+    if stored_records != expected_records {
+        return Err(format!(
+            "storage benchmark stored {stored_records} message records, expected {expected_records}"
+        )
+        .into());
+    }
+    drop(storage);
+
+    let db_bytes = std::fs::metadata(db_path)?.len();
+    let seconds = elapsed.as_secs_f64();
+    println!(
+        "STORAGE_BENCH messages={message_count} records={stored_records} seconds={seconds:.3} messages_per_second={:.3} database_bytes={db_bytes}",
+        message_count as f64 / seconds
+    );
     Ok(())
 }
 

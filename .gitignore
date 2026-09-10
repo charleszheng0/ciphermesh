@@ -1,3 +1,7 @@
 /target/
 /ciphermesh/
 /dist/
+
+# Local recruiting metrics and generated benchmark reports
+/RESUME_METRICS.md
+/target/*benchmark*
