@@ -1,42 +1,88 @@
 # CipherMesh
 
-CipherMesh is a Rust prototype of a decentralized end-to-end encrypted messenger. It is built incrementally to show how encrypted messaging, peer discovery, reliable delivery, local persistence, CRDT-style event convergence, and multi-device identity fit together.
+CipherMesh is a Rust end-to-end encrypted peer-to-peer messenger for Windows,
+macOS, and Linux. Its normal terminal UI supports short-code pairing on the
+same LAN or across networks, persistent conversations, durable queued delivery,
+and automatic reconnection through direct or relayed connections.
 
 ## Why It Exists
 
-The project is a learning and architecture prototype: each phase keeps the application crypto independent from the network path. Messages are encrypted before QUIC, relays, mailboxes, or discovery infrastructure see them.
+CipherMesh keeps application encryption independent from the network path.
+Messages are encrypted before QUIC, relays, mailboxes, or discovery
+infrastructure handle them, so changing transports does not expose plaintext or
+session keys. It remains a prototype rather than an audited production
+messenger; see [SECURITY.md](SECURITY.md) for its guarantees and limitations.
 
 ## Architecture
 
 ```text
-Alice / Bob CLI
-    |
-    v
-CipherMesh account/device/session logic
-    |
-    v
-Encrypted protocol bytes
-    |
-    +--> direct QUIC
-    +--> libp2p discovery + relay fallback
-    +--> persistent untrusted mailbox
-    |
-    v
-SQLite local state / outbox / events / vectors
+Device A                                              Device B
+Terminal UI                                           Terminal UI
+    |                                                      |
+SQLite history/outbox <-- Double Ratchet ciphertext --> SQLite history/outbox
+    |                                                      |
+    +------ direct peer connection / DCUtR hole punch -----+
+    |                                                      |
+    +-- Oracle rendezvous + Circuit Relay v2 fallback -----+
+
+Optional mailbox protocol stores opaque encrypted envelopes for later retrieval.
 ```
 
-## Cross-Network Pairing Context
+Private application and ratchet keys remain on the endpoints. The public
+service coordinates short-lived invite discovery and forwards relayed bytes;
+it does not terminate CipherMesh's application encryption.
 
-CipherMesh is being extended from same-LAN messaging to reliable cross-network
-messaging between devices on different Wi-Fi networks. A small public libp2p
-rendezvous/circuit-relay service gives peers a globally reachable meeting point
-when direct LAN discovery or NAT traversal is insufficient. Users still see
-only **Create Invite** with a short code and **Join Invite** with that code;
-CipherMesh resolves peer routing internally, attempts a direct connection where
-possible, and automatically falls back to the relay while preserving end-to-end
-encryption. The selected initial deployment target is an Oracle Cloud Always
-Free-eligible VM. See [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md) for the reusable
-project and resume summary.
+## Cross-Network Pairing
+
+CipherMesh supports messaging between devices on the same LAN and on different
+networks. The deployed Oracle Cloud libp2p rendezvous/Circuit Relay v2 service
+provides a globally reachable meeting point when LAN discovery or NAT traversal
+is insufficient. Users select **Create Invite** or **Join Invite** and exchange
+only a six-character code. CipherMesh resolves the peer internally, attempts a
+direct connection, allows DCUtR hole punching, and falls back to the relay while
+preserving application-layer end-to-end encryption.
+
+### Connection Selection: Direct, Hole Punch, Relay
+
+```text
+Resolve six-character invite
+          |
+          v
+Try the inviter's sanitized direct address
+          |
+          +-- connected --------------------> encrypted chat
+          |
+          v
+Allow DCUtR to negotiate a direct NAT traversal path
+          |
+          +-- connected --------------------> encrypted chat
+          |
+          v
+Dial /p2p/<relay>/p2p-circuit/p2p/<peer> ---> encrypted chat
+```
+
+The inviter establishes a Circuit Relay v2 reservation before its invite is
+published. The direct path is preferred; after a short grace period, the joiner
+uses the reserved circuit when direct connectivity is unavailable. A failed
+direct or DCUtR attempt does not tear down an existing relay connection.
+
+## Quick Demo
+
+On the first computer, run `cargo run`, select **Create Invite**, and share the
+six-character code:
+
+```text
+Connecting...
+Invite code: ABC2D3
+Waiting for your friend...
+```
+
+On the second computer, run `cargo run`, select **Join Invite**, and enter that
+code. Both users are placed into the encrypted chat when pairing completes.
+The same steps work on one LAN or across separate networks through the public
+service; the normal interface does not ask for an IP address, port, PeerId, or
+relay multiaddr. Use `cargo run -- --verbose` when a demo needs to show transport
+selection and relay/DCUtR diagnostics.
 
 ## Crypto Stack
 
@@ -56,14 +102,16 @@ project and resume summary.
 - mDNS and sanitized LAN addresses for direct same-network connections.
 - Kademlia DHT for distributed peer/address lookup.
 - AutoNAT/DCUtR/Circuit Relay support through rust-libp2p features.
-- Persistent untrusted offline mailbox for store-and-forward.
+- Automatic relay reservation renewal and background reconnect for active chats.
+- Optional untrusted mailbox protocol/demo for encrypted store-and-forward.
 
 ## Storage And Distributed State
 
-- SQLite via `rusqlite`.
+- SQLite via bundled `rusqlite`.
 - Local chat history for the endpoint's own conversation UI.
 - Durable outbox with pending/delivered status.
 - ACK/retry/deduplication.
+- Persistent local libp2p, application identity, and ratchet state.
 - Append-only event history.
 - Per-device event counters.
 - Version vectors for missing-event sync.
@@ -81,7 +129,9 @@ project and resume summary.
 
 ## Protocol And Data
 
-Current wire/demo types are Rust structs serialized with `serde`/`bincode`, plus libp2p CBOR request-response for discovery/mailbox messages. `prost`/Protobuf is not currently wired in this repo.
+Current wire/demo types are Rust structs serialized with `serde`/`bincode`,
+plus libp2p CBOR request-response for pairing, chat frames, and mailbox
+messages. `prost`/Protobuf is not currently wired in this repo.
 
 Main message shapes include:
 
@@ -95,17 +145,41 @@ Main message shapes include:
 - `DeviceCertificate`
 - `DeviceRevocation`
 
-## Build
+## Install And Run
+
+Requirements:
+
+- A current stable [Rust toolchain](https://www.rust-lang.org/tools/install).
+- Git and the native C/C++ build tools required by the Rust toolchain on the
+  host platform.
+- Internet access to the public pairing service for cross-network invites.
+
+Clone and run the normal application:
+
+```bash
+git clone https://github.com/charleszheng0/ciphermesh.git
+cd ciphermesh
+cargo run --release
+```
+
+For development, build or run the debug target:
 
 ```bash
 cargo build
+cargo run
 ```
 
-Release binary:
+Install the current checkout into Cargo's binary directory:
 
 ```bash
-cargo build --release
+cargo install --path .
+ciphermesh
 ```
+
+Local profiles, identities, ratchet state, history, and pending delivery state
+are stored in SQLite. The current default development profile is created under
+`target/`; pass an explicit profile path to `create-invite` or `join-invite`
+when testing persistence independently of Cargo build artifacts.
 
 Windows packaging helper:
 
@@ -123,25 +197,52 @@ macOS/Linux packaging helper:
 
 ## CLI
 
+Normal user commands:
+
 ```bash
 cargo run
 cargo run -- --verbose
 cargo run -- create-invite [profile.sqlite]
 cargo run -- join-invite <six-character-code> [profile.sqlite]
+```
+
+Running without a subcommand opens the product menu:
+
+```text
+Create Invite
+Join Invite
+Messages
+Profile
+Quit
+```
+
+Service-operator commands:
+
+```bash
 cargo run -- service /ip4/0.0.0.0/tcp/4001
+cargo run -- relay /ip4/0.0.0.0/tcp/4001
 cargo run -- service-dev /ip4/127.0.0.1/tcp/4001 [dev-service.key]
+```
+
+Developer and protocol-validation commands:
+
+```bash
 cargo run -- bob [listen-ip:port] [bootstrap-multiaddr...]
 cargo run -- alice <bob-libp2p-peer-id> [message] [bootstrap-multiaddr...]
+cargo run -- alice-relay <bob-libp2p-peer-id> [message] [relay-multiaddr...]
 cargo run -- alice-direct [bob-ip:port] [message]
 cargo run -- chat-bob [listen-ip:port]
 cargo run -- chat-alice [bob-ip:port]
+cargo run -- chat-listen [listen-ip:port] [profile.sqlite]
 cargo run -- relay-demo
 cargo run -- kad-demo
 cargo run -- mailbox [/ip4/0.0.0.0/tcp/7000] [target/ciphermesh-mailbox.sqlite]
 cargo run -- alice-mailbox <mailbox-multiaddr> [message] [target/ciphermesh-alice-mailbox.sqlite]
 cargo run -- bob-mailbox <mailbox-multiaddr> [target/ciphermesh-bob-mailbox.sqlite]
+cargo run -- invite-demo [target/ciphermesh-invite-demo.sqlite]
 cargo run -- restart-demo [target/ciphermesh-4a-demo.sqlite]
 cargo run -- outbox-demo [target/ciphermesh-4b-outbox-demo.sqlite]
+cargo run --release -- storage-bench [messages] [database]
 cargo run -- sync-demo
 cargo run -- crdt-demo
 cargo run -- device-demo
@@ -156,7 +257,9 @@ cargo run -- phase6-listener-doctor [0.0.0.0:5000] [hold-seconds]
 ```
 
 Verbose logging is enabled with `--verbose`, `-v`, or `CIPHERMESH_VERBOSE=1`.
-Both `cargo run` and `cargo run -- --verbose` open the normal product UI.
+Normal mode hides PeerIds, IP addresses, multiaddrs, Kademlia activity, relay
+internals, and DCUtR events. Both `cargo run` and `cargo run -- --verbose` open
+the normal product UI.
 
 ## Public Pairing Service
 
@@ -187,8 +290,11 @@ CIPHERMESH_RENDEZVOUS=/ip4/OTHER_PUBLIC_IP/tcp/4001/p2p/OTHER_SERVICE_PEER_ID
 
 Both production commands, `service` and `relay`, always use
 `/var/lib/ciphermesh/service.key`, independent of the working directory. They do
-not accept an alternate identity path. For local development, use `service-dev`
-with an explicit test key or set `CIPHERMESH_SERVICE_IDENTITY`.
+not accept an alternate identity path and refuse to start if the canonical key
+is absent or produces a PeerId other than the built-in production PeerId. For
+local development, use `service-dev` with an explicit test key;
+`CIPHERMESH_SERVICE_IDENTITY` supplies its default path when no path argument is
+given. A missing development key is generated once and reused.
 
 Promote the existing permanent identity once on Oracle (this copies the key; it
 does not generate one):
@@ -221,10 +327,19 @@ service under the host's normal process supervisor (for example, systemd) as:
 /home/opc/ciphermesh/target/release/ciphermesh service /ip4/0.0.0.0/tcp/4001
 ```
 
+The deployed service should run under systemd (or an equivalent supervisor)
+with automatic restart enabled. Its unit must execute the production command
+above as a user that can read `/var/lib/ciphermesh/service.key`. Because the
+canonical identity lives outside the repository, it survives binary rebuilds,
+process restarts, and VM reboots.
+
 The service keeps only hashed, five-minute invite codes, the inviter's PeerId,
-and sanitized routing addresses in memory. It will not register an invite until
-the inviter has an active relay reservation, removes registrations when
-reservations end, and consumes a code on its first successful resolution.
+and sanitized routing addresses in memory. It rejects wildcard, loopback,
+private, link-local, multicast, and documentation addresses. It will not
+register an invite until the inviter has an active relay reservation, removes
+registrations when reservations end, and consumes a code on its first
+successful resolution. Restarting the service clears outstanding invite codes
+but preserves its PeerId through the canonical key.
 
 ## Pairing On Any Network
 
@@ -234,12 +349,13 @@ On the host computer:
 cargo run
 ```
 
-Choose `Create invite`. CipherMesh prints only:
+Choose `Create invite`. After the local profile name is set, CipherMesh shows
+user-facing setup status such as:
 
 ```text
 Connecting...
 Invite code: ABC2D3
-Waiting for peer
+Waiting for your friend...
 ```
 
 On the joining computer:
@@ -252,6 +368,21 @@ Choose `Join invite` and enter `ABC2D3`. CipherMesh tries a valid direct LAN
 address first, lets DCUtR attempt a direct upgrade when available, and falls
 back to the public circuit relay automatically. IP addresses, ports, PeerIds,
 and multiaddrs are never part of the normal pairing UI.
+
+## Chat, Reconnection, And Queued Delivery
+
+After pairing, both peers enter the same persistent chat flow. Messages are
+written to the local SQLite history, tracked as pending, retried without
+creating duplicate history entries, and cleared from the outbox only after an
+ACK. If every connection to the peer disappears, CipherMesh marks the chat
+offline, keeps newly typed messages queued, retries the relay route every three
+seconds, and flushes pending messages when connectivity returns.
+
+An active chat has no inactivity timeout and can remain open until a user enters
+`/back`, presses Ctrl+C, or exits the application. Closing one libp2p connection
+or failing a direct/DCUtR attempt does not mark the peer offline while another
+viable connection remains. Reopening a saved conversation from **Messages**
+shows its local history and allows messages to be queued for later delivery.
 
 ## Local History Security
 
@@ -441,7 +572,23 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 ## Security Summary
 
-CipherMesh treats the network as untrusted. Discovery can find addresses, relays can forward bytes, and mailboxes can store ciphertext, but CipherMesh authentication and encryption live at the application layer. See [SECURITY.md](SECURITY.md).
+CipherMesh treats the network and public infrastructure as untrusted:
+
+- X25519 establishes shared secret material; Ed25519 authenticates identities
+  and device authorization.
+- HKDF and the Double Ratchet evolve per-session keys, and
+  ChaCha20-Poly1305 authenticates and encrypts message payloads.
+- Relays and mailboxes handle ciphertext plus necessary routing metadata, not
+  message plaintext or session keys.
+- Replay checks, bounded skipped keys, durable ACK/retry state, and
+  deduplication protect the message-processing path.
+- Local SQLite databases contain sensitive identities, ratchet state, and
+  plaintext history and are not currently encrypted at rest.
+
+CipherMesh does not claim complete metadata privacy, traffic-analysis
+resistance, endpoint-compromise protection, or audited production security.
+The full trust boundaries and attacker model are documented in
+[SECURITY.md](SECURITY.md).
 
 ## Known Limitations
 
@@ -452,4 +599,7 @@ CipherMesh treats the network as untrusted. Discovery can find addresses, relays
 - No account recovery or backup.
 - No group chat.
 - Internet reachability still depends on operating the public pairing service described above.
-- Manual reconnect UX is intentionally disabled while the protocol is hardened; use a fresh invite after restart/disconnect.
+- Automatic reconnect runs while the paired chat remains open; there is no
+  background messaging daemon after the application exits.
+- The persistent mailbox is a separate protocol/demo path rather than part of
+  the deployed rendezvous/relay service.
