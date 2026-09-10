@@ -1579,7 +1579,7 @@ async fn run_chat_history_menu(profile_db: &Path) -> AppResult<()> {
 
         let recent_count = chats.len().min(RECENT_CHAT_LIMIT);
         for (index, summary) in chats.iter().take(recent_count).enumerate() {
-            print_recent_chat_summary(index + 1, summary);
+            print_chat_summary(index + 1, summary);
         }
         println!("[A] View All Chats");
         println!("[B] Back");
@@ -1636,7 +1636,7 @@ async fn run_all_chat_history_menu(profile_db: &Path) -> AppResult<()> {
             println!();
         } else {
             for (index, summary) in page_chats.iter().enumerate() {
-                print_all_chat_summary(index + 1, summary);
+                print_chat_summary(index + 1, summary);
             }
         }
 
@@ -1694,13 +1694,7 @@ async fn run_all_chat_history_menu(profile_db: &Path) -> AppResult<()> {
     }
 }
 
-fn print_recent_chat_summary(index: usize, summary: &ChatSummary) {
-    println!("[{}] {}", index, summary.contact.display_name);
-    println!("    {}", chat_preview_line(summary));
-    println!();
-}
-
-fn print_all_chat_summary(index: usize, summary: &ChatSummary) {
+fn print_chat_summary(index: usize, summary: &ChatSummary) {
     println!("[{}] {}", index, summary.contact.display_name);
     println!("    {}", chat_preview_line(summary));
     println!();
@@ -3914,19 +3908,9 @@ fn mark_incoming_chat_message_accepted(db_path: &Path, message_id: &str) -> AppR
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ChatSessionEvent {
-    PeerDisconnected(String),
-}
-
-fn peer_disconnected_event(display_name: &str) -> ChatSessionEvent {
-    ChatSessionEvent::PeerDisconnected(display_name_or_anonymous(display_name))
-}
-
 fn handle_peer_disconnected(display_name: &str) {
-    let ChatSessionEvent::PeerDisconnected(peer) = peer_disconnected_event(display_name);
     println!();
-    println!("{peer} disconnected.");
+    println!("{} disconnected.", display_name_or_anonymous(display_name));
     println!("Status: Offline");
     println!("Messages you type now will be queued for delivery.");
     println!("Use /back to return to Messages.");

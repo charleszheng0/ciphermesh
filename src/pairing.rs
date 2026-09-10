@@ -382,16 +382,18 @@ async fn run_create_invite_at(profile_db: &Path, service_addr: Multiaddr) -> App
                         "Connected to {}",
                         display_name_or_anonymous(&remote_display_name)
                     );
-                    return run_bob_pairing_chat(
+                    return run_pairing_chat(
                         swarm,
                         peer,
-                        bob,
-                        local_display_name,
-                        remote_display_name,
-                        conversation_id,
-                        profile_db.to_path_buf(),
-                        service_addr,
-                        relay_listener,
+                        PairingChatRole::Bob(bob),
+                        PairingChatContext {
+                            local_display_name,
+                            remote_display_name,
+                            conversation_id,
+                            db_path: profile_db.to_path_buf(),
+                            service_addr,
+                        },
+                        Some(relay_listener),
                     )
                     .await;
                 }
@@ -675,15 +677,18 @@ async fn wait_for_join_ack_and_chat(
                     },
                 )) if peer == target => {
                     println!("Connected to {}", display_name_or_anonymous(&context.remote_display_name));
-                    return run_alice_pairing_chat(
+                    return run_pairing_chat(
                         swarm,
                         target,
-                        alice,
-                        local_display_name,
-                        context.remote_display_name,
-                        context.conversation_id,
-                        db_path,
-                        service_addr,
+                        PairingChatRole::Alice(alice),
+                        PairingChatContext {
+                            local_display_name,
+                            remote_display_name: context.remote_display_name,
+                            conversation_id: context.conversation_id,
+                            db_path,
+                            service_addr,
+                        },
+                        None,
                     ).await;
                 }
                 SwarmEvent::Behaviour(PairingBehaviourEvent::App(
@@ -695,115 +700,121 @@ async fn wait_for_join_ack_and_chat(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_alice_pairing_chat(
-    mut swarm: Swarm<PairingBehaviour>,
-    target: PeerId,
-    mut alice: Alice,
+struct PairingChatContext {
     local_display_name: String,
     remote_display_name: String,
     conversation_id: String,
     db_path: PathBuf,
     service_addr: Multiaddr,
-) -> AppResult<()> {
-    send_pending_as_alice(
-        &mut swarm,
-        target,
-        &mut alice,
-        &local_display_name,
-        &conversation_id,
-        &db_path,
-    )?;
-    print_conversation_history(&db_path, &conversation_id, &remote_display_name)?;
-    let mut terminal = spawn_line_editor()?;
-    let mut online = true;
-    let mut reconnect = time::interval(CHAT_RECONNECT_INTERVAL);
-    reconnect.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-    reconnect.tick().await;
+}
 
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => return Ok(()),
-            _ = reconnect.tick(), if !online => {
-                try_reconnect_through_relay(&mut swarm, &service_addr, target);
-            }
-            line = terminal.lines.recv() => {
-                let Some(line) = line else { return Ok(()); };
-                if is_chat_back_command(&line) { return Ok(()); }
-                if line.is_empty() { continue; }
-                if !online {
-                    queue_message_after_peer_disconnect(&db_path, &conversation_id, &remote_display_name, &line)?;
-                    continue;
-                }
-                let (message_id, bytes) = prepare_alice_frame(
-                    &mut alice, &local_display_name, &remote_display_name,
-                    &conversation_id, &db_path, &line, None,
-                )?;
-                track_pending_chat_delivery(&db_path, &conversation_id, &message_id, &line)?;
-                swarm.behaviour_mut().app.send_request(&target, PairingRequest::ChatFrame(bytes));
-                debug_log(format!("sent encrypted chat frame {message_id}"));
-            }
-            event = swarm.select_next_some() => match event {
-                SwarmEvent::Behaviour(PairingBehaviourEvent::App(event)) => {
-                    handle_alice_app_event(
-                        &mut swarm, target, &mut alice, &local_display_name,
-                        &remote_display_name, &conversation_id, &db_path,
-                        &mut terminal, event,
-                    )?;
-                }
-                SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == target => {
-                    if !online {
-                        online = true;
-                        handle_peer_reconnected(&remote_display_name);
-                        send_pending_as_alice(
-                            &mut swarm, target, &mut alice, &local_display_name,
-                            &conversation_id, &db_path,
-                        )?;
-                    }
-                }
-                SwarmEvent::ConnectionClosed { peer_id, num_established, cause, .. }
-                    if peer_id == target => {
-                    debug_log(format!(
-                        "chat connection closed; {num_established} connection(s) remain: {cause:?}"
-                    ));
-                    if peer_lost_all_connections(peer_id, target, num_established) {
-                        if online {
-                            online = false;
-                            handle_peer_disconnected(&remote_display_name);
-                        }
-                        try_reconnect_through_relay(&mut swarm, &service_addr, target);
-                    }
-                }
-                SwarmEvent::OutgoingConnectionError { peer_id: Some(peer_id), error, .. }
-                    if peer_id == target => debug_log(format!("chat reconnect failed: {error}")),
-                SwarmEvent::Behaviour(PairingBehaviourEvent::Dcutr(event)) => debug_log(format!("hole punch event: {event:?}")),
-                _ => {}
-            }
+enum PairingChatRole {
+    Alice(Alice),
+    Bob(Bob),
+}
+
+impl PairingChatRole {
+    fn prepare_frame(
+        &mut self,
+        context: &PairingChatContext,
+        plaintext: &str,
+    ) -> AppResult<(String, Vec<u8>)> {
+        match self {
+            Self::Alice(alice) => prepare_alice_frame(
+                alice,
+                &context.local_display_name,
+                &context.remote_display_name,
+                &context.conversation_id,
+                &context.db_path,
+                plaintext,
+                None,
+            ),
+            Self::Bob(bob) => prepare_bob_frame(
+                bob,
+                &context.local_display_name,
+                &context.remote_display_name,
+                &context.conversation_id,
+                &context.db_path,
+                plaintext,
+                None,
+            ),
+        }
+    }
+
+    fn send_pending(
+        &mut self,
+        swarm: &mut Swarm<PairingBehaviour>,
+        target: PeerId,
+        context: &PairingChatContext,
+    ) -> AppResult<()> {
+        match self {
+            Self::Alice(alice) => send_pending_as_alice(
+                swarm,
+                target,
+                alice,
+                &context.local_display_name,
+                &context.conversation_id,
+                &context.db_path,
+            ),
+            Self::Bob(bob) => send_pending_as_bob(
+                swarm,
+                target,
+                bob,
+                &context.local_display_name,
+                &context.conversation_id,
+                &context.db_path,
+            ),
+        }
+    }
+
+    fn handle_app_event(
+        &mut self,
+        swarm: &mut Swarm<PairingBehaviour>,
+        target: PeerId,
+        context: &PairingChatContext,
+        terminal: &mut ChatTerminal,
+        event: request_response::Event<PairingRequest, PairingResponse>,
+    ) -> AppResult<()> {
+        match self {
+            Self::Alice(alice) => handle_alice_app_event(
+                swarm,
+                target,
+                alice,
+                &context.local_display_name,
+                &context.remote_display_name,
+                &context.conversation_id,
+                &context.db_path,
+                terminal,
+                event,
+            ),
+            Self::Bob(bob) => handle_bob_pairing_app_event(
+                swarm,
+                target,
+                bob,
+                &context.local_display_name,
+                &context.remote_display_name,
+                &context.conversation_id,
+                &context.db_path,
+                terminal,
+                event,
+            ),
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_bob_pairing_chat(
+async fn run_pairing_chat(
     mut swarm: Swarm<PairingBehaviour>,
     target: PeerId,
-    mut bob: Bob,
-    local_display_name: String,
-    remote_display_name: String,
-    conversation_id: String,
-    db_path: PathBuf,
-    service_addr: Multiaddr,
-    mut relay_listener: ListenerId,
+    mut role: PairingChatRole,
+    context: PairingChatContext,
+    mut relay_listener: Option<ListenerId>,
 ) -> AppResult<()> {
-    send_pending_as_bob(
-        &mut swarm,
-        target,
-        &mut bob,
-        &local_display_name,
-        &conversation_id,
-        &db_path,
+    role.send_pending(&mut swarm, target, &context)?;
+    print_conversation_history(
+        &context.db_path,
+        &context.conversation_id,
+        &context.remote_display_name,
     )?;
-    print_conversation_history(&db_path, &conversation_id, &remote_display_name)?;
     let mut terminal = spawn_line_editor()?;
     let mut online = true;
     let mut reconnect = time::interval(CHAT_RECONNECT_INTERVAL);
@@ -814,40 +825,40 @@ async fn run_bob_pairing_chat(
         tokio::select! {
             _ = tokio::signal::ctrl_c() => return Ok(()),
             _ = reconnect.tick(), if !online => {
-                try_reconnect_through_relay(&mut swarm, &service_addr, target);
+                try_reconnect_through_relay(&mut swarm, &context.service_addr, target);
             }
             line = terminal.lines.recv() => {
                 let Some(line) = line else { return Ok(()); };
                 if is_chat_back_command(&line) { return Ok(()); }
                 if line.is_empty() { continue; }
                 if !online {
-                    queue_message_after_peer_disconnect(&db_path, &conversation_id, &remote_display_name, &line)?;
+                    queue_message_after_peer_disconnect(
+                        &context.db_path,
+                        &context.conversation_id,
+                        &context.remote_display_name,
+                        &line,
+                    )?;
                     continue;
                 }
-                let (message_id, bytes) = prepare_bob_frame(
-                    &mut bob, &local_display_name, &remote_display_name,
-                    &conversation_id, &db_path, &line, None,
+                let (message_id, bytes) = role.prepare_frame(&context, &line)?;
+                track_pending_chat_delivery(
+                    &context.db_path,
+                    &context.conversation_id,
+                    &message_id,
+                    &line,
                 )?;
-                track_pending_chat_delivery(&db_path, &conversation_id, &message_id, &line)?;
                 swarm.behaviour_mut().app.send_request(&target, PairingRequest::ChatFrame(bytes));
                 debug_log(format!("sent encrypted chat frame {message_id}"));
             }
             event = swarm.select_next_some() => match event {
                 SwarmEvent::Behaviour(PairingBehaviourEvent::App(event)) => {
-                    handle_bob_pairing_app_event(
-                        &mut swarm, target, &mut bob, &local_display_name,
-                        &remote_display_name, &conversation_id, &db_path,
-                        &mut terminal, event,
-                    )?;
+                    role.handle_app_event(&mut swarm, target, &context, &mut terminal, event)?;
                 }
                 SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == target => {
                     if !online {
                         online = true;
-                        handle_peer_reconnected(&remote_display_name);
-                        send_pending_as_bob(
-                            &mut swarm, target, &mut bob, &local_display_name,
-                            &conversation_id, &db_path,
-                        )?;
+                        handle_peer_reconnected(&context.remote_display_name);
+                        role.send_pending(&mut swarm, target, &context)?;
                     }
                 }
                 SwarmEvent::ConnectionClosed { peer_id, num_established, cause, .. }
@@ -858,16 +869,17 @@ async fn run_bob_pairing_chat(
                     if peer_lost_all_connections(peer_id, target, num_established) {
                         if online {
                             online = false;
-                            handle_peer_disconnected(&remote_display_name);
+                            handle_peer_disconnected(&context.remote_display_name);
                         }
-                        try_reconnect_through_relay(&mut swarm, &service_addr, target);
+                        try_reconnect_through_relay(&mut swarm, &context.service_addr, target);
                     }
                 }
-                SwarmEvent::ListenerClosed { listener_id, .. } if listener_id == relay_listener => {
+                SwarmEvent::ListenerClosed { listener_id, .. }
+                    if relay_listener == Some(listener_id) => {
                     debug_log("relay reservation listener closed; reconnecting".to_string());
-                    relay_listener = swarm.listen_on(
-                        service_addr.clone().with(Protocol::P2pCircuit)
-                    )?;
+                    relay_listener = Some(swarm.listen_on(
+                        context.service_addr.clone().with(Protocol::P2pCircuit)
+                    )?);
                     debug_log("relay reservation request sent".to_string());
                 }
                 SwarmEvent::Behaviour(PairingBehaviourEvent::Relay(
@@ -879,7 +891,7 @@ async fn run_bob_pairing_chat(
                         format!("relay reservation accepted by {relay_peer_id}")
                     });
                     if !online {
-                        try_reconnect_through_relay(&mut swarm, &service_addr, target);
+                        try_reconnect_through_relay(&mut swarm, &context.service_addr, target);
                     }
                 }
                 SwarmEvent::OutgoingConnectionError { peer_id: Some(peer_id), error, .. }
@@ -1832,8 +1844,6 @@ mod tests {
                     _ => {}
                 }
             }
-            #[allow(unreachable_code)]
-            Ok::<(), Box<dyn Error + Send + Sync>>(())
         });
 
         let join_key = identity::Keypair::generate_ed25519();
