@@ -8,6 +8,8 @@ use std::{
 const PAIRING_PROTOCOL: &str = "/ciphermesh/pairing/1.0.0";
 const LIBP2P_IDENTITY_SLOT: &str = "libp2p-installation";
 const DIRECT_DIAL_GRACE: Duration = Duration::from_secs(3);
+const CHAT_RECONNECT_INTERVAL: Duration = Duration::from_secs(3);
+const CHAT_IDLE_CONNECTION_TIMEOUT: Duration = Duration::MAX;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum PairingRequest {
@@ -388,6 +390,8 @@ async fn run_create_invite_at(profile_db: &Path, service_addr: Multiaddr) -> App
                         remote_display_name,
                         conversation_id,
                         profile_db.to_path_buf(),
+                        service_addr,
+                        relay_listener,
                     )
                     .await;
                 }
@@ -598,6 +602,7 @@ async fn run_join_invite_at(
                             local_display_name,
                             context,
                             profile_db.to_path_buf(),
+                            service_addr,
                         ).await;
                     }
                     PairingResponse::Error(error) => return Err(human_service_error(&error).into()),
@@ -652,6 +657,7 @@ async fn wait_for_join_ack_and_chat(
     local_display_name: String,
     context: JoinContext,
     db_path: PathBuf,
+    service_addr: Multiaddr,
 ) -> AppResult<()> {
     let timeout = time::sleep(DISCOVERY_TIMEOUT);
     tokio::pin!(timeout);
@@ -677,6 +683,7 @@ async fn wait_for_join_ack_and_chat(
                         context.remote_display_name,
                         context.conversation_id,
                         db_path,
+                        service_addr,
                     ).await;
                 }
                 SwarmEvent::Behaviour(PairingBehaviourEvent::App(
@@ -697,6 +704,7 @@ async fn run_alice_pairing_chat(
     remote_display_name: String,
     conversation_id: String,
     db_path: PathBuf,
+    service_addr: Multiaddr,
 ) -> AppResult<()> {
     send_pending_as_alice(
         &mut swarm,
@@ -709,10 +717,16 @@ async fn run_alice_pairing_chat(
     print_conversation_history(&db_path, &conversation_id, &remote_display_name)?;
     let mut terminal = spawn_line_editor()?;
     let mut online = true;
+    let mut reconnect = time::interval(CHAT_RECONNECT_INTERVAL);
+    reconnect.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    reconnect.tick().await;
 
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => return Ok(()),
+            _ = reconnect.tick(), if !online => {
+                try_reconnect_through_relay(&mut swarm, &service_addr, target);
+            }
             line = terminal.lines.recv() => {
                 let Some(line) = line else { return Ok(()); };
                 if is_chat_back_command(&line) { return Ok(()); }
@@ -725,6 +739,7 @@ async fn run_alice_pairing_chat(
                     &mut alice, &local_display_name, &remote_display_name,
                     &conversation_id, &db_path, &line, None,
                 )?;
+                track_pending_chat_delivery(&db_path, &conversation_id, &message_id, &line)?;
                 swarm.behaviour_mut().app.send_request(&target, PairingRequest::ChatFrame(bytes));
                 debug_log(format!("sent encrypted chat frame {message_id}"));
             }
@@ -736,11 +751,31 @@ async fn run_alice_pairing_chat(
                         &mut terminal, event,
                     )?;
                 }
-                SwarmEvent::ConnectionClosed { peer_id, num_established, .. }
-                    if peer_id == target && num_established == 0 => {
-                    online = false;
-                    handle_peer_disconnected(&remote_display_name);
+                SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == target => {
+                    if !online {
+                        online = true;
+                        handle_peer_reconnected(&remote_display_name);
+                        send_pending_as_alice(
+                            &mut swarm, target, &mut alice, &local_display_name,
+                            &conversation_id, &db_path,
+                        )?;
+                    }
                 }
+                SwarmEvent::ConnectionClosed { peer_id, num_established, cause, .. }
+                    if peer_id == target => {
+                    debug_log(format!(
+                        "chat connection closed; {num_established} connection(s) remain: {cause:?}"
+                    ));
+                    if peer_lost_all_connections(peer_id, target, num_established) {
+                        if online {
+                            online = false;
+                            handle_peer_disconnected(&remote_display_name);
+                        }
+                        try_reconnect_through_relay(&mut swarm, &service_addr, target);
+                    }
+                }
+                SwarmEvent::OutgoingConnectionError { peer_id: Some(peer_id), error, .. }
+                    if peer_id == target => debug_log(format!("chat reconnect failed: {error}")),
                 SwarmEvent::Behaviour(PairingBehaviourEvent::Dcutr(event)) => debug_log(format!("hole punch event: {event:?}")),
                 _ => {}
             }
@@ -757,6 +792,8 @@ async fn run_bob_pairing_chat(
     remote_display_name: String,
     conversation_id: String,
     db_path: PathBuf,
+    service_addr: Multiaddr,
+    mut relay_listener: ListenerId,
 ) -> AppResult<()> {
     send_pending_as_bob(
         &mut swarm,
@@ -769,10 +806,16 @@ async fn run_bob_pairing_chat(
     print_conversation_history(&db_path, &conversation_id, &remote_display_name)?;
     let mut terminal = spawn_line_editor()?;
     let mut online = true;
+    let mut reconnect = time::interval(CHAT_RECONNECT_INTERVAL);
+    reconnect.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    reconnect.tick().await;
 
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => return Ok(()),
+            _ = reconnect.tick(), if !online => {
+                try_reconnect_through_relay(&mut swarm, &service_addr, target);
+            }
             line = terminal.lines.recv() => {
                 let Some(line) = line else { return Ok(()); };
                 if is_chat_back_command(&line) { return Ok(()); }
@@ -785,6 +828,7 @@ async fn run_bob_pairing_chat(
                     &mut bob, &local_display_name, &remote_display_name,
                     &conversation_id, &db_path, &line, None,
                 )?;
+                track_pending_chat_delivery(&db_path, &conversation_id, &message_id, &line)?;
                 swarm.behaviour_mut().app.send_request(&target, PairingRequest::ChatFrame(bytes));
                 debug_log(format!("sent encrypted chat frame {message_id}"));
             }
@@ -796,11 +840,50 @@ async fn run_bob_pairing_chat(
                         &mut terminal, event,
                     )?;
                 }
-                SwarmEvent::ConnectionClosed { peer_id, num_established, .. }
-                    if peer_id == target && num_established == 0 => {
-                    online = false;
-                    handle_peer_disconnected(&remote_display_name);
+                SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == target => {
+                    if !online {
+                        online = true;
+                        handle_peer_reconnected(&remote_display_name);
+                        send_pending_as_bob(
+                            &mut swarm, target, &mut bob, &local_display_name,
+                            &conversation_id, &db_path,
+                        )?;
+                    }
                 }
+                SwarmEvent::ConnectionClosed { peer_id, num_established, cause, .. }
+                    if peer_id == target => {
+                    debug_log(format!(
+                        "chat connection closed; {num_established} connection(s) remain: {cause:?}"
+                    ));
+                    if peer_lost_all_connections(peer_id, target, num_established) {
+                        if online {
+                            online = false;
+                            handle_peer_disconnected(&remote_display_name);
+                        }
+                        try_reconnect_through_relay(&mut swarm, &service_addr, target);
+                    }
+                }
+                SwarmEvent::ListenerClosed { listener_id, .. } if listener_id == relay_listener => {
+                    debug_log("relay reservation listener closed; reconnecting".to_string());
+                    relay_listener = swarm.listen_on(
+                        service_addr.clone().with(Protocol::P2pCircuit)
+                    )?;
+                    debug_log("relay reservation request sent".to_string());
+                }
+                SwarmEvent::Behaviour(PairingBehaviourEvent::Relay(
+                    relay::client::Event::ReservationReqAccepted { relay_peer_id, renewal, .. }
+                )) => {
+                    debug_log(if renewal {
+                        format!("relay reservation renewed by {relay_peer_id}")
+                    } else {
+                        format!("relay reservation accepted by {relay_peer_id}")
+                    });
+                    if !online {
+                        try_reconnect_through_relay(&mut swarm, &service_addr, target);
+                    }
+                }
+                SwarmEvent::OutgoingConnectionError { peer_id: Some(peer_id), error, .. }
+                    if peer_id == target => debug_log(format!("chat reconnect failed: {error}")),
                 SwarmEvent::Behaviour(PairingBehaviourEvent::Dcutr(event)) => debug_log(format!("hole punch event: {event:?}")),
                 _ => {}
             }
@@ -1046,6 +1129,25 @@ fn prepare_outgoing_frame(
     Ok((message_id, bytes))
 }
 
+fn track_pending_chat_delivery(
+    db_path: &Path,
+    conversation_id: &str,
+    message_id: &str,
+    plaintext: &str,
+) -> AppResult<()> {
+    let peer_id = pending_peer_id_for_conversation(db_path, conversation_id)?;
+    Storage::open(db_path)?.queue_pending_peer_message(&PendingPeerMessage {
+        message_id: message_id.to_string(),
+        peer_id,
+        conversation_id: conversation_id.to_string(),
+        plaintext: plaintext.to_string(),
+        created_at_unix_secs: now_unix_secs(),
+        retry_count: 0,
+        last_attempt_unix_secs: None,
+    })?;
+    Ok(())
+}
+
 fn send_pending_as_alice(
     swarm: &mut Swarm<PairingBehaviour>,
     target: PeerId,
@@ -1139,6 +1241,9 @@ fn new_pairing_swarm(key: identity::Keypair) -> AppResult<Swarm<PairingBehaviour
                 relay,
             })
         })?
+        .with_swarm_config(|config| {
+            config.with_idle_connection_timeout(CHAT_IDLE_CONNECTION_TIMEOUT)
+        })
         .build())
 }
 
@@ -1392,6 +1497,42 @@ fn dial_target_through_relay(
     Ok(())
 }
 
+fn try_reconnect_through_relay(
+    swarm: &mut Swarm<PairingBehaviour>,
+    service_addr: &Multiaddr,
+    target: PeerId,
+) {
+    if swarm.is_connected(&target) {
+        return;
+    }
+    let relay_address = service_addr
+        .clone()
+        .with(Protocol::P2pCircuit)
+        .with(Protocol::P2p(target));
+    let options = DialOpts::peer_id(target)
+        .addresses(vec![relay_address])
+        .extend_addresses_through_behaviour()
+        .build();
+    match swarm.dial(options) {
+        Ok(()) => debug_log(format!("background reconnect started for {target}")),
+        Err(error) => debug_log(format!(
+            "background reconnect deferred for {target}: {error}"
+        )),
+    }
+}
+
+fn peer_lost_all_connections(peer_id: PeerId, target: PeerId, num_established: u32) -> bool {
+    peer_id == target && num_established == 0
+}
+
+fn handle_peer_reconnected(display_name: &str) {
+    println!();
+    println!("{} reconnected.", display_name_or_anonymous(display_name));
+    println!("Status: Online");
+    println!("Queued messages are being sent.");
+    println!();
+}
+
 fn human_service_error(error: &str) -> String {
     debug_log(format!("pairing service error: {error}"));
     if error.contains("invalid") || error.contains("expired") || error.contains("used") {
@@ -1419,6 +1560,43 @@ mod tests {
             std::mem::size_of_val(&future) <= 1024,
             "normal Create Invite must keep its network state machine behind a task boundary"
         );
+    }
+
+    #[test]
+    fn chat_marks_offline_only_after_the_targets_last_connection_closes() {
+        let target = PeerId::random();
+        let other = PeerId::random();
+
+        assert!(!peer_lost_all_connections(target, target, 1));
+        assert!(!peer_lost_all_connections(other, target, 0));
+        assert!(peer_lost_all_connections(target, target, 0));
+    }
+
+    #[test]
+    fn active_chat_connections_do_not_expire_for_inactivity() {
+        assert_eq!(CHAT_IDLE_CONNECTION_TIMEOUT, Duration::MAX);
+    }
+
+    #[test]
+    fn chat_delivery_stays_queued_until_acknowledged() {
+        let path = pairing_temp_db("pending-chat-delivery");
+        track_pending_chat_delivery(&path, "conversation", "message-1", "hello").unwrap();
+
+        let storage = Storage::open(&path).unwrap();
+        assert_eq!(
+            storage
+                .pending_peer_messages_for_peer("conversation")
+                .unwrap()
+                .len(),
+            1
+        );
+        mark_delivered_if_pending(&path, "message-1").unwrap();
+        assert!(storage
+            .pending_peer_messages_for_peer("conversation")
+            .unwrap()
+            .is_empty());
+        drop(storage);
+        let _ = std::fs::remove_file(path);
     }
 
     fn pairing_temp_db(name: &str) -> PathBuf {
