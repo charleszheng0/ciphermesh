@@ -181,19 +181,67 @@ are stored in SQLite. The current default development profile is created under
 `target/`; pass an explicit profile path to `create-invite` or `join-invite`
 when testing persistence independently of Cargo build artifacts.
 
-Windows packaging helper:
+## Packaging Installers
+
+`target/release/ciphermesh` (or `ciphermesh.exe`) is Cargo's optimized build
+output. Files under `dist/` are the copies intended for testing or distribution;
+users do not need Rust or Cargo to run them.
+
+### Windows
+
+The portable Windows binary can be built with:
 
 ```powershell
 .\scripts\package-release.ps1
 .\dist\ciphermesh-windows-x64-ciphermesh.exe
 ```
 
-macOS/Linux packaging helper:
+To create the per-user Windows installer, install Inno Setup 6 and run:
+
+```powershell
+winget install --id JRSoftware.InnoSetup -e
+.\scripts\package-windows-installer.ps1
+```
+
+The result is `dist/CipherMesh-<version>-windows-x64-setup.exe`. It installs
+CipherMesh under the user's local application directory, adds Start Menu and
+optional desktop shortcuts, and uses a writable per-user working directory for
+the SQLite profile. No Rust toolchain is needed on the destination computer.
+
+### macOS
+
+Run the installer build on each target macOS architecture:
+
+```bash
+bash scripts/package-macos-installer.sh
+```
+
+The result is `dist/CipherMesh-<version>-macos-<x64|arm64>.pkg`, which installs
+the `ciphermesh` command into `/usr/local/bin`. After installation, users run:
+
+```bash
+ciphermesh
+```
+
+The existing portable macOS/Linux helper remains available:
 
 ```bash
 ./scripts/package-release.sh
 ./dist/ciphermesh-<macos|linux>-<x64|arm64>-ciphermesh
 ```
+
+The **Package installers** GitHub Actions workflow builds the Windows x64,
+macOS Intel, and macOS Apple Silicon packages on their native runners. Run it
+manually from the Actions tab or push a version tag such as `v0.1.0`, then
+download the artifacts from the workflow run.
+
+These local/CI packages are unsigned by default. Public Windows distribution
+requires an Authenticode code-signing certificate. Public macOS distribution
+requires Developer ID Application and Developer ID Installer certificates plus
+Apple notarization; the macOS script supports `MACOS_APPLICATION_IDENTITY`,
+`MACOS_INSTALLER_IDENTITY`, and an `APPLE_NOTARY_PROFILE` stored in the macOS
+keychain. Packaging without those credentials does not bypass Smart App Control
+or Gatekeeper.
 
 ## CLI
 
